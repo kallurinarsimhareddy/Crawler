@@ -1,0 +1,12 @@
+pandas>=2.2
+loguru>=0.7
+requests>=2.32
+beautifulsoup4>=4.12
+lxml>=5.0
+openpyxl>=3.1
+
+# Optional: the headless-browser fallback for boards that render client-side.
+# Everything degrades gracefully without it, so an install that omits this
+# still runs — it just cannot read a JavaScript-only board. After installing,
+# fetch the browser itself with:  python -m playwright install chromium
+playwright>=1.40

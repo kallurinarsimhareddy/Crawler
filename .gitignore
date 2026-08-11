@@ -1,0 +1,32 @@
+# Virtual environment. Recreate it with the commands in README.md rather than
+# committing it: it is ~400 MB and platform-specific.
+venv/
+.venv/
+env/
+
+# Byte code and caches.
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Crawl results. These are generated, large, and change on every run — the
+# input sheet is the input, not these.
+output/
+!output/.gitkeep
+
+# Files an interrupted write can leave behind, and the timestamped siblings the
+# exporters fall back to when a destination is locked by Excel.
+*.partial.*
+jobs-[0-9]*.xlsx
+*-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9].csv
+
+# Editors and operating systems.
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
