@@ -86,10 +86,10 @@ from crawler.job_filters import (
 )
 from crawler.observations import observations_from_result
 from crawler.resolve import Resolution, resolve_company
-from crawler.retry import RetryPolicy, classify
+from crawler.retry import RetryPolicy, Verdict, classify
 from store import Database, migrate
 from store.database import DEFAULT_DATABASE_PATH
-from store.queue import DEFAULT_LEASE_SECONDS, CrawlQueue, QueueItem
+from store.queue import DEFAULT_LEASE_SECONDS, CrawlQueue, QueueItem, QueueState
 
 # Aliased on purpose. `sheets.companies.CompanyRepository` and
 # `sheets.jobs.JobRepository` are imported under their own names inside
@@ -526,14 +526,24 @@ class _Heartbeat:
 
     def _beat(self) -> None:
         """Refresh every claim until asked to stop."""
-        while not self._stop.wait(self._interval):
+        try:
+            while not self._stop.wait(self._interval):
+                try:
+                    for key in self._keys:
+                        self._queue.heartbeat(key)
+                except Exception as exc:  # noqa: BLE001 - a lapsed lease is recoverable
+                    logger.debug("Heartbeat stopped: {}", exc)
+                    return
+                self.beats += 1
+        finally:
+            # :class:`store.Database` hands out a connection per thread and
+            # closes only the caller's, so this thread has to close its own.
+            # Left open it keeps a Windows lock on the database file for the
+            # life of the process, and the next run finds it busy.
             try:
-                for key in self._keys:
-                    self._queue.heartbeat(key)
-            except Exception as exc:  # noqa: BLE001 - a lapsed lease is recoverable
-                logger.debug("Heartbeat stopped: {}", exc)
-                return
-            self.beats += 1
+                self._queue.database.close()
+            except Exception as exc:  # noqa: BLE001 - closing is best effort
+                logger.debug("Could not close the heartbeat connection: {}", exc)
 
     @property
     def running(self) -> bool:
@@ -692,6 +702,7 @@ class WeeklyRun:
         run_id: Optional[str] = None,
         extra_keywords: Iterable[str] = (),
         use_queue: bool = False,
+        requeue: bool = False,
     ) -> RunSummary:
         """Crawl the master list and write the results.
 
@@ -704,10 +715,21 @@ class WeeklyRun:
             use_queue: Take work from the durable SQLite queue rather than from
                 the roster and the JSON checkpoint. Off by default: the JSON
                 path is what two live runs have verified, and it stays the
-                default until this one has earned the same.
+                default until this one has earned the same. Redundant when the
+                runner was built with ``queue_mode=True``; either turns the
+                queue on.
+            requeue: Return companies that finished in an earlier run to
+                ``pending`` before claiming, so a new week crawls them again.
+                Off by default, because the common case is resuming an
+                interrupted run. ``resume=False`` implies it.
 
         Returns:
             What the run did.
+
+        Raises:
+            EmptyRosterError: In queue mode, when there is nothing left to
+                claim. A run that crawls nothing is never reported as a
+                successful crawl of nothing.
         """
         started = utc_now()
         week_start, week_end = week_of(started)
@@ -733,9 +755,20 @@ class WeeklyRun:
                 len(unusable),
             )
 
+        # Either switch turns the queue on: the constructor's `queue_mode` and
+        # this call's `use_queue` are the same decision reached from two
+        # directions, and a runner given a database but neither flag stays on
+        # the JSON path.
+        queue_on = bool((self.queue_mode or use_queue) and self.database is not None)
+
         # The limit applies to usable companies, so --limit 5 crawls five
         # companies rather than five rows of which some are unusable.
-        if limit > 0:
+        #
+        # In queue mode it caps what is *claimed* instead, and the whole roster
+        # is still enqueued. A limited run is then a smaller bite of the same
+        # queue rather than a smaller queue -- which is what makes `--limit 3`
+        # safe to try against the real database.
+        if limit > 0 and not queue_on:
             roster = roster[:limit]
 
         checkpoint = Checkpoint.resume_or_start(
@@ -759,7 +792,12 @@ class WeeklyRun:
         # and nothing else -- in particular `checkpoint` still tracks what this
         # segment read, because `crawled_this_session` is what stops a blocked
         # company's jobs being closed, and that decision belongs in one place.
-        queue = self._prepare_queue(roster, resume=resume) if use_queue else None
+        queue = (
+            self._prepare_queue(roster, resume=resume, requeue=requeue, summary=summary)
+            if queue_on
+            else None
+        )
+        summary.queue_mode = queue is not None
 
         pending = [
             record
@@ -798,45 +836,67 @@ class WeeklyRun:
         company_outcomes: Dict[str, Dict[str, object]] = {}
         clock = time.monotonic()
 
-        for batch in self._batches(pending):
+        # The queue replaces this one expression and nothing else. Everything
+        # below it is the batch loop as the JSON path has always run it.
+        sources = (
+            self._queue_batches(queue, limit, summary)
+            if queue is not None
+            else self._batches(pending)
+        )
+
+        for batch in sources:
             if self._stopping:
                 summary.interrupted = True
                 break
 
-            # Work out where each company's jobs live before crawling it. A row
-            # that already names a board resolves without a request; one that
-            # names only a website has its careers page and applicant tracking
-            # system discovered here, and both are written back to the sheet so
-            # next week's run needs no discovery at all.
-            resolutions = self._resolve_batch(batch, summary)
-            prepared = [
-                resolutions[str(record.get("company_key") or "")].to_record(record)
-                for record in batch
-            ]
+            # Only in queue mode: a claim is a lease, and a browser rescue on a
+            # large board outlives the default one. Refreshed for as long as
+            # the batch is actually being worked on.
+            self._start_heartbeat(queue)
 
-            results = engine.crawl_all(prepared)
+            try:
+                # Work out where each company's jobs live before crawling it. A
+                # row that already names a board resolves without a request; one
+                # that names only a website has its careers page and applicant
+                # tracking system discovered here, and both are written back to
+                # the sheet so next week's run needs no discovery at all.
+                resolutions = self._resolve_batch(batch, summary)
+                prepared = [
+                    resolutions[str(record.get("company_key") or "")].to_record(record)
+                    for record in batch
+                ]
 
-            # Read after the crawl rather than before it, because the URL the
-            # engine actually used is the board -- resolution only predicted
-            # one, and the engine may have fallen through to a better seed.
-            # Off by default, in which case this returns {} without a request.
-            filter_sets = self._detect_filters_batch(batch, results, summary)
+                results = engine.crawl_all(prepared)
 
-            for record, result in zip(batch, results):
-                self._absorb(
-                    record,
-                    result,
-                    checkpoint.run_id,
-                    observations,
-                    seen_keys,
-                    failures,
-                    company_outcomes,
-                    checkpoint,
-                    summary,
-                    extra_keywords,
-                    resolutions.get(str(record.get("company_key") or "")),
-                    filter_sets.get(str(record.get("company_key") or "")),
-                )
+                # Read after the crawl rather than before it, because the URL
+                # the engine actually used is the board -- resolution only
+                # predicted one, and the engine may have fallen through to a
+                # better seed. Off by default, in which case this returns {}
+                # without a request.
+                filter_sets = self._detect_filters_batch(batch, results, summary)
+
+                for record, result in zip(batch, results):
+                    self._absorb(
+                        record,
+                        result,
+                        checkpoint.run_id,
+                        observations,
+                        seen_keys,
+                        failures,
+                        company_outcomes,
+                        checkpoint,
+                        summary,
+                        extra_keywords,
+                        resolutions.get(str(record.get("company_key") or "")),
+                        filter_sets.get(str(record.get("company_key") or "")),
+                    )
+            except BaseException:
+                # Ctrl-C, or the engine giving up. Whatever is still claimed was
+                # never read, and saying so beats leaving it to a lease.
+                self._abandon_claims(queue)
+                raise
+            finally:
+                self._stop_heartbeat()
 
             # Deliberately not on a dry run. Writing the checkpoint would make
             # the next real run skip companies this one only pretended to crawl.
@@ -848,6 +908,13 @@ class WeeklyRun:
                 len(roster),
                 len(observations),
             )
+
+        # In queue mode the loop ends by running out of claimable work, so a
+        # stop request is noticed here rather than at the top of an iteration
+        # that never happens. Guarded, so the JSON path keeps deciding this
+        # exactly where it always has.
+        if queue is not None and self._stopping:
+            summary.interrupted = True
 
         # Rows that could not be crawled at all still belong in FAILURES: the
         # fix is a cell in the sheet, and an operator cannot fix what is not
@@ -918,6 +985,264 @@ class WeeklyRun:
             applied.describe(),
         )
         return summary
+
+    # -- the durable queue ---------------------------------------------------
+
+    def _prepare_queue(
+        self,
+        roster: Sequence[Mapping[str, str]],
+        resume: bool,
+        requeue: bool,
+        summary: RunSummary,
+    ) -> CrawlQueue:
+        """Bring the store up, copy the roster into it and fill the queue.
+
+        The sheet stays the source of *which companies exist*; the queue is the
+        source of *what is left to do*. So the roster just read is upserted --
+        and because a blank cell never clears a stored value, a board that
+        discovery found locally survives a sheet which has not been told about
+        it yet -- and then anything not already queued is queued.
+
+        Only usable rows are copied. A row naming no website, careers page or
+        board has nowhere to start, and a queue in which every company is
+        uncrawlable is worse than a smaller one.
+
+        Args:
+            roster: The usable companies the sheet holds.
+            resume: Whether this continues an interrupted run. A resume leaves
+                finished companies alone; ``resume=False`` returns them to
+                ``pending``, because a new week has to crawl them again.
+            requeue: Ask for that requeue explicitly, without also saying this
+                is a fresh run.
+            summary: Counters, updated in place.
+
+        Returns:
+            The queue to take work from.
+
+        Raises:
+            EmptyRosterError: When nothing can be claimed.
+        """
+        database = self.database
+        if database is None:  # pragma: no cover - the caller has checked
+            raise ValueError("queue mode needs a Database")
+
+        # Idempotent, and a no-op on a database already at the current version.
+        # Done here rather than asked of the operator, so `--queue` works
+        # against a file that has never been opened before.
+        migrate(database)
+
+        # Built here when the constructor did not, which is the shape a caller
+        # passing `database=` without `queue_mode=True` produces.
+        if self.queue is None:
+            self.queue = CrawlQueue(database)
+        if self._store_companies is None:
+            self._store_companies = StoreCompanyRepository(database)
+        if self._store_jobs is None:
+            self._store_jobs = StoreJobRepository(database)
+        queue = self.queue
+
+        if not roster:
+            raise EmptyRosterError(
+                "No company in MASTER_COMPANIES names a website, careers page "
+                "or board, so there is nothing to crawl. Add a Website or "
+                "Career Page URL to at least one row."
+            )
+
+        # The store spells it company_name; the sheet spells it company.
+        self._store_companies.upsert_many(
+            {**record, "company_name": record.get("company") or ""}
+            for record in roster
+        )
+
+        # Before anything is claimed. A run that died left its companies
+        # `running`, and no one else may take them until the lease lapses --
+        # so a run that starts by recovering them is the difference between a
+        # crash costing one batch and it costing every company that was in
+        # flight.
+        summary.queue_released = queue.release_stale(lease_seconds=self.lease_seconds)
+
+        # Idempotent, which is what makes a resume safe: a company already in
+        # the queue keeps whatever state it has.
+        summary.queue_enqueued = queue.enqueue_all(run_id=summary.run_id)
+
+        # Which also means a second week against last week's database adds
+        # nothing at all, because every company is already there in a terminal
+        # state. Something has to say "this is a new run, try them again", and
+        # this is it. Never automatic: a resume must not re-crawl what the
+        # interrupted segment already finished.
+        if requeue or not resume:
+            summary.queue_requeued = queue.reset_finished()
+
+        counts = queue.stats()
+        claimable = (
+            counts.get(QueueState.PENDING.value, 0)
+            + counts.get(QueueState.RETRY_WAIT.value, 0)
+        )
+
+        # Refused only when every company has reached a settled verdict.
+        # `running` belongs to another worker and `skipped` to a run that was
+        # interrupted before it could crawl them -- neither is a finished
+        # queue, and refusing to start over them would turn one interrupted run
+        # into a stuck one.
+        unsettled = claimable + (
+            counts.get(QueueState.RUNNING.value, 0)
+            + counts.get(QueueState.SKIPPED.value, 0)
+        )
+        if not unsettled:
+            # The failure this guard exists for: every company is already
+            # `succeeded` from last week, so `enqueue_all` correctly adds
+            # nothing -- and without this the run would crawl nothing and
+            # report success.
+            raise EmptyRosterError(
+                f"Every company in the queue has finished "
+                f"({counts.get(QueueState.SUCCEEDED.value, 0)} succeeded, "
+                f"{counts.get(QueueState.FAILED.value, 0)} failed, "
+                f"{counts.get(QueueState.BLOCKED.value, 0)} blocked) and there "
+                f"is nothing left to claim. Pass --requeue to crawl them again."
+            )
+
+        logger.info(
+            "Queue ready: {} enqueued, {} returned to pending, {} stale claim(s) "
+            "recovered, {} claimable",
+            summary.queue_enqueued,
+            summary.queue_requeued,
+            summary.queue_released,
+            claimable,
+        )
+        return queue
+
+    @property
+    def heartbeat_running(self) -> bool:
+        """Whether a heartbeat thread is currently refreshing claims.
+
+        Returns:
+            ``True`` only between the start and the end of a batch.
+        """
+        return self._heartbeat is not None and self._heartbeat.running
+
+    def _queue_batches(
+        self,
+        queue: CrawlQueue,
+        limit: int,
+        summary: RunSummary,
+    ) -> Iterator[List[Mapping[str, str]]]:
+        """Claim companies from the queue, a batch at a time, until none are left.
+
+        This is the one thing the queue replaces: where the next batch comes
+        from. The batch it yields is the same list of company records the JSON
+        path yields, so the loop body around it does not know the difference.
+
+        Claiming happens just before the batch is crawled rather than up front,
+        which is what lets a stop request leave the rest of the queue
+        ``pending`` for the next run instead of stranding it ``running``.
+
+        Args:
+            queue: The queue to take work from.
+            limit: Cap on how many companies to claim in total. ``0`` means
+                drain the queue.
+            summary: Counters, updated in place.
+
+        Yields:
+            Batches of company records, at most :attr:`batch_size` each.
+        """
+        taken = 0
+
+        # Checked before claiming, not after: a batch claimed and then
+        # abandoned would sit `running` until its lease lapsed.
+        while not self._stopping:
+            wanted = self.batch_size
+            if limit > 0:
+                wanted = min(wanted, limit - taken)
+                if wanted <= 0:
+                    return
+
+            items = queue.claim(self.owner, limit=wanted, lease_seconds=self.lease_seconds)
+
+            if not items:
+                # Nothing claimable now. There may still be companies parked in
+                # `retry_wait` whose turn has not come; whether to wait for
+                # them is the operator's call, and the default is not to.
+                if self._wait_for_retries():
+                    continue
+                return
+
+            taken += len(items)
+            summary.queue_claimed += len(items)
+
+            # Held so an outcome can find the attempt number the queue handed
+            # out with the claim.
+            self._claimed = {item.company_key: item for item in items}
+            yield [item.as_record() for item in items]
+
+    def _wait_for_retries(self) -> bool:
+        """Wait for a parked retry to come due, if one is due soon enough.
+
+        Returns:
+            Whether it is worth claiming again. ``False`` ends the run, which
+            is the right answer for a retry parked minutes away: the company is
+            durable in SQLite and the next invocation picks it up, which is the
+            whole point of a queue that outlives the process.
+        """
+        if self.retry_poll_seconds <= 0 or self.database is None:
+            return False
+
+        row = self.database.one(
+            "SELECT MIN(next_attempt_at) AS due FROM crawl_queue WHERE state = 'retry_wait'"
+        )
+        due = float((row or {}).get("due") or 0.0)
+        if not due:
+            return False
+
+        wait = due - time.time()
+        if wait <= 0:
+            return True
+        if wait > self.retry_poll_seconds:
+            return False
+
+        time.sleep(wait)
+        return True
+
+    def _start_heartbeat(self, queue: Optional[CrawlQueue]) -> None:
+        """Keep this batch's claims alive while the engine works on them.
+
+        Args:
+            queue: The queue holding the claims, or ``None`` on the JSON path,
+                in which case there is nothing to refresh.
+        """
+        if queue is None or not self._claimed:
+            return
+        self._heartbeat = _Heartbeat(
+            queue, list(self._claimed), self.heartbeat_seconds
+        ).start()
+
+    def _stop_heartbeat(self) -> None:
+        """Stop refreshing, and keep the count for the report."""
+        if self._heartbeat is None:
+            return
+        self._heartbeat.stop()
+        self.heartbeats += self._heartbeat.beats
+        self._heartbeat = None
+
+    def _abandon_claims(self, queue: Optional[CrawlQueue]) -> None:
+        """Give up the batch in flight when the run dies part-way through it.
+
+        Marked skipped rather than released. Released would mean ``pending``,
+        and the next run would crawl a company this one had already handed to
+        the engine — the interruption would silently double the work rather
+        than merely stop it. Skipped says what happened, keeps the company out
+        of the failure report it did not earn, and ``--requeue`` brings it back.
+
+        Args:
+            queue: The queue holding the claims, if there is one.
+        """
+        if queue is None:
+            return
+        for company_key in self._claimed:
+            try:
+                queue.skip(company_key, reason="interrupted mid-batch")
+            except Exception as exc:  # noqa: BLE001 - the lease recovers it anyway
+                logger.debug("Could not release {}: {}", company_key, exc)
+        self._claimed = {}
 
     def _resolve_batch(
         self,
@@ -1223,15 +1548,16 @@ class WeeklyRun:
         elif readable:
             summary.companies_no_jobs += 1
 
-        observations.extend(
-            observations_from_result(
-                result,
-                company=record,
-                run_id=run_id,
-                extra_keywords=extra_keywords,
-                seen=seen_keys,
-            )
+        # Kept separately as well as accumulated, because the durable store
+        # records one company at a time and closure is scoped to one company.
+        mine = observations_from_result(
+            result,
+            company=record,
+            run_id=run_id,
+            extra_keywords=extra_keywords,
+            seen=seen_keys,
         )
+        observations.extend(mine)
 
         # What to write back to MASTER_COMPANIES. Resolution supplies the URLs
         # and the platform; the postings themselves supply the location detail,
@@ -1305,6 +1631,125 @@ class WeeklyRun:
                     run_id=run_id,
                 )
             )
+
+        # -- and the durable store, when this company came from the queue -----
+        # Guarded on the claim rather than on the mode, so a company the JSON
+        # path is crawling can never reach the queue by accident.
+        if self.queue is not None and company_key in self._claimed:
+            self._record_in_queue(company_key, result, readable, len(mine), run_id, summary)
+
+            if readable:
+                # The set handed to the weekly comparison. Successes only: a
+                # company that was not read proves nothing about what its board
+                # still advertises, and offering it would close every posting
+                # the crawl failed to see.
+                self.crawled_this_run.add(company_key)
+                self._store_postings(company_key, mine, run_id, summary)
+
+    def _record_in_queue(
+        self,
+        company_key: str,
+        result: CrawlResult,
+        readable: bool,
+        jobs: int,
+        run_id: str,
+        summary: RunSummary,
+    ) -> None:
+        """Record one company's fate in the queue.
+
+        A read board is a success even when it advertises nothing: an empty
+        board is a fact about the company, not a failure of the crawl. Anything
+        else is classified, judged by the retry policy, and parked, blocked or
+        failed accordingly.
+
+        Args:
+            company_key: The company.
+            result: What the engine produced for it.
+            readable: Whether the board was read at all.
+            jobs: How many postings it yielded.
+            run_id: The run.
+            summary: Counters, updated in place.
+        """
+        queue = self.queue
+        item = self._claimed.get(company_key)
+        if queue is None or item is None:  # pragma: no cover - the caller checks
+            return
+
+        if readable:
+            queue.succeed(company_key, jobs=jobs, run_id=run_id)
+            return
+
+        error = result.error or ""
+        verdict = self.retry_policy.decide(classify(error), item.attempts)
+
+        # The belt to the policy's braces. A policy that never gives up would
+        # otherwise mean a company claimed, failed and reclaimed for as long as
+        # the run lasts -- which is to say, for ever.
+        if verdict.retry and item.attempts >= self.retry_policy.max_attempts:
+            logger.debug(
+                "{}: {} attempt(s) is the cap, failing rather than retrying",
+                company_key,
+                item.attempts,
+            )
+            verdict = Verdict(
+                retry=False, delay=0.0, blocked=verdict.blocked, reason=verdict.reason
+            )
+
+        queue.fail(
+            company_key,
+            reason=verdict.reason,
+            retry_in=verdict.delay,
+            retryable=verdict.retry,
+            http_status=_status_in(error),
+            run_id=run_id,
+            blocked=verdict.blocked,
+        )
+
+        if verdict.retry:
+            summary.queue_retry_wait += 1
+        elif verdict.blocked:
+            summary.queue_blocked += 1
+
+    def _store_postings(
+        self,
+        company_key: str,
+        postings: Sequence[Mapping[str, object]],
+        run_id: str,
+        summary: RunSummary,
+    ) -> None:
+        """Write one company's postings to the local store and close the rest.
+
+        The observations already carry the identity
+        :mod:`crawler.observations` derived from the board the crawl *actually
+        used*, and :meth:`store.repositories.JobRepository.record_many` honours
+        a supplied ``job_key``. That is what stops one posting acquiring two
+        primary keys when discovery finds a better board than the sheet holds.
+
+        Called only for a company that was read, which is what makes the
+        closure below safe: it is the same rule the weekly comparison applies,
+        for the same reason.
+
+        Args:
+            company_key: The company.
+            postings: Its observations from this run.
+            run_id: The run.
+            summary: Counters, updated in place.
+        """
+        repository = self._store_jobs
+        if repository is None:  # pragma: no cover - built with the queue
+            return
+
+        if postings:
+            counts = repository.record_many(postings, run_id=run_id)
+            summary.jobs_persisted += counts.get("inserted", 0) + counts.get("updated", 0)
+
+        # Scoped to this company, and only to a run that read it. A posting
+        # this crawl did not see on a board this crawl did read has gone.
+        summary.jobs_closed_locally += repository.close_missing(
+            company_key,
+            [str(posting.get("job_key") or "") for posting in postings],
+            run_id=run_id,
+        )
 
     def _save(self, checkpoint: Checkpoint) -> None:
         """Write the checkpoint, treating a failure as non-fatal.
@@ -1415,9 +1860,48 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--database",
-        type=Path,
         default=None,
+        metavar="PATH",
         help="With --queue, where the database lives (default: state/crawler.db)",
+    )
+    parser.add_argument(
+        "--requeue",
+        action="store_true",
+        help=(
+            "With --queue, return companies that finished in an earlier run to "
+            "pending, so a new week crawls them again. Off by default, because "
+            "the common case is resuming an interrupted run rather than "
+            "starting a new one"
+        ),
+    )
+    parser.add_argument(
+        "--recover",
+        action="store_true",
+        help=(
+            "With --queue, release every outstanding claim before starting, "
+            "not just the expired ones. The deliberate \"the last run died\" "
+            "switch; do not use it while another run is working"
+        ),
+    )
+    parser.add_argument(
+        "--lease-seconds",
+        type=float,
+        default=DEFAULT_LEASE_SECONDS,
+        metavar="SECONDS",
+        help=(
+            "With --queue, how long a claim is honoured before another run may "
+            f"take it (default: {DEFAULT_LEASE_SECONDS:.0f})"
+        ),
+    )
+    parser.add_argument(
+        "--max-attempts",
+        type=int,
+        default=DEFAULT_MAX_ATTEMPTS,
+        metavar="N",
+        help=(
+            "With --queue, attempts one company gets before it is failed "
+            f"regardless of the retry policy (default: {DEFAULT_MAX_ATTEMPTS})"
+        ),
     )
     parser.add_argument(
         "--resume",
@@ -1552,12 +2036,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_dir=PROJECT_ROOT / "output",
     )
 
+    # Opened only for --queue. The JSON flow takes no database at all, which
+    # is what stops an ordinary run creating a state file it never reads.
+    database: Optional[Database] = None
+    if args.queue:
+        database = Database(Path(args.database) if args.database else DEFAULT_DATABASE_PATH)
+        migrate(database)
+
     run = WeeklyRun(
         connection.client,
         checkpoint_path=args.checkpoint,
         batch_size=args.batch_size,
         tech_only=not args.all_jobs,
         database=database,
+        queue_mode=bool(args.queue),
+        # `--recover` means "the last run died": a zero lease makes every
+        # outstanding claim stale, so startup recovers all of them.
+        lease_seconds=0.0 if args.recover else max(0.0, args.lease_seconds),
+        retry_policy=RetryPolicy(max_attempts=max(1, args.max_attempts)),
     )
 
     # A Ctrl-C or a shutdown finishes the batch in flight and checkpoints it,
@@ -1578,10 +2074,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             limit=args.limit,
             resume=not args.fresh,
             dry_run=args.dry_run,
+            use_queue=bool(args.queue),
+            requeue=bool(args.requeue),
         )
     except Exception as exc:  # noqa: BLE001 - reported with the API's wording
         return report_failure(exc, connection.account)
-
+    finally:
+        # Released here rather than left to the interpreter, because Windows
+        # keeps a lock on an open SQLite file and the next run would find it
+        # busy.
+        if database is not None:
+            database.close()
 
     print(_render(summary, args.dry_run, connection.client.stats))
 

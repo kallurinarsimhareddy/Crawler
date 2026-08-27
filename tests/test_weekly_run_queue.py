@@ -24,6 +24,7 @@ The classes worth reading first:
 
 from __future__ import annotations
 
+import dataclasses
 import tempfile
 import threading
 import time
@@ -92,6 +93,25 @@ class AlwaysRetry(RetryPolicy):
     def decide(self, blocker: Block, attempt: int, retry_after: Optional[float] = None) -> Verdict:
         """Always retry, immediately."""
         return Verdict(retry=True, delay=0.0, blocked=False, reason=blocker.value)
+
+
+class ImmediateRetry(RetryPolicy):
+    """The real policy's verdicts, without waiting out its cooldown.
+
+    :class:`~crawler.retry.RetryPolicy` floors its backoff at
+    :func:`utils.blocking.cooldown_seconds`, so a 503 parks for five minutes
+    whatever ``base_delay`` says. The cap is a **per-run** rule -- that is what
+    ``max_attempts`` is documented as, and ``reset_finished`` deliberately
+    zeroes ``attempts`` when it returns a company to pending -- so reaching it
+    means making the attempts inside one run rather than across three.
+    """
+
+    def decide(self, blocker: Block, attempt: int, retry_after: Optional[float] = None) -> Verdict:
+        """The policy's own verdict, due immediately."""
+        verdict = super().decide(blocker, attempt)
+        return Verdict(
+            retry=verdict.retry, delay=0.0, blocked=verdict.blocked, reason=verdict.reason
+        )
 
 
 class QueueRunTest(unittest.TestCase):
@@ -502,12 +522,9 @@ class TestFailureOutcomes(QueueRunTest):
     def test_the_attempt_cap_turns_a_transient_failure_permanent(self) -> None:
         """Three attempts of a retryable failure, then it is simply failed."""
         engine = self.failing("HTTP 503 from the board")
-        policy = RetryPolicy(max_attempts=3, base_delay=0.0, jitter=0.0)
+        policy = ImmediateRetry(max_attempts=3)
 
-        for _ in range(3):
-            self.runner(engine, retry_policy=policy, retry_poll_seconds=0.0).execute(
-                dry_run=True, requeue=True
-            )
+        self.runner(engine, retry_policy=policy, retry_poll_seconds=0.0).execute(dry_run=True)
 
         row = self.queue_row(ACME)
         self.assertEqual(row["state"], QueueState.FAILED.value)
@@ -551,11 +568,14 @@ class TestLeaseAndRecovery(QueueRunTest):
 
     def test_a_dead_runs_claims_are_released_at_startup(self) -> None:
         self.two_companies()
-        CrawlQueue(self.database).enqueue_all()
+        # The companies first: `enqueue_all` selects from the companies table,
+        # so queuing before they exist queues nothing and there is no claim for
+        # the dead worker to leave behind.
         StoreCompanies(self.database).upsert_many(
             [{"company_key": ACME, "company_name": "Acme Corporation"},
              {"company_key": OTHER, "company_name": "Other Inc"}]
         )
+        CrawlQueue(self.database).enqueue_all()
         CrawlQueue(self.database).claim("dead-worker", limit=2)
         self.assertEqual(self.stats()["running"], 2)
 
@@ -763,10 +783,16 @@ class TestJobIdentityPreservation(QueueRunTest):
         self.seed(sheet_row("Acme Corporation", "", "https://acme.com/careers"))
 
         crawled_board = "https://boards.greenhouse.io/acme"
-        job = posting(url="https://boards.greenhouse.io/acme/jobs/7")
-        job.career_page_url = crawled_board
+        # Job is a frozen dataclass, so the board the crawl actually used
+        # is substituted rather than assigned.
+        job = dataclasses.replace(
+            posting(url="https://boards.greenhouse.io/acme/jobs/7"),
+            career_page_url=crawled_board,
+        )
+        # Keyed on the company key a website-less row actually produces: the
+        # identity falls back to the careers page's domain, not to the name.
         engine = FakeEngine({
-            "name:acme": result(jobs=[job], seed_url=crawled_board, seed_field="it_link"),
+            ACME: result(jobs=[job], seed_url=crawled_board, seed_field="it_link"),
         })
         self.runner(engine).execute(dry_run=False)
 
@@ -806,7 +832,9 @@ class TestJobIdentityPreservation(QueueRunTest):
         self.runner(engine).execute(dry_run=False)
 
         in_sqlite = {row["job_key"] for row in self.stored_jobs()}
-        in_sheet = {job.job_key for job in SheetJobs(self.client).known_jobs()}
+        # The ledger calls it job_uid; the jobs table calls it job_key. Same
+        # identity, two spellings -- which is the whole point of the assertion.
+        in_sheet = {job.job_uid for job in SheetJobs(self.client).known_jobs()}
 
         self.assertTrue(in_sqlite)
         self.assertTrue(in_sqlite <= in_sheet, "the two stores disagree about identity")
@@ -877,10 +905,14 @@ class TestClosureSafety(QueueRunTest):
 
     def test_closure_is_scoped_to_one_company(self) -> None:
         """Reading Acme must never close Other's postings."""
+        # `posting` already fills company_name in, so Other's is set after the
+        # fact rather than passed twice.
+        others = dataclasses.replace(
+            posting("Analyst", "https://other.com/jobs/9"), company_name="Other Inc"
+        )
         both = FakeEngine({
             ACME: result(jobs=[posting()]),
-            OTHER: result(jobs=[posting("Analyst", "https://other.com/jobs/9",
-                                        company_name="Other Inc")]),
+            OTHER: result(jobs=[others]),
         })
         self.runner(both).execute(dry_run=False)
         self.assertEqual(StoreJobs(self.database).count(status="active"), 2)
