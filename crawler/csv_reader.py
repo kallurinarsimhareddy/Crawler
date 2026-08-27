@@ -15,16 +15,30 @@ point for turning that sheet into clean, in-memory records:
 Everything downstream may assume the returned records are non-empty, stripped
 strings keyed by ``company``, ``website``, ``career_url`` and ``it_link``.
 ``it_link`` is ``""`` when the sheet has no such column.
+
+**Encoding is not the caller's problem.** The sheet arrives from Excel, from a
+browser paste, or from an email attachment, and it is frequently Windows-1252
+rather than UTF-8 — most often because somebody typed a non-breaking space,
+which is byte ``0xA0`` and not valid UTF-8. Version 2 read the file as UTF-8
+only and made that fatal, so the operator had to convert the sheet by hand
+before every run. Decoding now goes through :mod:`utils.encoding`, which tries
+UTF-8 first, falls back through the legacy encodings, and cannot fail. The
+encoding actually used is logged, and :func:`read_companies_with_encoding`
+returns it for a caller that wants to report it. The file on disk is only ever
+read.
 """
 
 from __future__ import annotations
 
+import io
 import re
 from pathlib import Path
-from typing import Dict, Final, List, Sequence
+from typing import Dict, Final, List, Sequence, Tuple
 
 import pandas as pd
 from loguru import logger
+
+from utils.encoding import DecodedText, read_text
 
 __all__ = [
     "DEFAULT_CSV_PATH",
@@ -32,6 +46,7 @@ __all__ = [
     "REQUIRED_COLUMNS",
     "CompanyRecord",
     "read_companies",
+    "read_companies_with_encoding",
 ]
 
 #: A single validated row of the input sheet.
@@ -196,28 +211,54 @@ def read_companies(csv_path: Path | str = DEFAULT_CSV_PATH) -> List[CompanyRecor
         ValueError: If the file is not parsable as CSV, or if any of the
             required columns (:data:`REQUIRED_COLUMNS`) is missing.
     """
+    records, _ = read_companies_with_encoding(csv_path)
+    return records
+
+
+def read_companies_with_encoding(
+    csv_path: Path | str = DEFAULT_CSV_PATH,
+) -> Tuple[List[CompanyRecord], DecodedText]:
+    """Read the input sheet and report how it had to be decoded.
+
+    Identical to :func:`read_companies` except that it also hands back the
+    decode, so a run can log or export the fact that the sheet was Windows-1252
+    and how many non-breaking spaces it contained.
+
+    Args:
+        csv_path: Path to the input CSV. Defaults to :data:`DEFAULT_CSV_PATH`.
+
+    Returns:
+        ``(records, decoded)``.
+
+    Raises:
+        FileNotFoundError: If ``csv_path`` does not exist.
+        ValueError: If the file is not parsable as CSV, or if any of the
+            required columns (:data:`REQUIRED_COLUMNS`) is missing.
+    """
     path = Path(csv_path)
     logger.info("Reading company input sheet: {}", path)
 
     if not path.is_file():
         raise FileNotFoundError(f"Input CSV not found: {path.resolve()}")
 
+    # Decoding happens here rather than inside pandas so that a sheet which is
+    # not UTF-8 is recovered rather than fatal. utils.encoding cannot raise.
+    decoded = read_text(path)
+
     try:
-        # dtype=str keeps values verbatim (no numeric coercion of, say, "3E");
-        # utf-8-sig transparently drops the BOM that Excel exports prepend.
+        # dtype=str keeps values verbatim (no numeric coercion of, say, "3E").
+        # The text is already decoded and BOM-free, so pandas is handed a
+        # string buffer and never guesses at an encoding itself.
         frame = pd.read_csv(
-            path,
+            io.StringIO(decoded.text),
             dtype=str,
             keep_default_na=False,
             na_values=[""],
-            encoding="utf-8-sig",
         )
     except pd.errors.EmptyDataError as exc:
         raise ValueError(f"Input CSV is empty: {path}") from exc
     except pd.errors.ParserError as exc:
         raise ValueError(f"Input CSV is malformed: {path} ({exc})") from exc
-    except UnicodeDecodeError as exc:
-        raise ValueError(f"Input CSV is not valid UTF-8: {path} ({exc})") from exc
 
     logger.debug("Loaded {} raw row(s) with columns: {}", len(frame), list(frame.columns))
 
@@ -247,5 +288,7 @@ def read_companies(csv_path: Path | str = DEFAULT_CSV_PATH) -> List[CompanyRecor
     if nameless_rows:
         logger.warning("Skipped {} row(s) without a company name", nameless_rows)
 
-    logger.success("Loaded {} company record(s) from {}", len(records), path)
-    return records
+    logger.success(
+        "Loaded {} company record(s) from {} ({})", len(records), path, decoded.encoding
+    )
+    return records, decoded

@@ -159,6 +159,7 @@ class TestDetectPlatformByHost(unittest.TestCase):
         ("https://acme.recruiterbox.com/jobs", Platform.RECRUITERBOX),
         ("https://acme.talentbrew.com/search-jobs", Platform.RADANCY),
         ("https://www.indeed.com/cmp/Acme/jobs", Platform.INDEED),
+        ("https://acme.peopleadmin.com/postings/search", Platform.PEOPLEADMIN),
     )
 
     def test_known_boards(self) -> None:

@@ -23,7 +23,7 @@ has produced a posting, later stages describe it rather than edit it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from typing import Dict, Final, Tuple
 
 __all__ = ["EXPORT_COLUMNS", "Job"]
@@ -79,11 +79,27 @@ class Job:
     career_page_url: str = ""
     platform: str = ""
 
+    # --- Added in version 3 -------------------------------------------------
+    # Detail the version 3 sheet has columns for. Every one defaults to empty
+    # and none appears in EXPORT_COLUMNS, so ``output/jobs.xlsx`` keeps exactly
+    # the seven columns it has always had and no adapter has to change. An
+    # adapter that already parses one of these — several parse a department or
+    # a requisition id and currently discard it — can now pass it through.
+    #
+    # Nothing here is ever inferred. A board that does not publish a posted
+    # date leaves ``posted_date`` empty rather than being given a guess, which
+    # is why version 3 dates a posting by when it first observed it instead.
+    department: str = ""
+    employment_type: str = ""
+    workplace_type: str = ""
+    posted_date: str = ""
+    job_id: str = ""
+
     def __post_init__(self) -> None:
         """Normalise every field to a stripped string in place."""
-        for name, _ in EXPORT_COLUMNS:
+        for item in fields(self):
             # object.__setattr__ because the dataclass is frozen.
-            object.__setattr__(self, name, _clean(getattr(self, name)))
+            object.__setattr__(self, item.name, _clean(getattr(self, item.name)))
 
     @property
     def key(self) -> Tuple[str, str]:

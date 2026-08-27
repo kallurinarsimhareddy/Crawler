@@ -90,6 +90,7 @@ class Platform(str, Enum):
     ASURE = "Asure"
 
     # Dedicated applicant tracking systems.
+    PEOPLEADMIN = "PeopleAdmin"
     JAZZHR = "JazzHR"
     RIPPLING = "Rippling"
     PERSONIO = "Personio"
@@ -268,6 +269,19 @@ _RULES: Final[Tuple[_Rule, ...]] = (
     _Rule(Platform.RECRUITERBOX, hosts=("recruiterbox.com", "trakstar.com", "trakstarhire.com")),
     _Rule(Platform.RADANCY, hosts=("radancy.com", "talentbrew.com", "tmpwebeng.com")),
     _Rule(Platform.INDEED, hosts=("indeed.com", "indeed.jobs")),
+    # PeopleAdmin last, and the only rule here whose *path* does the real work.
+    # Institutions front it with their own domain -- jobs.montana.edu,
+    # employment.plu.edu -- so the hostname says nothing about the vendor and
+    # the search view is the only thing in the URL that does. Every other rule
+    # is evaluated before it, and hosts are tried before any path at all, so a
+    # vendor with its own domain can never be claimed by this.
+    #
+    # The trade is deliberate and the same one Taleo's "/careersection/" rule
+    # makes: an unrelated site serving "/postings/search" is classified
+    # PeopleAdmin. Detection never fetches, so the URL is all the evidence
+    # there is. adapters.peopleadmin checks the markup and fails with a clear
+    # message rather than inventing postings, which is where that is caught.
+    _Rule(Platform.PEOPLEADMIN, hosts=("peopleadmin.com",), paths=("/postings/search",)),
 )
 
 #: Schemes worth crawling. Anything else (mailto:, javascript:, ftp:) is not a page.

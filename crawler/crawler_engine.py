@@ -144,6 +144,7 @@ ADAPTER_MODULES: Final[Dict[Platform, str]] = {
     Platform.CORNERSTONE: "adapters.cornerstone",
     Platform.EIGHTFOLD: "adapters.eightfold",
     Platform.PHENOM: "adapters.phenom",
+    Platform.PEOPLEADMIN: "adapters.peopleadmin",
     Platform.PAYLOCITY: "adapters.paylocity",
     Platform.PAYCOM: "adapters.paycom",
     Platform.PAYCOR: "adapters.paycor",

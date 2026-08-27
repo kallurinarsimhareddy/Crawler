@@ -30,3 +30,22 @@ jobs-[0-9]*.xlsx
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# --- version 3 ---------------------------------------------------------------
+# Credentials. A service-account key is a private key: it must never reach the
+# GitHub remote. Ignored before the directory exists, so the window in which a
+# downloaded key could be committed by accident never opens.
+secrets/
+*.json.key
+.env
+.env.*
+!.env.example
+client_secret*.json
+service_account*.json
+token.json
+
+# Persistent crawl state. Rebuildable in principle, but large and machine-local.
+state/
+*.db
+*.db-wal
+*.db-shm

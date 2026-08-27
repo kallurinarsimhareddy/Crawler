@@ -10,3 +10,12 @@ openpyxl>=3.1
 # still runs — it just cannot read a JavaScript-only board. After installing,
 # fetch the browser itself with:  python -m playwright install chromium
 playwright>=1.40
+
+# --- version 3 -------------------------------------------------------------
+# The official Google Sheets API client. Version 3 uses the API rather than
+# scraping the spreadsheet web page, and authenticates with a service account
+# so the weekly run needs nobody signed in.
+google-api-python-client>=2.100
+google-auth>=2.20
+google-auth-oauthlib>=1.0
+google-auth-httplib2>=0.2

@@ -56,6 +56,15 @@ class Settings:
             how much of its wall clock can go that way. ``0`` means no cap.
         discover_careers: Whether a company with no usable board URL should
             have its website searched for a careers page.
+        detect_filters: Whether a board that was read should also have its own
+            search controls read, for the filter columns in MASTER_COMPANIES.
+            Off by default, and deliberately: it costs one extra request per
+            company that was crawled successfully.
+        filter_render_budget: Companies per run whose filters may be read in
+            headless Chromium when the served markup had none. ADP, UltiPro and
+            Eightfold build every control client-side, so static detection finds
+            nothing on them -- but a browser visit costs seconds, so this is
+            capped rather than unlimited. ``0`` means never render.
         diagnostics: Whether unreadable boards get an evidence dump written to
             ``diagnostics_dir``.
         diagnostics_dir: Where those dumps land.
@@ -70,6 +79,8 @@ class Settings:
     browser_fallback: bool = False
     browser_budget: int = 0
     discover_careers: bool = False
+    detect_filters: bool = False
+    filter_render_budget: int = 0
     diagnostics: bool = False
     diagnostics_dir: Path = field(default_factory=lambda: PROJECT_ROOT / "output" / "unknown_platforms")
     diagnostics_limit: int = 60

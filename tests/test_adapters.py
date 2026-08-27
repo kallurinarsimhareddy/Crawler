@@ -620,10 +620,24 @@ class TestICIMS(unittest.TestCase):
         self.assertEqual(jobs[0].location, "Austin, TX")
 
     def test_bot_challenge_is_reported_precisely(self) -> None:
+        """Blocked over HTTP, and still blocked when the browser cannot help.
+
+        The browser is stubbed out rather than left to run: iCIMS now falls
+        back to it when HTTP meets the challenge, and a unit test must not
+        launch Chromium or reach the network to prove what HTTP reported.
+        """
         session = FakeSession([html("<title>Human Verification</title><script>gokuProps</script>")])
 
-        with self.assertRaises(AdapterHttpError) as ctx:
-            icims.fetch_jobs("https://careers-acme.icims.com/jobs/search", "Acme", session=session)
+        original = icims.render_page
+        icims.render_page = lambda _url, **_kwargs: None
+        try:
+            with self.assertRaises(AdapterHttpError) as ctx:
+                icims.fetch_jobs(
+                    "https://careers-acme.icims.com/jobs/search", "Acme", session=session
+                )
+        finally:
+            icims.render_page = original
+
         self.assertIn("bot challenge", str(ctx.exception))
 
 

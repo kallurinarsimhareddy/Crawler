@@ -1,11 +1,19 @@
-# CareerCrawler v2
+# CareerCrawler
 
 Extracts every publicly visible job posting — title, location, country and URL —
 from a sheet of companies, whatever applicant tracking system each one uses.
 
-Version 2 covers **58 platforms** with a dedicated adapter, falls back to
-generic HTML extraction for the rest, and falls back again to a headless browser
-for boards that only exist once JavaScript has run.
+It covers **58 platforms** with a dedicated adapter, falls back to generic HTML
+extraction for the rest, and falls back again to a headless browser for boards
+that only exist once JavaScript has run.
+
+There are two ways to run it:
+
+* **Version 2** — a one-shot crawl over a CSV, writing a workbook. Start at
+  [Running a crawl](#running-a-crawl).
+* **Version 3** — a scheduled weekly job against a Google Sheet, with a
+  separate enrichment step that works out each company's board once and stores
+  it. Start at [The weekly pipeline](#the-weekly-pipeline).
 
 ---
 
@@ -34,7 +42,7 @@ technical failures instead. Nothing crashes — there is a test that proves it.
 ### Verify the install
 
 ```bash
-python -m unittest discover -s tests     # 397 tests, all offline
+python -m unittest discover -s tests     # 1,152 tests, all offline
 python main.py --preview                 # platform mix, no network calls
 ```
 
@@ -158,7 +166,11 @@ crawler/
   crawler_engine.py     Worker pool, dispatch, outcomes, failure isolation
   career_finder.py      Website → careers page
   diagnostics.py        Evidence dumps for unreadable boards
-adapters/               One module per ATS, 57 of them, plus shared helpers
+  ats_discovery.py      Website -> board URL, with the write rules for IT Link
+  weekly_run.py         The scheduled job: crawl, diff, write every tab
+  resolve.py            Company record -> the URL to crawl
+sheets/                 The Google Sheets store: schema, client, one repo per tab
+adapters/               One module per ATS, 58 of them, plus shared helpers
   _paginated_html.py    The shared crawler for server-rendered boards
   _ta_recruitment.py    Shared REST reader for UKG Ready and Asure
   generic.py            Fallback, and the shared card/location reasoning
@@ -171,8 +183,103 @@ utils/
   browser.py            Headless Chromium: render, intercept, scroll, load more
   location.py           Location parsing and country derivation
   jobs.py               Job assembly and deduplication
-tests/                  397 offline tests
+tests/                  1,152 offline tests
 ```
+
+---
+
+## The weekly pipeline
+
+Version 3 replaces the CSV with a Google Sheet and runs on a schedule. It is
+**two commands, deliberately kept apart**:
+
+```bash
+# 1. Enrichment — work out each company's job board and store it. Occasional.
+python -m crawler.ats_discovery --dry-run          # report; writes nothing
+python -m crawler.ats_discovery --apply            # write IT Link + Platform
+
+# 2. The weekly crawl — read the stored boards and collect postings.
+python -m crawler.weekly_run --dry-run             # crawl and compare, write nothing
+python -m crawler.weekly_run                       # the scheduled command
+```
+
+### Why they are separate
+
+Enrichment is expensive and it writes to a column an operator curates by hand.
+Discovery renders pages in a browser when a board is client-side, so it costs
+minutes per company rather than seconds, and folding it into the weekly crawl
+would make a five-hour run unpredictable. Keeping it separate also means an
+automated writer never runs unsupervised behind a human one: `--dry-run`
+reports the exact write set, and `--apply` is a second, deliberate step.
+
+A test asserts that `crawler/weekly_run.py` does not import
+`crawler.ats_discovery`, so the two cannot quietly merge.
+
+### What enrichment does
+
+For every company whose `IT Link` is blank it follows
+`Career Page URL -> careers page -> vendor board`, reusing
+`crawler.resolve.resolve_company` and `crawler.platform_detector` rather than
+detecting anything itself. Beyond that chain it adds two things the plain
+resolver does not do:
+
+* it reads `<script src>`, `<iframe src>`, `<form action>`, `<link href>` and
+  URLs inside inline JavaScript — not only `<a href>`. Most boards are
+  *embedded*, not linked;
+* it probes `/careers`, `/jobs` and the `jobs.` / `careers.` / `employment.`
+  subdomains, then optionally renders in a browser under a strict budget.
+
+```bash
+python -m crawler.ats_discovery --dry-run --render 60   # allow 60 browser visits
+python -m crawler.ats_discovery --dry-run --limit 25    # first 25 needing a board
+python -m crawler.ats_discovery --dry-run --workers 6   # companies examined at once
+python -m crawler.ats_discovery --dry-run --json out.json
+```
+
+`--dry-run` and `--apply` are mutually exclusive and **one of them is
+required**: neither reading nor writing happens by accident. A dry run also
+authenticates with the **read-only** Sheets scope, so its promise to write
+nothing is enforced by Google rather than merely intended here.
+
+### Safety rules
+
+These are enforced in code and pinned by tests, not left to convention.
+
+| Rule | Where |
+|---|---|
+| A row that already names a real vendor is never overwritten, and costs no request | `discover_board`, `needs_a_board` |
+| Only `IT Link` and `ATS / Platform` are ever written | `Enrichment.sheet_updates` |
+| Writes address rows **by number**, so no row can be appended and no duplicate `Company Key` created | `apply_discoveries` -> `store.update_rows` |
+| A vendor's CDN asset, a link to one posting, an aggregator, and a vendor's sign-in app are all refused | `_looks_like_an_asset`, `_names_one_posting`, `AGGREGATORS`, `_APPLICATION_HOSTS` |
+| A board that cannot be confidently named is left alone with a reason, never guessed | `STATUS_UNRESOLVED` |
+| A blocked, empty or failed crawl cannot clear a stored board | `TestCuratedBoardsSurviveTheWeeklyRun` |
+| Running the same plan twice writes nothing the second time | idempotence tests |
+
+**Apply from a reviewed plan, not a fresh discovery pass.** Discovery is
+network-dependent and its results vary between runs — a company can appear one
+week and be blocked the next. Read the dry run, then apply what it reported.
+
+### Known limitations of the pipeline
+
+- **Discovery has no checkpoint.** It is idempotent, so re-running is safe and
+  costs nothing for rows already answered, but an interrupted pass starts over.
+  Fine at the current 65 companies; it would need one at several thousand.
+- **Board filter detection is off and should stay off.** `--filters` on
+  `weekly_run` records a board's own search controls. On a sample of real ATS
+  boards it cost +242% runtime with a browser and produced **no usable filtered
+  URLs at all**, because those boards filter by POST rather than by a query
+  parameter. `technology_urls()` is written but unwired.
+- **The iCIMS browser fallback is unwired.** `adapters/icims.py` can read a
+  tenant behind a *self-clearing* challenge, but all four tenants currently in
+  the sheet sit behind an AWS WAF that headless Chromium never passes — the
+  same challenge page returns byte-identical after repeated waits, a current
+  Chrome UA and `navigator.webdriver` masked. They are reported as blocked.
+- **Three rows store a board whose vendor has no name.** Pittsburgh Mercy,
+  Kenyon College and Beam Therapeutics run Phenom and Greenhouse behind vanity
+  domains that `detect_platform` cannot identify, so their `ATS / Platform`
+  reads `Generic HTML`. They crawl correctly through the generic adapter. The
+  automated pipeline would not have stored these; they were added by hand after
+  being validated through `CrawlerEngine`.
 
 ---
 
@@ -212,3 +319,8 @@ names the API to call.
   `"CA (+8 more)"` yields nothing rather than something wrong.
 - **Four legacy SAP SuccessFactors portals** publish no anonymous endpoint and
   are reported as needing a browser-driven adapter.
+- **PeopleAdmin is identified by path, not hostname.** Institutions front it
+  with their own domain, so the rule matches `/postings/search`. It is the
+  broadest path rule in the detector and sits last so it cannot shadow a more
+  specific one; an unrelated site serving that path is classified PeopleAdmin,
+  and `adapters.peopleadmin.looks_like_a_board` is what catches that.
