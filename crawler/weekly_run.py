@@ -102,6 +102,7 @@ from store.repositories import JobRepository as StoreJobRepository
 from utils.blocking import Block, classify_text
 from utils.clock import iso, run_id_for, utc_now, week_of
 from utils.http import build_session, get_text
+from utils.runlock import EXIT_ALREADY_RUNNING, RunLock, RunLockBusy, lock_path_for
 
 __all__ = ["EmptyRosterError", "RunSummary", "WeeklyRun", "main"]
 
@@ -2400,6 +2401,30 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--log-file", type=Path, default=None, help="Also write a full DEBUG log here"
     )
+    parser.add_argument(
+        "--lock-path",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "Where the run lock lives (default: beside the database, so "
+            "state/crawler.db is guarded by state/crawler.lock). Two databases "
+            "are two locks; there is no system-wide lock"
+        ),
+    )
+    parser.add_argument(
+        "--no-lock",
+        action="store_true",
+        help=(
+            "UNSAFE. Run without taking the lock that stops two crawlers using "
+            "one database. Two runs sharing a database corrupt each other's "
+            "checkpoint, overwrite each other's run record and can close "
+            "postings the other just found -- all of which has happened. Only "
+            "for recovering from a lock left by a process you have confirmed is "
+            "gone, and the kernel already releases that one on exit, so you "
+            "almost certainly do not need this"
+        ),
+    )
     return parser.parse_args(list(argv))
 
 
@@ -2475,7 +2500,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     Returns:
         ``0`` on success, ``2`` when the spreadsheet is not configured, ``1``
-        on failure, ``130`` when interrupted.
+        on failure, ``75`` when another run already holds the database,
+        ``130`` when interrupted.
     """
     args = _parse_args(sys.argv[1:] if argv is None else argv)
     _configure_logging(args.log_level, args.log_file)
@@ -2486,80 +2512,132 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if connection is None:
         return code
 
-    # The run's choices, applied once. These are the version 2 defaults; the
-    # engine reads them exactly as `python main.py` makes it.
-    configure(
-        max_workers=max(1, args.workers),
-        per_host_delay=max(0.0, args.per_host_delay),
-        browser_fallback=not args.no_browser,
-        discover_careers=not args.no_discover,
-        detect_filters=bool(args.filters),
-        filter_render_budget=max(0, args.filter_render) if args.filters else 0,
-        diagnostics=False,
-        retries=args.retries,
-        output_dir=PROJECT_ROOT / "output",
-    )
+    # --- one crawler per database ----------------------------------------
+    # Taken before anything mutable is opened, and held until the database is
+    # closed. Every other lock in this project is a threading.Lock, which says
+    # nothing about a second *process* -- and on 2026-09-05 a manual run and the
+    # scheduled task ran together against one database, closed 125 postings on a
+    # second unluckier read and overwrote the run's record. The Windows task's
+    # `IgnoreNew` could not prevent it: it suppresses a second instance of the
+    # *task*, and a process started from a shell is not one.
+    #
+    # Scoped to this database and nothing else. `lock_path_for` puts the lock
+    # beside the file it protects, so a different --database takes a different
+    # lock and no path outside that database's own directory is ever opened.
+    # Nothing here is system-wide, and a separate tool with its own store is
+    # unaffected by construction rather than by luck.
+    #
+    # A dry run takes no lock: it opens no database, authenticates read-only and
+    # writes nothing, so it is safe beside a live crawl -- which is exactly when
+    # someone wants to run one.
+    database_path = Path(args.database) if args.database else DEFAULT_DATABASE_PATH
+    lock: Optional[RunLock] = None
 
-    # Opened for every run, not only --queue. The database is now where a
-    # posting becomes durable, and the JSON flow needs that as much as the
-    # queue does -- a run holding twelve thousand companies' results in memory
-    # until the end is one power cut away from having crawled nothing.
-    # `--queue` still decides only where the *work* comes from.
-    database: Optional[Database] = None
-    if not args.dry_run:
-        database = Database(Path(args.database) if args.database else DEFAULT_DATABASE_PATH)
-        migrate(database)
-
-    run = WeeklyRun(
-        connection.client,
-        checkpoint_path=args.checkpoint,
-        batch_size=args.batch_size,
-        tech_only=not args.all_jobs,
-        database=database,
-        queue_mode=bool(args.queue),
-        # `--recover` means "the last run died": a zero lease makes every
-        # outstanding claim stale, so startup recovers all of them.
-        lease_seconds=0.0 if args.recover else max(0.0, args.lease_seconds),
-        retry_policy=RetryPolicy(max_attempts=max(1, args.max_attempts)),
-    )
-
-    # A Ctrl-C or a shutdown finishes the batch in flight and checkpoints it,
-    # rather than losing however many hours the run had accumulated.
-    def stop(_signum: int, _frame: Any) -> None:
-        run.request_stop()
-
-    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
-        received = getattr(signal, name, None)
-        if received is not None:
-            try:
-                signal.signal(received, stop)
-            except (ValueError, OSError):  # pragma: no cover - not the main thread
-                pass
+    if args.dry_run:
+        logger.debug("Dry run: no lock taken, nothing is mutated")
+    elif args.no_lock:
+        logger.warning(
+            "--no-lock: running WITHOUT the guard that stops two crawlers "
+            "sharing {}. If another run is live, both will corrupt the "
+            "checkpoint and the run record.",
+            database_path,
+        )
+    else:
+        try:
+            lock = RunLock(
+                args.lock_path or lock_path_for(database_path),
+                run_id=run_id_for(),
+            ).acquire()
+        except RunLockBusy as busy:
+            print(f"\n{busy}\n", file=sys.stderr)
+            logger.error("{}", busy)
+            return EXIT_ALREADY_RUNNING
+        except OSError as exc:
+            # The lock file could not be created at all -- a missing directory
+            # or a read-only disk. An operator problem, and emphatically not
+            # contention, so it must not be reported as "already running".
+            print(f"\nCould not create the run lock: {exc}\n", file=sys.stderr)
+            return 1
 
     try:
-        summary = run.execute(
-            limit=args.limit,
-            resume=not args.fresh,
-            dry_run=args.dry_run,
-            use_queue=bool(args.queue),
-            requeue=bool(args.requeue),
+        # The run's choices, applied once. These are the version 2 defaults; the
+        # engine reads them exactly as `python main.py` makes it.
+        configure(
+            max_workers=max(1, args.workers),
+            per_host_delay=max(0.0, args.per_host_delay),
+            browser_fallback=not args.no_browser,
+            discover_careers=not args.no_discover,
+            detect_filters=bool(args.filters),
+            filter_render_budget=max(0, args.filter_render) if args.filters else 0,
+            diagnostics=False,
+            retries=args.retries,
+            output_dir=PROJECT_ROOT / "output",
         )
-    except Exception as exc:  # noqa: BLE001 - reported with the API's wording
-        return report_failure(exc, connection.account)
+
+        # Opened for every run, not only --queue. The database is now where a
+        # posting becomes durable, and the JSON flow needs that as much as the
+        # queue does -- a run holding twelve thousand companies' results in memory
+        # until the end is one power cut away from having crawled nothing.
+        # `--queue` still decides only where the *work* comes from.
+        database: Optional[Database] = None
+        if not args.dry_run:
+            # The same path the lock was derived from, so the two cannot drift.
+            database = Database(database_path)
+            migrate(database)
+
+        run = WeeklyRun(
+            connection.client,
+            checkpoint_path=args.checkpoint,
+            batch_size=args.batch_size,
+            tech_only=not args.all_jobs,
+            database=database,
+            queue_mode=bool(args.queue),
+            # `--recover` means "the last run died": a zero lease makes every
+            # outstanding claim stale, so startup recovers all of them.
+            lease_seconds=0.0 if args.recover else max(0.0, args.lease_seconds),
+            retry_policy=RetryPolicy(max_attempts=max(1, args.max_attempts)),
+        )
+
+        # A Ctrl-C or a shutdown finishes the batch in flight and checkpoints it,
+        # rather than losing however many hours the run had accumulated.
+        def stop(_signum: int, _frame: Any) -> None:
+            run.request_stop()
+
+        for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+            received = getattr(signal, name, None)
+            if received is not None:
+                try:
+                    signal.signal(received, stop)
+                except (ValueError, OSError):  # pragma: no cover - not the main thread
+                    pass
+
+        try:
+            summary = run.execute(
+                limit=args.limit,
+                resume=not args.fresh,
+                dry_run=args.dry_run,
+                use_queue=bool(args.queue),
+                requeue=bool(args.requeue),
+            )
+        except Exception as exc:  # noqa: BLE001 - reported with the API's wording
+            return report_failure(exc, connection.account)
+        finally:
+            # Released here rather than left to the interpreter, because Windows
+            # keeps a lock on an open SQLite file and the next run would find it
+            # busy.
+            if database is not None:
+                database.close()
+
+        print(_render(summary, args.dry_run, connection.client.stats))
+
+        if summary.interrupted:
+            print("\nInterrupted. Resume with:  python -m crawler.weekly_run --resume")
+            return 130
+
+        return 0
     finally:
-        # Released here rather than left to the interpreter, because Windows
-        # keeps a lock on an open SQLite file and the next run would find it
-        # busy.
-        if database is not None:
-            database.close()
-
-    print(_render(summary, args.dry_run, connection.client.stats))
-
-    if summary.interrupted:
-        print("\nInterrupted. Resume with:  python -m crawler.weekly_run --resume")
-        return 130
-
-    return 0
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":  # pragma: no cover
