@@ -1,0 +1,16 @@
+# Line endings for files that run somewhere other than here.
+#
+# This repository is developed on Windows with core.autocrlf=true, which stores
+# CRLF in the blob for these files. That is harmless for Python, which does not
+# care, and fatal for everything in deploy/: a shell script whose first line is
+# `set -euo pipefail\r` fails on Linux with "$'\r': command not found", and a
+# systemd unit with CRLF is parsed unpredictably.
+#
+# The deployment target is a Linux server, so these are pinned to LF regardless
+# of the machine they are edited on. tests/test_deploy_units.py asserts it, so a
+# regression fails in the suite rather than at 06:00 on the server.
+
+deploy/**       text eol=lf
+*.sh            text eol=lf
+*.service       text eol=lf
+*.timer         text eol=lf

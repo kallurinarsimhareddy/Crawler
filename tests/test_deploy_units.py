@@ -533,6 +533,50 @@ class TestNothingIsHardcoded(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 6b. Line endings, because these files run on Linux
+# ---------------------------------------------------------------------------
+
+
+class TestLineEndings(unittest.TestCase):
+    """Every deployment file keeps LF, whatever machine edited it.
+
+    This repository is developed on Windows with ``core.autocrlf=true``, so a
+    checkout rewrites text files with CRLF. Python does not care and neither
+    does the suite. A shell script does: a Linux server running one whose first
+    line is ``set -euo pipefail`` followed by a carriage return fails with
+    ``command not found``, and a systemd unit with CRLF is parsed unpredictably.
+
+    The files are LF today, in the working tree and in the blob. This is what
+    notices if a future checkout, editor or merge changes that -- and
+    ``.gitattributes`` is what stops it happening.
+    """
+
+    #: A carriage return, spelled this way so that this file's own line endings
+    #: cannot be mistaken for the thing under test.
+    CR = bytes([13])
+
+    def test_no_deployment_file_contains_a_carriage_return(self) -> None:
+        for path in sorted(DEPLOY.iterdir()):
+            if not path.is_file():
+                continue
+            with self.subTest(file=path.name):
+                self.assertNotIn(
+                    self.CR,
+                    path.read_bytes(),
+                    f"{path.name} has CRLF endings and will not run on Linux",
+                )
+
+    def test_gitattributes_pins_the_deployment_files_to_lf(self) -> None:
+        attributes = DEPLOY.parent / ".gitattributes"
+        self.assertTrue(attributes.is_file(), "no .gitattributes to pin line endings")
+
+        text = attributes.read_text(encoding="utf-8")
+        for pattern in ("deploy/**", "*.sh", "*.service", "*.timer"):
+            self.assertIn(pattern, text, f"{pattern} is not pinned")
+        self.assertIn("eol=lf", text)
+
+
+# ---------------------------------------------------------------------------
 # 7. The README documents what an operator has to do
 # ---------------------------------------------------------------------------
 
