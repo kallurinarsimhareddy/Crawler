@@ -1,0 +1,83 @@
+[Unit]
+# The weekly crawl. Started by careercrawler.timer on a schedule, by
+# careercrawler-resume.service after a reboot, and by hand with
+# `systemctl start careercrawler.service` -- all three are the same run, and
+# utils.runlock is what makes it safe for them to overlap in time.
+Description=CareerCrawler weekly crawl
+Documentation=file://@CC_HOME@/deploy/README.deploy.md
+
+# The crawl is nothing but network I/O, so starting before the network is
+# configured would spend its first minutes failing companies for no reason.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+# Never root. The service user needs write access to state/ and output/ and
+# read access to the credential file, and nothing else at all.
+User=@CC_USER@
+Group=@CC_USER@
+WorkingDirectory=@CC_HOME@
+
+# Optional, and the leading `-` is what makes it optional: a missing file
+# leaves the defaults below in place rather than refusing to start.
+EnvironmentFile=-/etc/careercrawler/careercrawler.env
+
+# Defaults, overridden by anything the file above sets.
+Environment=CAREERCRAWLER_WORKERS=6
+Environment=CAREERCRAWLER_PER_HOST_DELAY=0.35
+Environment=CAREERCRAWLER_LOG=@CC_HOME@/output/weekly.log
+Environment=CAREERCRAWLER_DATABASE=@CC_HOME@/state/crawler.db
+
+ExecStart=@CC_HOME@/venv/bin/python -m crawler.weekly_run \
+    --workers ${CAREERCRAWLER_WORKERS} \
+    --per-host-delay ${CAREERCRAWLER_PER_HOST_DELAY} \
+    --database ${CAREERCRAWLER_DATABASE} \
+    --log-file ${CAREERCRAWLER_LOG}
+
+# `systemctl stop` sends SIGTERM, which the crawler treats as "finish the batch
+# in flight, persist it, checkpoint it, then exit 130". It does not abandon work
+# part-way.
+KillSignal=SIGTERM
+KillMode=mixed
+
+# How long that batch is given. Batches on the real roster have run from 14 to
+# 95 minutes, so a stop during a slow one will be escalated to SIGKILL -- which
+# is survivable by design (the batch replays, every write is keyed) but is not
+# the graceful path. Raise this if you would rather wait than replay.
+TimeoutStopSec=900
+
+# A twenty-hour crawl is normal for the full roster; systemd must not treat it
+# as hung.
+TimeoutStartSec=infinity
+
+# 0 finished, 75 declined because another run holds the database (utils.runlock),
+# 130 stopped on a signal after checkpointing. None of the three is a failure,
+# and a skipped weekly run must not page anybody.
+SuccessExitStatus=0 75 130
+
+# One crawl at a time is enforced by the run lock inside the process, not by
+# systemd -- systemd can only see units it started, and the 2026-09-05 incident
+# was a shell-started process it could not see. This is belt to that braces.
+Restart=no
+
+# Hardening. The crawler reads a credential file, writes state/ and output/, and
+# talks to the network; it has no business doing anything else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=@CC_HOME@/state @CC_HOME@/output
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=careercrawler
+
+[Install]
+# Deliberately absent from any .wants: this unit is started by its timer, by the
+# resume unit, or by hand. Enabling it directly would run a crawl at every boot.

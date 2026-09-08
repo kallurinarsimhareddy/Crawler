@@ -1,0 +1,73 @@
+[Unit]
+# Picks an interrupted crawl back up after the server restarts.
+#
+# Safe beside careercrawler.timer without any coordination between them: if the
+# timer fires while this is running, or the other way round, the second process
+# finds the run lock held and exits 75, which SuccessExitStatus treats as the
+# non-event it is. That guarantee is utils.runlock's, not systemd's -- systemd
+# can only see units it started, and the 2026-09-05 double-run was a
+# shell-started process it could never have known about.
+Description=CareerCrawler resume after restart
+Documentation=file://@CC_HOME@/deploy/README.deploy.md
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+
+User=@CC_USER@
+Group=@CC_USER@
+WorkingDirectory=@CC_HOME@
+
+EnvironmentFile=-/etc/careercrawler/careercrawler.env
+
+Environment=CAREERCRAWLER_WORKERS=6
+Environment=CAREERCRAWLER_PER_HOST_DELAY=0.35
+Environment=CAREERCRAWLER_LOG=@CC_HOME@/output/weekly.log
+Environment=CAREERCRAWLER_DATABASE=@CC_HOME@/state/crawler.db
+Environment=CAREERCRAWLER_HOME=@CC_HOME@
+
+# Resume is the crawler's default, not a mode: started with no checkpoint it
+# crawls all 12,377 companies from the beginning. Without this condition every
+# reboot would launch a twenty-hour full crawl, which is not what "resume after
+# restart" means. A non-zero exit here skips the unit cleanly rather than
+# failing it.
+#
+# Needs systemd 243 or newer. On older systemd, delete this line and the unit
+# becomes "crawl at every boot" -- which you almost certainly do not want, so
+# prefer leaving the unit disabled there.
+ExecCondition=@CC_HOME@/deploy/careercrawler-should-resume.sh
+
+# The same command the timer runs. There is no --resume flag to pass: resuming
+# is what the crawler does unless --fresh says otherwise, and the condition
+# above has already established that there is something to resume.
+ExecStart=@CC_HOME@/venv/bin/python -m crawler.weekly_run \
+    --workers ${CAREERCRAWLER_WORKERS} \
+    --per-host-delay ${CAREERCRAWLER_PER_HOST_DELAY} \
+    --database ${CAREERCRAWLER_DATABASE} \
+    --log-file ${CAREERCRAWLER_LOG}
+
+KillSignal=SIGTERM
+KillMode=mixed
+TimeoutStopSec=900
+TimeoutStartSec=infinity
+SuccessExitStatus=0 75 130
+Restart=no
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=@CC_HOME@/state @CC_HOME@/output
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=careercrawler-resume
+
+[Install]
+WantedBy=multi-user.target

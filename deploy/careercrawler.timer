@@ -1,0 +1,30 @@
+[Unit]
+# The only schedule. There is deliberately no cron entry and no second timer:
+# two mechanisms firing the same unit is how a machine ends up crawling twice,
+# and while utils.runlock would refuse the second one, a refusal is a symptom to
+# investigate rather than a design.
+Description=CareerCrawler weekly crawl (Saturday 06:00)
+Documentation=file://@CC_HOME@/deploy/README.deploy.md
+
+[Timer]
+Unit=careercrawler.service
+
+# Saturday 06:00 local time, matching the Windows schedule this replaces.
+OnCalendar=Sat *-*-* 06:00:00
+
+# The systemd equivalent of "Start when available": if the server was off, or
+# suspended, or still booting at 06:00, the run happens at the next opportunity
+# instead of being silently lost for a week. This is the setting whose absence
+# on Windows meant a missed Saturday was simply gone.
+Persistent=true
+
+# Spread the start over five minutes. One machine does not need it; it costs
+# nothing and stops a fleet stampeding Workday at exactly 06:00:00.
+RandomizedDelaySec=300
+
+# Wake a suspended machine for it. Harmless where the hardware cannot, and the
+# server case this is written for is always on anyway.
+WakeSystem=false
+
+[Install]
+WantedBy=timers.target
