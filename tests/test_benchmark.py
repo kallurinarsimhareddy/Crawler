@@ -51,6 +51,7 @@ def a_measurement(**overrides: Any) -> Benchmark:
             {"host": "jobs.smartrecruiters.com", "requests": 312,
              "peak_active": 6, "waits": 88, "seconds_waiting": 12.5},
         ],
+        "browser": {"limit": 4, "taken": 37, "peak": 4, "waited": 6.2, "skipped": 1},
         "peak_rss": 512 * 1024 * 1024,
         "peak_chromium": 34,
         "samples": 1280,
@@ -185,6 +186,8 @@ class TestTheMeasurement(unittest.TestCase):
         self.assertEqual(found["outcomes"]["observations"], 5312)
         self.assertEqual(found["outcomes"]["jobs_persisted"], 0)
         self.assertEqual(found["outcomes"]["blockers"]["403 forbidden"], 9)
+        self.assertEqual(found["browser"]["skipped"], 1)
+        self.assertEqual(found["browser"]["taken"], 37)
 
     def test_the_measurement_survives_a_round_trip_through_json(self) -> None:
         """Two runs are compared by saving one and reading it back."""
@@ -231,6 +234,19 @@ class TestTheReport(unittest.TestCase):
     def test_it_calls_out_the_failures_that_mean_pushback(self) -> None:
         self.assertIn("site pushed back", self.text)
         self.assertIn("watch this as workers rise", self.text)
+
+    def test_it_reports_what_the_browser_budget_cost(self) -> None:
+        """A budget that is silently skipping rescues is a degraded crawl."""
+        self.assertIn("Browser rescues", self.text)
+        self.assertIn("Rescues taken", self.text)
+        self.assertIn("Rescues skipped", self.text)
+        self.assertIn("37", self.text)
+
+    def test_an_uncapped_budget_says_so_rather_than_showing_zeroes(self) -> None:
+        text = render(a_measurement(
+            browser={"limit": 0, "taken": 0, "peak": 0, "waited": 0.0, "skipped": 0}
+        ))
+        self.assertIn("keeps no counters by design", text)
 
     def test_it_reports_resources_and_the_limiter(self) -> None:
         self.assertIn("Peak resident memory", self.text)

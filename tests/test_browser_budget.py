@@ -119,6 +119,13 @@ class TestTheCapHolds(SettingsGuard):
         self.assertGreater(engine.browser_slots.peak, 1)
         self.assertLessEqual(engine.browser_slots.peak, 4)
 
+    def test_rescues_taken_is_the_denominator_for_skipped(self) -> None:
+        """"3 skipped" means nothing without "how many were there"."""
+        engine = self.rescue_many(budget=2, workers=6)
+
+        self.assertEqual(engine.browser_slots.taken, 6)
+        self.assertEqual(engine.browser_slots.skipped, 0)
+
     def test_zero_means_no_cap(self) -> None:
         """The shipped default, and what every run to date has had."""
         engine = self.rescue_many(budget=0, workers=6)
@@ -126,6 +133,7 @@ class TestTheCapHolds(SettingsGuard):
         self.assertEqual(engine.browser_slots.limit, 0)
         self.assertEqual(engine.browser_slots.waited, 0.0, "an uncapped run waited")
         self.assertEqual(engine.browser_slots.peak, 0, "an uncapped run counted slots")
+        self.assertEqual(engine.browser_slots.taken, 0, "an uncapped run counted slots")
 
 
 # ---------------------------------------------------------------------------

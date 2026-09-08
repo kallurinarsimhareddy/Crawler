@@ -415,6 +415,11 @@ class _BrowserSlots:
         self.waited = 0.0
         self.skipped = 0
 
+        #: Rescues that got a slot, which is the denominator `skipped` needs to
+        #: mean anything. Counted only when there *is* a budget: the uncapped
+        #: path is deliberately free of bookkeeping, and a test asserts it.
+        self.taken = 0
+
     @contextmanager
     def hold(self, timeout: float = _BROWSER_SLOT_TIMEOUT) -> Iterator[bool]:
         """Take a slot for the duration of a block.
@@ -440,6 +445,7 @@ class _BrowserSlots:
         with self._lock:
             self.waited += waited
             if taken:
+                self.taken += 1
                 self.live += 1
                 self.peak = max(self.peak, self.live)
             else:
@@ -463,7 +469,8 @@ class _BrowserSlots:
             return "browser rescues: unlimited"
         return (
             f"browser rescues: at most {self.limit} at once "
-            f"(peak {self.peak}, {self.waited:.1f}s waiting, {self.skipped} skipped)"
+            f"({self.taken} taken, peak {self.peak}, "
+            f"{self.waited:.1f}s waiting, {self.skipped} skipped)"
         )
 
 

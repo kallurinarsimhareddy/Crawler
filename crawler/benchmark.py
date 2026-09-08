@@ -316,6 +316,7 @@ class Benchmark:
     jobs_persisted: int = 0
     blockers: Dict[str, int] = field(default_factory=dict)
     http: Dict[str, Any] = field(default_factory=dict)
+    browser: Dict[str, Any] = field(default_factory=dict)
     busiest_hosts: List[Dict[str, Any]] = field(default_factory=list)
     peak_rss: Optional[int] = None
     peak_chromium: Optional[int] = None
@@ -385,6 +386,7 @@ class Benchmark:
                 "samples": self.samples,
             },
             "http": dict(self.http),
+            "browser": dict(self.browser),
             "busiest_hosts": list(self.busiest_hosts),
         }
 
@@ -495,6 +497,27 @@ def render(measured: Benchmark) -> str:
         ):
             if key in measured.http:
                 lines.append(f"    {key.replace('_', ' '):<34}{measured.http[key]}")
+
+    if measured.browser:
+        lines.append("")
+        lines.append("  Browser rescues")
+        lines.append("  " + "-" * 74)
+        budget = measured.browser.get("limit") or 0
+        lines.append(
+            f"    {'Budget':<34}{budget or 'unlimited'}"
+        )
+        if budget:
+            for label, key in (
+                ("Rescues taken", "taken"),
+                ("Peak concurrent", "peak"),
+                ("Seconds waiting for a slot", "waited"),
+                ("Rescues skipped (wait ran out)", "skipped"),
+            ):
+                lines.append(f"    {label:<34}{measured.browser.get(key)}")
+        else:
+            lines.append(
+                "    (uncapped: the unlimited path keeps no counters by design)"
+            )
 
     if measured.busiest_hosts:
         lines.append("")
@@ -653,6 +676,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         jobs_persisted=summary.jobs_persisted,
         blockers=dict(summary.blockers),
         http=limiter_found,
+        browser={
+            "limit": engine.browser_slots.limit,
+            "taken": engine.browser_slots.taken,
+            "peak": engine.browser_slots.peak,
+            "waited": round(engine.browser_slots.waited, 2),
+            "skipped": engine.browser_slots.skipped,
+        },
         busiest_hosts=limiter.busiest(8) if limiter is not None else [],
         peak_rss=sampler.peak_rss,
         peak_chromium=sampler.peak_chromium,
