@@ -66,34 +66,8 @@ def resident_bytes() -> Optional[int]:
         pass
 
     if os.name == "nt":
-        try:
-            import ctypes
-            from ctypes import wintypes
-
-            class _Counters(ctypes.Structure):
-                _fields_ = [
-                    ("cb", wintypes.DWORD),
-                    ("PageFaultCount", wintypes.DWORD),
-                    ("PeakWorkingSetSize", ctypes.c_size_t),
-                    ("WorkingSetSize", ctypes.c_size_t),
-                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
-                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
-                    ("PagefileUsage", ctypes.c_size_t),
-                    ("PeakPagefileUsage", ctypes.c_size_t),
-                ]
-
-            counters = _Counters()
-            counters.cb = ctypes.sizeof(_Counters)
-            handle = ctypes.windll.kernel32.GetCurrentProcess()
-            if ctypes.windll.psapi.GetProcessMemoryInfo(
-                handle, ctypes.byref(counters), counters.cb
-            ):
-                return int(counters.WorkingSetSize)
-        except Exception:  # noqa: BLE001 - measurement must never end a run
-            return None
-        return None
+        counters = _windows_memory()
+        return int(counters.WorkingSetSize) if counters is not None else None
 
     try:
         import resource
@@ -103,6 +77,77 @@ def resident_bytes() -> Optional[int]:
         return int(peak) if sys.platform == "darwin" else int(peak) * 1024
     except Exception:  # noqa: BLE001 - as above
         return None
+
+
+def peak_resident_bytes() -> Optional[int]:
+    """The highest resident memory this process has *ever* reached.
+
+    Better than anything sampling can produce: the operating system has been
+    watching continuously, where a sampler looking every half-second can walk
+    straight past a spike. Used alongside the samples rather than instead of
+    them, since the sampled series is what shows *when* memory grew.
+
+    Returns:
+        Bytes, or ``None`` where the platform will not say.
+    """
+    if os.name == "nt":
+        counters = _windows_memory()
+        return int(counters.PeakWorkingSetSize) if counters is not None else None
+
+    try:
+        import resource
+
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return int(peak) if sys.platform == "darwin" else int(peak) * 1024
+    except Exception:  # noqa: BLE001 - a missing number beats an invented one
+        return None
+
+
+def _windows_memory() -> Optional[Any]:
+    """This process's memory counters, from the Windows API.
+
+    ``argtypes`` are set explicitly and deliberately. Without them ctypes
+    marshals the struct pointer as a 32-bit int, the call fails on 64-bit
+    Python, and the only symptom is a measurement that quietly reports
+    "unavailable" — which is exactly what the first benchmark did.
+
+    Returns:
+        The populated structure, or ``None`` if the call failed.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel32.GetCurrentProcess.argtypes = []
+
+        query = kernel32.K32GetProcessMemoryInfo
+        query.argtypes = [wintypes.HANDLE, ctypes.POINTER(_Counters), wintypes.DWORD]
+        query.restype = wintypes.BOOL
+
+        counters = _Counters()
+        counters.cb = ctypes.sizeof(_Counters)
+
+        if query(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+            return counters
+    except Exception:  # noqa: BLE001 - measurement must never end a run
+        return None
+    return None
 
 
 def chromium_processes() -> Optional[int]:
@@ -152,6 +197,18 @@ class Sampler:
         self.peak_chromium: Optional[int] = None
         self.samples = 0
 
+        #: Chromium processes already running before the crawl started.
+        #:
+        #: The count is machine-wide, because attributing a Playwright browser
+        #: tree to its parent costs more than the number is worth. On a server
+        #: running nothing else the baseline is zero and the peak is the
+        #: crawler's. On a workstation with a browser open it is emphatically
+        #: not -- the first benchmark reported 29 Chromium processes for a
+        #: three-company crawl, essentially all of them the operator's own
+        #: Chrome. Recording the baseline is what makes the number mean
+        #: something on both.
+        self.baseline_chromium: Optional[int] = None
+
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._watch, name="benchmark-sampler", daemon=True
@@ -177,20 +234,43 @@ class Sampler:
             except Exception:  # noqa: BLE001 - sampling must not end a run
                 logger.debug("A benchmark sample failed", exc_info=True)
 
+    @property
+    def chromium_above_baseline(self) -> Optional[int]:
+        """Chromium processes beyond those already running.
+
+        Returns:
+            The crawl's own contribution, or ``None`` when either end of the
+            subtraction is unknown. Never negative: a browser the operator
+            closed mid-run is not a negative crawler.
+        """
+        if self.peak_chromium is None or self.baseline_chromium is None:
+            return None
+        return max(0, self.peak_chromium - self.baseline_chromium)
+
     def __enter__(self) -> "Sampler":
-        """Take a first sample, then start watching."""
+        """Note what was already running, then start watching."""
+        self.baseline_chromium = chromium_processes()
         self._record()
         self._thread.start()
         return self
 
     def __exit__(self, *_exc: object) -> None:
-        """Stop watching, after one last sample."""
+        """Stop watching, after one last sample.
+
+        The operating system's own high-water mark is folded in here: it has
+        been watching continuously, where sampling every half second can walk
+        past a spike.
+        """
         self._stop.set()
         self._thread.join(timeout=10)
         try:
             self._record()
         except Exception:  # noqa: BLE001 - as above
             pass
+
+        reported = peak_resident_bytes()
+        if reported is not None:
+            self.peak_rss = max(self.peak_rss or 0, reported)
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +298,9 @@ class Benchmark:
         blockers: Failure type to count, straight from the run.
         http: The limiter's counters.
         peak_rss: Highest resident memory observed, in bytes.
-        peak_chromium: Highest Chromium process count observed.
+        peak_chromium: Highest Chromium process count observed, machine-wide.
+        baseline_chromium: How many were already running before the crawl, so
+            the peak can be read on a workstation as well as a bare server.
         samples: How many samples were taken.
     """
 
@@ -237,7 +319,15 @@ class Benchmark:
     busiest_hosts: List[Dict[str, Any]] = field(default_factory=list)
     peak_rss: Optional[int] = None
     peak_chromium: Optional[int] = None
+    baseline_chromium: Optional[int] = None
     samples: int = 0
+
+    @property
+    def chromium_above_baseline(self) -> Optional[int]:
+        """Chromium processes attributable to the crawl."""
+        if self.peak_chromium is None or self.baseline_chromium is None:
+            return None
+        return max(0, self.peak_chromium - self.baseline_chromium)
 
     @property
     def seconds_per_company(self) -> float:
@@ -290,6 +380,8 @@ class Benchmark:
                     round(self.peak_rss / (1024 * 1024), 1) if self.peak_rss else None
                 ),
                 "peak_chromium_processes": self.peak_chromium,
+                "chromium_before_the_crawl": self.baseline_chromium,
+                "chromium_above_baseline": self.chromium_above_baseline,
                 "samples": self.samples,
             },
             "http": dict(self.http),
@@ -380,7 +472,16 @@ def render(measured: Benchmark) -> str:
     lines.append(
         f"    {'Peak Chromium processes':<34}"
         f"{measured.peak_chromium if measured.peak_chromium is not None else 'unavailable'}"
-        "          <- machine-wide, an upper bound"
+        "          <- machine-wide"
+    )
+    lines.append(
+        f"    {'  ...already running before':<34}"
+        f"{measured.baseline_chromium if measured.baseline_chromium is not None else 'unavailable'}"
+    )
+    lines.append(
+        f"    {'  ...attributable to the crawl':<34}"
+        f"{measured.chromium_above_baseline if measured.chromium_above_baseline is not None else 'unavailable'}"
+        "          <- this is the one that scales with workers"
     )
     lines.append(f"    {'Samples taken':<34}{measured.samples}")
 
@@ -555,6 +656,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         busiest_hosts=limiter.busiest(8) if limiter is not None else [],
         peak_rss=sampler.peak_rss,
         peak_chromium=sampler.peak_chromium,
+        baseline_chromium=sampler.baseline_chromium,
         samples=sampler.samples,
     )
 
