@@ -68,6 +68,22 @@ class Settings:
             it when the thread ends, so over a long enough batch every worker
             can still acquire one; this caps concurrent *renders*, not resident
             browsers. Bounding those means bounding workers.
+        host_concurrency: HTTP requests to one hostname that may be in flight
+            at once, across every worker. ``0`` means no limit.
+
+            Workers are concurrent *companies*, not concurrent requests to one
+            site -- but several companies routinely share a host, and the ones
+            that do are the busiest in the ledger:
+            ``jobs.smartrecruiters.com``, ``recruiting2.ultipro.com``,
+            ``workforcenow.adp.com``. Without this, raising the worker count
+            raises the pressure on those hosts one-for-one, which is how a
+            vendor starts answering 403 instead of JSON.
+
+            Defaults to ``6``, which equals the worker count production runs
+            with, so it is a no-op today and becomes the thing that stops
+            twenty workers arriving at one vendor twenty-wide. Hostname-level:
+            608 Workday tenants stay 608 independent gates.
+
         discover_careers: Whether a company with no usable board URL should
             have its website searched for a careers page.
         detect_filters: Whether a board that was read should also have its own
@@ -92,6 +108,7 @@ class Settings:
     per_host_delay: float = 0.0
     browser_fallback: bool = False
     browser_budget: int = 0
+    host_concurrency: int = 6
     discover_careers: bool = False
     detect_filters: bool = False
     filter_render_budget: int = 0

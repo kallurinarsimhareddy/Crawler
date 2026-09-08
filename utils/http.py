@@ -17,6 +17,7 @@ from a board that is down.
 
 from __future__ import annotations
 
+import threading
 from typing import Any, Dict, Final, Mapping, Optional, Tuple
 
 import requests
@@ -24,6 +25,12 @@ from loguru import logger
 from requests.adapters import HTTPAdapter
 from urllib3.exceptions import InvalidHeader
 from urllib3.util.retry import Retry
+
+from config.settings import SETTINGS
+# crawler.ratelimit imports nothing from this package, so this is acyclic. The
+# limiter lives there because that is where it was written and tested; wiring
+# it in from here is what Phase 4 does, not moving it.
+from crawler.ratelimit import DomainLimiter, RateLimitConfig
 
 __all__ = [
     "DEFAULT_RETRIES",
@@ -37,8 +44,11 @@ __all__ = [
     "build_session",
     "get_json",
     "get_text",
+    "host_limiter",
+    "limiter_stats",
     "post_json",
     "request",
+    "reset_host_limiter",
 ]
 
 #: Seconds to wait for connect and for read, respectively.
@@ -166,6 +176,74 @@ class BoundedRetry(Retry):
         return other
 
 
+#: The process-wide per-host limiter, and the concurrency it was built for.
+#:
+#: Module state rather than a parameter because every adapter, the careers-page
+#: discovery and the filter reader all call :func:`request` and none of them
+#: should have to know the limiter exists. Rebuilt when
+#: :data:`~config.settings.SETTINGS` changes, so ``configure()`` at startup --
+#: and a test that changes its mind -- both take effect.
+_LIMITER: Optional["DomainLimiter"] = None
+_LIMITER_LIMIT: Optional[int] = None
+_LIMITER_LOCK: Final[threading.Lock] = threading.Lock()
+
+
+def host_limiter() -> Optional["DomainLimiter"]:
+    """The limiter this process is using, if any.
+
+    Returns:
+        The limiter, or ``None`` when ``host_concurrency`` is ``0`` and every
+        request may proceed unbounded -- which is exactly the code path that
+        existed before the limiter was wired in.
+    """
+    global _LIMITER, _LIMITER_LIMIT
+
+    wanted = max(0, int(getattr(SETTINGS, "host_concurrency", 0) or 0))
+
+    with _LIMITER_LOCK:
+        if wanted == 0:
+            _LIMITER, _LIMITER_LIMIT = None, 0
+            return None
+
+        if _LIMITER is None or _LIMITER_LIMIT != wanted:
+            _LIMITER = DomainLimiter(
+                RateLimitConfig(
+                    # Concurrency only. crawler_engine._HostThrottle already
+                    # spaces companies out per host; pacing every request on
+                    # top would slow every paginated adapter twice over.
+                    min_delay=0.0,
+                    max_concurrent=wanted,
+                    burst=1,
+                    group_shared_vendors=False,
+                )
+            )
+            _LIMITER_LIMIT = wanted
+
+        return _LIMITER
+
+
+def reset_host_limiter() -> None:
+    """Forget the limiter and its counters.
+
+    For tests, and for a benchmark that wants one run's numbers rather than the
+    process's.
+    """
+    global _LIMITER, _LIMITER_LIMIT
+
+    with _LIMITER_LOCK:
+        _LIMITER, _LIMITER_LIMIT = None, None
+
+
+def limiter_stats() -> Dict[str, Any]:
+    """What the limiter has done so far.
+
+    Returns:
+        Its counters, or ``{}`` when no limiter is configured.
+    """
+    limiter = host_limiter()
+    return dict(limiter.stats()) if limiter is not None else {}
+
+
 class AdapterError(Exception):
     """Base class for every failure an adapter raises."""
 
@@ -259,15 +337,36 @@ def request(
         AdapterHttpError: On a transport failure, or a status that is neither
             successful nor listed in ``allow_statuses``.
     """
+    # One slot on this hostname, held for exactly this call and given back
+    # however it ends. Deliberately around the request rather than around an
+    # adapter: a company must not hold a host to itself while it paginates, and
+    # two companies on different hosts must not wait for each other.
+    #
+    # The slot spans the retries urllib3 performs inside `session.request`,
+    # which is the right side to err on -- a host that is answering 429 should
+    # keep its slot rather than let the next worker walk into the same wall.
+    limiter = host_limiter()
+
     try:
-        response = session.request(
-            method,
-            url,
-            json=json_body,
-            params=params,
-            headers=dict(headers) if headers else None,
-            timeout=timeout,
-        )
+        if limiter is None:
+            response = session.request(
+                method,
+                url,
+                json=json_body,
+                params=params,
+                headers=dict(headers) if headers else None,
+                timeout=timeout,
+            )
+        else:
+            with limiter.hold(url):
+                response = session.request(
+                    method,
+                    url,
+                    json=json_body,
+                    params=params,
+                    headers=dict(headers) if headers else None,
+                    timeout=timeout,
+                )
     except requests.RequestException as exc:
         raise AdapterHttpError(f"{method} {url} failed: {exc}") from exc
 

@@ -2402,6 +2402,20 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--log-file", type=Path, default=None, help="Also write a full DEBUG log here"
     )
     parser.add_argument(
+        "--host-concurrency",
+        type=int,
+        default=6,
+        metavar="N",
+        help=(
+            "HTTP requests to one hostname allowed in flight at once, across "
+            "every worker. Workers are concurrent companies, not concurrent "
+            "requests to one site -- but companies share hosts, and the "
+            "busiest hosts in the ledger are shared ones. Default 6, matching "
+            "the worker count production runs with, so it changes nothing "
+            "today and bounds the pressure when workers rise. 0 disables it"
+        ),
+    )
+    parser.add_argument(
         "--browser-budget",
         type=int,
         default=0,
@@ -2586,6 +2600,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # never been read must not change what a run does until an operator
             # asks for it.
             browser_budget=max(0, args.browser_budget),
+            host_concurrency=max(0, args.host_concurrency),
             discover_careers=not args.no_discover,
             detect_filters=bool(args.filters),
             filter_render_budget=max(0, args.filter_render) if args.filters else 0,
