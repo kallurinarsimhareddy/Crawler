@@ -11,6 +11,14 @@ spreadsheet ends up in*, not merely on which methods were called — which is th
 difference between proving initialisation is idempotent and proving that it
 calls something twice.
 
+**It models the destructive operations too, faithfully.** A shrinking
+``gridProperties.rowCount`` really does drop the rows past the new boundary
+here, exactly as Google does. That is deliberate and was learned the hard way:
+this fake used to clamp such a request upwards, which made every test agree that
+``ensure_size`` only ever grew while the real client was quietly shrinking a
+production tab. A simulator that declines to reproduce a dangerous operation
+cannot be used to prove the code never performs one.
+
 It also records every request, so a test can assert what was *not* sent::
 
     >>> service = FakeSheetsService({"Sheet1": []})
@@ -465,10 +473,29 @@ class FakeSheetsService:
                     grid = properties.get("gridProperties", {})
                     if "rowCount" in grid or "columnCount" in grid:
                         rows, columns = self.grid[name]
-                        self.grid[name] = (
-                            max(rows, grid.get("rowCount", rows)),
-                            max(columns, grid.get("columnCount", columns)),
-                        )
+                        wanted_rows = grid.get("rowCount", rows)
+                        wanted_columns = grid.get("columnCount", columns)
+
+                        # Applied verbatim, including downwards. This used to
+                        # clamp with max(), which made the fake kinder than the
+                        # API it stands in for -- and a simulator that refuses
+                        # to reproduce a destructive operation cannot be used to
+                        # prove the code never asks for one. `ensure_size` sent
+                        # a shrinking request against the real spreadsheet for
+                        # months while `test_the_grid_only_grows` passed, because
+                        # the clamp here was doing the growing-only that the
+                        # client was supposed to do.
+                        #
+                        # A real shrink also discards the rows past the new
+                        # boundary, so that is modelled too: a test asserting
+                        # "no data was lost" must be able to observe the loss.
+                        self.grid[name] = (wanted_rows, wanted_columns)
+                        if wanted_rows < rows:
+                            del self.tabs[name][wanted_rows:]
+                        if wanted_columns < columns:
+                            self.tabs[name] = [
+                                row[:wanted_columns] for row in self.tabs[name]
+                            ]
                     if "frozenRowCount" in grid:
                         self.frozen[name] = grid["frozenRowCount"]
 

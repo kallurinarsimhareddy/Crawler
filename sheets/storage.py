@@ -635,6 +635,74 @@ class TabStore:
         logger.info("{}: appended {} row(s)", self.title, len(rows))
         return result
 
+    def remove(
+        self,
+        keys: Iterable[str],
+        key_field: Optional[str] = None,
+        dry_run: bool = False,
+    ) -> int:
+        """Take rows out of the tab by identity, closing the gap behind them.
+
+        The tab is *compacted*, not punched through, and that is not a stylistic
+        choice. :meth:`read` treats a wholly blank row as spacing and skips it,
+        and :meth:`_write_rows` appends at ``FIRST_DATA_ROW + len(read())`` --
+        so a blank left in the middle would make the next append land on top of
+        a real row. Rewriting the survivors from the first removal downwards and
+        blanking the tail keeps the one invariant the rest of this module rests
+        on: **blank rows only ever exist as a contiguous tail.**
+
+        Nothing is deleted at the API level. This writes values, exactly as
+        :meth:`replace` does, so :class:`sheets.client.DestructiveRequestError`
+        is never provoked and a column the operator added beside the crawler's
+        own is left untouched on every row that moves.
+
+        Args:
+            keys: Identities to remove. Anything not present is ignored, which
+                is what makes calling this twice cost one write and then none.
+            key_field: The identity field. Defaults to the specification's.
+            dry_run: Work out what would go, and write nothing.
+
+        Returns:
+            How many rows were removed, or would be.
+
+        Raises:
+            ValueError: If the tab has no identity column and none was given.
+        """
+        key = key_field or self._spec.identity_field
+        if not key:
+            raise ValueError(
+                f"Tab {self._spec.title!r} has no identity column, so rows "
+                "cannot be removed by identity."
+            )
+
+        unwanted = {str(item) for item in keys if str(item or "").strip()}
+        if not unwanted:
+            return 0
+
+        existing = self.read()
+
+        # Every row carrying an unwanted key goes, not merely the first. A tab
+        # that somehow holds a posting twice must not keep the second copy.
+        survivors = [
+            record for record in existing if record.get(key) not in unwanted
+        ]
+        removed = len(existing) - len(survivors)
+
+        if not removed:
+            return 0
+
+        if dry_run:
+            logger.info("{}: would remove {} row(s)", self.title, removed)
+            return removed
+
+        # Delegated on purpose. `replace` already writes only the rows whose
+        # content actually changed -- so everything above the first removal
+        # costs nothing -- blanks exactly the tail the shorter list leaves, and
+        # never grows the grid, because the survivors can only be fewer.
+        self.replace([record.values for record in survivors], dry_run=False)
+        logger.info("{}: removed {} row(s)", self.title, removed)
+        return removed
+
     def replace(
         self,
         records: Iterable[Mapping[str, object]],

@@ -826,18 +826,41 @@ class TestJobIdentityPreservation(QueueRunTest):
         self.assertNotIn(from_the_stored_row, stored)
 
     def test_sqlite_and_the_sheet_agree_on_the_key(self) -> None:
-        """One posting, one identity, in both places."""
+        """One posting, one identity, in both places.
+
+        The tab compared against is the weekly change log rather than
+        ``JOB_HISTORY``: SQLite is the ledger now, and a run no longer copies
+        every posting into a seventeen-column tab. What still has to hold is
+        that a posting carries the *same* identity wherever it is written, so
+        the sheet and the store can be joined.
+        """
         self.two_companies()
         engine = FakeEngine({ACME: result(jobs=[posting()])})
         self.runner(engine).execute(dry_run=False)
 
         in_sqlite = {row["job_key"] for row in self.stored_jobs()}
-        # The ledger calls it job_uid; the jobs table calls it job_key. Same
-        # identity, two spellings -- which is the whole point of the assertion.
-        in_sheet = {job.job_uid for job in SheetJobs(self.client).known_jobs()}
+        in_sheet = {
+            str(record.get("job_key"))
+            for record in SheetJobs(self.client).weekly.read()
+            if record.get("job_key")
+        }
 
         self.assertTrue(in_sqlite)
+        self.assertTrue(in_sheet)
         self.assertTrue(in_sqlite <= in_sheet, "the two stores disagree about identity")
+
+    def test_the_ledger_is_no_longer_mirrored_into_job_history(self) -> None:
+        """The tab that could not hold the roster stops being written to.
+
+        Every posting is in SQLite; ``JOB_HISTORY`` keeps whatever it already
+        had. Nothing is deleted — it simply stops growing.
+        """
+        self.two_companies()
+        engine = FakeEngine({ACME: result(jobs=[posting()])})
+        self.runner(engine).execute(dry_run=False)
+
+        self.assertTrue({row["job_key"] for row in self.stored_jobs()})
+        self.assertEqual(SheetJobs(self.client).known_jobs(), [])
 
 
 # ---------------------------------------------------------------------------

@@ -84,6 +84,13 @@ class Checkpoint:
             loaded from a checkpoint an earlier attempt left behind. Not
             persisted: a fresh process has recorded nothing yet, which is
             exactly what it needs to know.
+        durable: Whether the run that wrote this checkpoint persisted each
+            batch's postings *before* recording its companies. Only such a
+            checkpoint can be resumed: one written by a run that held its
+            results in memory marks companies done whose postings were never
+            stored anywhere, and resuming it would skip them forever. Absent
+            from a checkpoint written before this guarantee existed, which is
+            precisely the case it has to catch.
     """
 
     run_id: str
@@ -94,6 +101,7 @@ class Checkpoint:
     companies: Dict[str, str] = field(default_factory=dict)
     path: Path = DEFAULT_CHECKPOINT_PATH
     recorded_now: Set[str] = field(default_factory=set)
+    durable: bool = False
 
     # -- state ---------------------------------------------------------------
 
@@ -214,6 +222,7 @@ class Checkpoint:
             "week_start": self.week_start,
             "total": self.total,
             "completed": self.completed,
+            "durable": bool(self.durable),
             "companies": dict(self.companies),
         }
 
@@ -319,6 +328,7 @@ class Checkpoint:
             total=int(payload.get("total") or 0),
             companies=companies,
             path=source,
+            durable=bool(payload.get("durable", False)),
         )
 
     @classmethod
@@ -381,6 +391,24 @@ class Checkpoint:
                 "Checkpoint at {} is from week {}, not this one; starting fresh",
                 path,
                 existing.week_start or "unknown",
+            )
+            return cls.start(run_id, total, path)
+
+        if not existing.durable:
+            # Written by a run that accumulated its postings in memory and
+            # wrote them only at the end. Its companies are marked done, but
+            # nothing was stored for them: resuming would skip exactly the
+            # companies whose results were lost. The file is left on disk for
+            # inspection — starting fresh does not delete it — and every
+            # company is crawled again.
+            logger.warning(
+                "Checkpoint at {} records {} company(ies) from run {}, but was written "
+                "before results were persisted per batch, so those postings were never "
+                "stored. Starting fresh and crawling them again; the file is left in "
+                "place.",
+                path,
+                existing.completed,
+                existing.run_id,
             )
             return cls.start(run_id, total, path)
 

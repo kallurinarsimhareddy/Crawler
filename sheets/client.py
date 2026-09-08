@@ -58,6 +58,13 @@ class DestructiveRequestError(SheetsError):
 #: legitimate use for any of them: it creates tabs, appends columns and writes
 #: values, and nothing else. Refusing them here means a future edit that
 #: introduces one fails loudly in the tests rather than quietly in production.
+#:
+#: Naming a *kind* is not sufficient on its own. ``updateSheetProperties`` is
+#: legitimate -- it is how a tab is grown and how its header row is frozen --
+#: but the same request shrinks a grid when it names a smaller ``rowCount``,
+#: and Google deletes the rows below the new boundary without saying so. That
+#: one is caught by value rather than by name, in
+#: :meth:`SheetsClient._shrinks_grid`.
 DESTRUCTIVE_REQUESTS: Final[frozenset] = frozenset(
     {
         "deleteSheet",
@@ -97,6 +104,16 @@ _BACKOFF_BASE: Final[float] = 2.0
 #: window and is refused again. This is set above it deliberately -- a run that
 #: has exhausted its quota has nothing useful to do but wait for the window.
 _BACKOFF_CEILING: Final[float] = 75.0
+
+#: Ceiling on a wait *Google* asks for, in seconds.
+#:
+#: Distinct from :data:`_BACKOFF_CEILING`, and deliberately higher. That one
+#: bounds a delay this client invented; this one bounds a delay the API named,
+#: and the API is usually right -- a hard quota really does need minutes. But
+#: "usually right" is not "bounded", and an uncapped header is how a run that
+#: has crawled for sixteen hours spends the seventeenth asleep on a single
+#: write. Five minutes clears every quota window Sheets enforces and still ends.
+_RETRY_AFTER_CEILING: Final[float] = 300.0
 
 #: Cells per values write. The API caps a request's size rather than its row
 #: count, and this is comfortably inside it for the widest tab here.
@@ -170,7 +187,10 @@ def _retry_after(error: BaseException) -> Optional[float]:
         error: The exception.
 
     Returns:
-        Seconds to wait, or ``None``.
+        Seconds to wait, bounded by :data:`_RETRY_AFTER_CEILING`, or ``None``
+        when the error named no wait. Bounded here rather than at the call
+        site because this is where an unbounded number would be produced, and
+        every caller would otherwise have to remember to clamp it.
     """
     response = getattr(error, "resp", None)
     if response is None:
@@ -185,9 +205,14 @@ def _retry_after(error: BaseException) -> Optional[float]:
         return None
 
     try:
-        return max(0.0, float(value))
+        seconds = float(value)
     except (TypeError, ValueError):
         return None
+
+    if seconds != seconds:  # NaN: a malformed header, not an instruction.
+        return None
+
+    return min(max(0.0, seconds), _RETRY_AFTER_CEILING)
 
 
 class SheetsClient:
@@ -539,8 +564,10 @@ class SheetsClient:
 
         Raises:
             DestructiveRequestError: If any request would delete or move
-                existing content. Raised before anything is sent, so a batch
-                containing one bad request performs none of them.
+                existing content -- by kind, for the requests that exist only
+                to remove things, and by value, for an ``updateSheetProperties``
+                that would shrink a grid. Raised before anything is sent, so a
+                batch containing one bad request performs none of them.
         """
         prepared = [request for request in requests if request]
         if not prepared:
@@ -554,6 +581,16 @@ class SheetsClient:
                         "appends columns and writes values; it never removes anything "
                         "from the operator's spreadsheet."
                     )
+
+            shrink = self._shrinks_grid(request)
+            if shrink is not None:
+                raise DestructiveRequestError(
+                    f"Refusing to shrink a tab's grid ({shrink}). Google removes "
+                    "every row and column past the new boundary, without asking and "
+                    "without a reply that mentions it. Version 3 grows a grid and "
+                    "never reduces one; making a tab smaller is the operator's "
+                    "decision to take in the spreadsheet."
+                )
 
         self.stats.structural += 1
         response = self._call(
@@ -614,17 +651,111 @@ class SheetsClient:
         )
         logger.info("Renamed tab {} to {!r}", sheet_id, title)
 
+    def grid_of(self, sheet_id: int) -> Optional[Tuple[int, int]]:
+        """The grid a tab currently has.
+
+        Args:
+            sheet_id: The tab's numeric id.
+
+        Returns:
+            ``(rows, columns)``, or ``None`` when the spreadsheet holds no such
+            tab -- the honest answer for one being created in the same batch,
+            and one that means "no constraint" rather than "zero".
+        """
+        for sheet in self.metadata().get("sheets", []) or []:
+            properties = sheet.get("properties", {}) or {}
+            try:
+                found = int(properties.get("sheetId", -1))
+            except (TypeError, ValueError):  # pragma: no cover - malformed metadata
+                continue
+            if found != int(sheet_id):
+                continue
+            grid = properties.get("gridProperties", {}) or {}
+            return (
+                int(grid.get("rowCount", 0) or 0),
+                int(grid.get("columnCount", 0) or 0),
+            )
+        return None
+
+    def _shrinks_grid(self, request: Dict[str, Any]) -> Optional[str]:
+        """Whether a request would make a tab smaller, and by how much.
+
+        Args:
+            request: One Sheets API request object.
+
+        Returns:
+            A description of the reduction, or ``None`` when the request shrinks
+            nothing. ``None`` is also the answer for a request naming no
+            ``rowCount`` or ``columnCount`` at all -- freezing a header row goes
+            through ``updateSheetProperties`` too, and must not be mistaken for
+            a truncation -- and for a tab the spreadsheet does not yet hold,
+            which cannot be shrunk because it does not exist.
+        """
+        body = request.get("updateSheetProperties")
+        if not isinstance(body, dict):
+            return None
+
+        properties = body.get("properties", {}) or {}
+        grid = properties.get("gridProperties", {}) or {}
+        if "rowCount" not in grid and "columnCount" not in grid:
+            return None
+
+        # Consulted only for a request that actually names a dimension, so
+        # creating, renaming and formatting a tab cost no extra read.
+        current = self.grid_of(properties.get("sheetId", -1))
+        if current is None:
+            return None
+
+        current_rows, current_columns = current
+
+        wanted_rows = int(grid.get("rowCount", current_rows) or 0)
+        if wanted_rows < current_rows:
+            return f"rowCount {current_rows} -> {wanted_rows}"
+
+        wanted_columns = int(grid.get("columnCount", current_columns) or 0)
+        if wanted_columns < current_columns:
+            return f"columnCount {current_columns} -> {wanted_columns}"
+
+        return None
+
     def ensure_size(self, sheet_id: int, rows: int, columns: int) -> None:
         """Grow a tab's grid so a write has somewhere to land.
 
-        Only ever grows. A tab is never shrunk, because shrinking one is how
-        data below the fold disappears.
+        **Only ever grows** -- and now actually so. This used to send whatever
+        it was given, which meant a caller asking for the size its *data* needs
+        -- :mod:`sheets.init` asks for ``rows + 2`` -- reduced a grid that had
+        been larger, and Google removed everything past the new boundary. That
+        was survivable only because every caller happened to ask for at least as
+        many rows as its tab already held; one that did not would have deleted
+        real data, silently, through a request whose reply says nothing of it.
+
+        So the current size is read and the request clamped to it. A call that
+        would change nothing sends nothing at all, which also spares the
+        structural quota in the common case of a tab already big enough.
 
         Args:
             sheet_id: The tab's numeric id.
             rows: The minimum rows wanted.
             columns: The minimum columns wanted.
         """
+        wanted_rows = max(2, int(rows))
+        wanted_columns = max(1, int(columns))
+
+        current = self.grid_of(sheet_id)
+        if current is not None:
+            current_rows, current_columns = current
+            wanted_rows = max(wanted_rows, current_rows)
+            wanted_columns = max(wanted_columns, current_columns)
+
+            if wanted_rows == current_rows and wanted_columns == current_columns:
+                logger.debug(
+                    "Tab {} is already {}x{}; leaving it alone",
+                    sheet_id,
+                    current_rows,
+                    current_columns,
+                )
+                return
+
         self.batch_update(
             [
                 {
@@ -632,8 +763,8 @@ class SheetsClient:
                         "properties": {
                             "sheetId": int(sheet_id),
                             "gridProperties": {
-                                "rowCount": max(2, int(rows)),
-                                "columnCount": max(1, int(columns)),
+                                "rowCount": wanted_rows,
+                                "columnCount": wanted_columns,
                             },
                         },
                         "fields": "gridProperties.rowCount,gridProperties.columnCount",

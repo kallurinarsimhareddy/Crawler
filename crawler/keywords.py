@@ -204,8 +204,22 @@ def load_keywords(client: Any, only_enabled: bool = True) -> KeywordSet:
 
     try:
         records = TabStore(client, IT_KEYWORDS).read()
-    except Exception as exc:  # noqa: BLE001 - an absent tab is not an error
-        logger.debug("IT_KEYWORDS could not be read ({}); no keywords this run", exc)
+    except Exception as exc:  # noqa: BLE001 - an unreadable tab must not end a run
+        # Loud, not silent. This used to be a debug line, from a time when
+        # nothing in production called this function -- so an unreadable tab
+        # cost nothing. It now decides how every posting of the run is
+        # classified, and a run that quietly classified two hundred thousand
+        # postings against an empty keyword list would look exactly like a
+        # successful one. The crawl still proceeds on the built-in tables,
+        # because losing the crawl is worse than losing the operator's terms,
+        # but the operator is told which happened.
+        logger.error(
+            "IT_KEYWORDS could not be read ({}): {}. No operator keywords are in "
+            "effect this run -- classification falls back to the built-in tables "
+            "in crawler.tech_filter alone.",
+            type(exc).__name__,
+            exc,
+        )
         return KeywordSet([])
 
     keywords: List[Keyword] = []
@@ -233,6 +247,19 @@ def load_keywords(client: Any, only_enabled: bool = True) -> KeywordSet:
         )
 
     found = KeywordSet(keywords)
+
+    if not found:
+        # An empty tab and an unreadable one are different faults with the same
+        # consequence, and both need saying out loud for the same reason.
+        logger.warning(
+            "IT_KEYWORDS holds no enabled term{}. No operator keywords are in "
+            "effect this run -- classification falls back to the built-in tables "
+            "in crawler.tech_filter alone. Add terms to the IT_KEYWORDS tab, or "
+            "run: python -m sheets.init --seed-keywords",
+            f" ({disabled} are switched off)" if disabled else "",
+        )
+        return found
+
     logger.info(
         "IT_KEYWORDS: {} term(s) active across {} category(ies){}",
         len(found),

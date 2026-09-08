@@ -485,6 +485,31 @@ class FailureRepository:
         """
         return self.store.upsert(records, key_field="company_key", dry_run=dry_run)
 
+    def resolve(self, company_keys: Iterable[str], dry_run: bool = False) -> int:
+        """Take companies out of ``FAILURES`` because they have since been read.
+
+        The tab reports *current unresolved* failures -- its own specification
+        says it is replaced each run, and the historical counts live in
+        ``WEEKLY_RUNS``. An incremental run cannot keep that promise by
+        upserting alone: it adds the companies that failed and never revisits
+        the ones that stopped failing, so a company fixed in March is still
+        accusing itself in June.
+
+        Removing the row loses nothing an operator needs. ``WEEKLY_RUNS``
+        retains this run's failure count, the run log retains the error, and a
+        company that fails again is simply written again.
+
+        Args:
+            company_keys: Companies **successfully read**. A company that was
+                not attempted this run must not be offered here: its failure is
+                unresolved, not resolved.
+            dry_run: Work out what would go, and write nothing.
+
+        Returns:
+            How many stale failure rows were removed.
+        """
+        return self.store.remove(company_keys, key_field="company_key", dry_run=dry_run)
+
     def counts_by_type(self) -> Dict[str, int]:
         """How many companies each failure type accounts for.
 

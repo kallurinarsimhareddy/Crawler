@@ -345,7 +345,7 @@ class TestCheckpoint(TemporaryCheckpointTest):
         self.assertEqual(
             set(payload),
             {"format", "run_id", "started_at", "updated_at", "week_start", "total",
-             "completed", "companies"},
+             "completed", "durable", "companies"},
         )
         # The only company data is the key, which names no URL and no secret.
         self.assertEqual(list(payload["companies"]), ["domain:acme.com"])
@@ -364,6 +364,9 @@ class TestCheckpoint(TemporaryCheckpointTest):
 
     def test_resume_continues_an_existing_run(self) -> None:
         first = Checkpoint.start("run-1", total=5, path=self.checkpoint_path)
+        # Written by a run that persisted each batch before recording it, which
+        # is the only kind that may be resumed.
+        first.durable = True
         first.record("domain:a.com", STATUS_DONE)
         first.save()
 
@@ -371,6 +374,26 @@ class TestCheckpoint(TemporaryCheckpointTest):
 
         self.assertEqual(resumed.run_id, "run-1")
         self.assertEqual(resumed.completed, 1)
+
+    def test_a_checkpoint_that_never_persisted_its_results_is_not_resumed(self) -> None:
+        """The failure this guard exists for: companies marked done, nothing stored.
+
+        A run that accumulated postings in memory and died recorded companies
+        as complete whose jobs reached no store at all. Resuming it would skip
+        exactly those companies, so the whole roster is crawled again instead.
+        """
+        first = Checkpoint.start("run-1", total=5, path=self.checkpoint_path)
+        first.record("domain:a.com", STATUS_DONE)
+        first.save()
+
+        self.assertFalse(json.loads(self.checkpoint_path.read_text(encoding="utf-8"))["durable"])
+
+        resumed = Checkpoint.resume_or_start("run-2", total=5, path=self.checkpoint_path)
+
+        self.assertEqual(resumed.run_id, "run-2")
+        self.assertEqual(resumed.completed, 0)
+        # Left on disk rather than deleted: it is evidence, not garbage.
+        self.assertTrue(self.checkpoint_path.is_file())
 
     def test_fresh_ignores_an_existing_checkpoint(self) -> None:
         first = Checkpoint.start("run-1", total=5, path=self.checkpoint_path)

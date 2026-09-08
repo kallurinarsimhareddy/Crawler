@@ -286,6 +286,66 @@ class JobRepository:
             if record.get("run_id")
         }
 
+    def current_job_keys(self) -> List[str]:
+        """Every posting ``CURRENT_JOBS`` currently shows.
+
+        Returns:
+            Their job keys, in sheet order, including any that appear twice --
+            reconciliation has to be able to see a duplicate in order to remove
+            both copies of it.
+        """
+        return [
+            str(record.get("job_key") or "")
+            for record in self.current.read()
+            if record.get("job_key")
+        ]
+
+    def remove_current(self, job_keys: Iterable[str], dry_run: bool = False) -> int:
+        """Take postings out of the snapshot.
+
+        ``CURRENT_JOBS`` is a view of what is open *now*, and an incremental
+        run cannot keep that promise by upserting alone: batch two has no
+        reason to touch a row batch one wrote, so a posting that closes is
+        never revisited and the tab slowly fills with jobs that are gone. The
+        run therefore reconciles the tab against the ledger before it finishes,
+        and this is the removal that does it.
+
+        Only the snapshot. ``JOB_HISTORY`` keeps its rows, ``NEW_LAST_WEEK``
+        keeps the ``closed`` entry that records the event, and SQLite keeps the
+        posting itself with its status and dates. Nothing historical is lost by
+        a row leaving this tab.
+
+        Args:
+            job_keys: The postings to drop.
+            dry_run: Work out what would go, and write nothing.
+
+        Returns:
+            How many rows were removed.
+        """
+        return self.current.remove(job_keys, key_field="job_key", dry_run=dry_run)
+
+    def logged_change_keys(self) -> Set[Tuple[str, str, str]]:
+        """Which individual changes the log already holds.
+
+        The run-level guard :meth:`logged_runs` provides is right for a run
+        that writes once and wrong for one that writes per batch: the second
+        batch would find its own run already logged and skip itself, silently,
+        for the rest of the crawl. Identity at the row level says the same
+        thing — append each change exactly once — without that.
+
+        Returns:
+            ``(run_id, job_key, change)`` for every row already written.
+        """
+        return {
+            (
+                str(record.get("run_id") or ""),
+                str(record.get("job_key") or ""),
+                str(record.get("change") or ""),
+            )
+            for record in self.weekly.read()
+            if record.get("job_key")
+        }
+
     # -- writing -------------------------------------------------------------
 
     def apply(
@@ -295,6 +355,9 @@ class JobRepository:
         run_id: str,
         tech_only: bool = True,
         dry_run: bool = False,
+        known: Optional[Sequence[Mapping[str, object]]] = None,
+        incremental: bool = False,
+        capacity: Optional[Any] = None,
     ) -> AppliedChanges:
         """Compare this run against the ledger and write the result everywhere.
 
@@ -312,6 +375,19 @@ class JobRepository:
                 can be changed later without re-crawling; only the current view
                 is narrowed.
             dry_run: Work out what would change, and write nothing.
+            known: What is already known about these companies' postings, in
+                the ledger's field names. Supplied by an incremental caller
+                from SQLite, which holds the same rows and can be asked about
+                two hundred companies rather than all of them. ``None`` reads
+                the ``JOB_HISTORY`` tab, as a whole-run call always has.
+            incremental: Whether this is one batch of a larger run. Changes two
+                things: ``JOB_HISTORY`` is not written — SQLite is the ledger
+                and mirroring hundreds of thousands of rows into a tab is what
+                exhausts the spreadsheet — and ``CURRENT_JOBS`` is upserted
+                rather than replaced, so an earlier batch's rows survive.
+            capacity: A :class:`~sheets.capacity.CapacityGuard`, consulted
+                before the append that can grow without bound. ``None`` means
+                no ceiling is enforced.
 
         Returns:
             The comparison and what was written.
@@ -319,7 +395,30 @@ class JobRepository:
         # One read of the ledger, used twice. known_jobs() would read it again,
         # and at a hundred thousand rows against a sixty-reads-per-minute quota
         # a redundant full-tab read is not a rounding error.
-        stored = [record for record in self.history.read() if record.get("job_key")]
+        if known is not None:
+            stored = [dict(record) for record in known if record.get("job_key")]
+        else:
+            stored = [record for record in self.history.read() if record.get("job_key")]
+
+            # JOB_HISTORY stopped being written when SQLite became the ledger,
+            # so on any run without a durable store -- which is every
+            # ``--dry-run``, because main() opens no database for one -- the
+            # baseline is a tab frozen at whatever it held that day. Everything
+            # stored since is invisible to the comparison, and every posting
+            # the crawler has known for months is reported as new.
+            #
+            # Deliberately a warning rather than a fix: choosing a baseline is
+            # this method's contract and changing it belongs with the caller
+            # that owns the store. But a number nobody can tell is wrong is
+            # worse than one nobody has, so the run says so.
+            logger.warning(
+                "Comparing against the {} tab ({} posting(s)), not the durable "
+                "ledger: no store was supplied. JOB_HISTORY is no longer written, "
+                "so these new/closed counts understate what is already known. For "
+                "ledger-accurate figures run: python -m crawler.status",
+                self.history.title,
+                len(stored),
+            )
         by_key = {record.get("job_key"): record for record in stored}
         known = [
             KnownJob(
@@ -352,12 +451,25 @@ class JobRepository:
         applied = AppliedChanges(changes=changes, run_id=run_id)
         stamp = iso()
 
-        applied.history = self._write_history(changes, detail, by_key, run_id, stamp, dry_run)
+        # JOB_HISTORY is the ledger only while the ledger fits in a tab. Once
+        # SQLite holds every posting, copying them here buys nothing an
+        # operator reads and costs seventeen cells apiece against a budget the
+        # roster already overruns. The existing rows are left exactly as they
+        # are; this stops adding to them.
+        if incremental:
+            applied.history = UpsertResult(dry_run=dry_run)
+        else:
+            applied.history = self._write_history(
+                changes, detail, by_key, run_id, stamp, dry_run
+            )
+
         applied.current = self._write_current(
-            changes, detail, by_key, run_id, stamp, dry_run, tech_only
+            changes, detail, by_key, run_id, stamp, dry_run, tech_only,
+            incremental=incremental, capacity=capacity,
         )
         applied.weekly, applied.already_logged = self._write_weekly(
-            changes, detail, by_key, run_id, stamp, dry_run
+            changes, detail, by_key, run_id, stamp, dry_run,
+            incremental=incremental, capacity=capacity,
         )
 
         logger.success("Weekly changes for {}: {}", run_id, applied.describe())
@@ -485,6 +597,8 @@ class JobRepository:
         stamp: str,
         dry_run: bool,
         tech_only: bool = True,
+        incremental: bool = False,
+        capacity: Optional[Any] = None,
     ) -> UpsertResult:
         """Rewrite the snapshot of what is open now.
 
@@ -496,6 +610,11 @@ class JobRepository:
             stamp: Its timestamp.
             dry_run: Write nothing.
             tech_only: Keep only postings the observation flagged as technical.
+            incremental: Whether this is one batch of a larger run. A batch
+                upserts, because ``replace`` would make batch two delete batch
+                one — the snapshot would end a twelve-thousand-company run
+                holding only its last two hundred.
+            capacity: The cell budget, consulted before writing.
 
         Returns:
             What was done.
@@ -539,7 +658,26 @@ class JobRepository:
             )
 
         rows.sort(key=lambda record: (record.get("company_name", ""), record.get("job_title", "")))
-        return self.current.replace(rows, dry_run=dry_run)
+
+        if not incremental:
+            return self.current.replace(rows, dry_run=dry_run)
+
+        if capacity is not None:
+            allowed = capacity.allow_rows(self.current.title, len(rows), len(CURRENT_JOBS.columns))
+            if allowed < len(rows):
+                rows = rows[:allowed]
+
+        if not rows:
+            return UpsertResult(dry_run=dry_run)
+
+        # First Seen is stamped once and never revised, which is also what makes
+        # a replayed batch converge rather than re-date every posting it wrote.
+        return self.current.upsert(
+            rows,
+            key_field="job_key",
+            insert_only=frozenset({"first_seen"}),
+            dry_run=dry_run,
+        )
 
     def _write_weekly(
         self,
@@ -549,6 +687,8 @@ class JobRepository:
         run_id: str,
         stamp: str,
         dry_run: bool,
+        incremental: bool = False,
+        capacity: Optional[Any] = None,
     ) -> Tuple[UpsertResult, bool]:
         """Append this run's changes to the weekly log, exactly once.
 
@@ -559,11 +699,16 @@ class JobRepository:
             run_id: The run.
             stamp: Its timestamp.
             dry_run: Write nothing.
+            incremental: Whether this is one batch of a larger run. The guard
+                moves from the run to the row: a whole-run call may skip itself
+                on a replay, but a batch must not, because its run is already
+                in the log by the time the second batch arrives.
+            capacity: The cell budget, consulted before appending.
 
         Returns:
             ``(result, already_logged)``.
         """
-        if run_id and run_id in self.logged_runs():
+        if not incremental and run_id and run_id in self.logged_runs():
             logger.info("Run {} is already in the weekly log; not appending again", run_id)
             return UpsertResult(dry_run=dry_run), True
 
@@ -600,7 +745,28 @@ class JobRepository:
         for job in changes.closed_jobs:
             rows.append(entry(job.job_uid, CHANGE_CLOSED, fallback_title=job.title))
 
+        if incremental and rows:
+            # Exactly-once at the row level. A batch that crashed after its
+            # append but before its checkpoint is replayed on the next run, and
+            # this is what stops the replay logging those changes twice.
+            already = self.logged_change_keys()
+            rows = [
+                row
+                for row in rows
+                if (run_id, str(row.get("job_key") or ""), str(row.get("change") or ""))
+                not in already
+            ]
+
         if not rows:
             return UpsertResult(dry_run=dry_run), False
+
+        if capacity is not None:
+            allowed = capacity.allow_rows(
+                self.weekly.title, len(rows), len(NEW_LAST_WEEK.columns)
+            )
+            if allowed < len(rows):
+                rows = rows[:allowed]
+            if not rows:
+                return UpsertResult(dry_run=dry_run), False
 
         return self.weekly.append(rows, dry_run=dry_run), False

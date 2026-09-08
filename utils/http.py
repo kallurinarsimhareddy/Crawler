@@ -22,15 +22,18 @@ from typing import Any, Dict, Final, Mapping, Optional, Tuple
 import requests
 from loguru import logger
 from requests.adapters import HTTPAdapter
+from urllib3.exceptions import InvalidHeader
 from urllib3.util.retry import Retry
 
 __all__ = [
     "DEFAULT_RETRIES",
     "DEFAULT_TIMEOUT",
+    "MAX_RETRY_AFTER",
     "USER_AGENT",
     "AdapterError",
     "AdapterHttpError",
     "AdapterUrlError",
+    "BoundedRetry",
     "build_session",
     "get_json",
     "get_text",
@@ -57,6 +60,111 @@ USER_AGENT: Final[str] = (
 #: mis-detected page streaming a large file into memory.
 MAX_BODY_BYTES: Final[int] = 12 * 1024 * 1024
 
+#: Ceiling on a wait a *server* asks for, in seconds.
+#:
+#: ``Retry-After`` is authoritative about when a board wants to be asked again,
+#: and it is honoured -- but it is a number the other side chooses, and some of
+#: them choose an hour. urllib3 imposes no useful bound of its own: its
+#: ``Retry.DEFAULT_RETRY_AFTER_MAX`` is 21,600 seconds, and the ``backoff_max``
+#: that does cap the *computed* delay is never consulted once a header is
+#: present, because :meth:`urllib3.util.Retry.sleep` returns as soon as
+#: ``sleep_for_retry`` has slept.
+#:
+#: The consequence at this scale is not theoretical: one worker of six parked
+#: for an hour on a single ``Retry-After: 3600`` costs a sixth of a
+#: twelve-thousand-company run's throughput, and a shared vendor answering that
+#: way parks most of the pool. Two minutes is long enough to outlast the burst
+#: limits these boards actually enforce and short enough that being wrong costs
+#: a company rather than an evening.
+MAX_RETRY_AFTER: Final[float] = 120.0
+
+
+class BoundedRetry(Retry):
+    """A retry policy that honours ``Retry-After`` but not without limit.
+
+    Everything else is :class:`urllib3.util.Retry` unchanged -- the same
+    statuses, the same exponential backoff, the same behaviour when no header
+    is sent. The single difference is that a server-supplied wait is clamped to
+    :attr:`max_retry_after` before it is slept.
+
+    Implemented by overriding :meth:`get_retry_after` rather than by passing
+    urllib3's own ``retry_after_max``, because that parameter exists only in
+    urllib3 2.x and nothing in ``requirements.txt`` pins a major version. This
+    works on both.
+
+    Attributes:
+        max_retry_after: The ceiling, in seconds. A class attribute so that a
+            policy built with the default needs no arguments, and an instance
+            attribute the moment one is set -- which :meth:`new` then carries
+            onto every copy urllib3 makes as it counts a request's attempts
+            down.
+    """
+
+    max_retry_after: float = MAX_RETRY_AFTER
+
+    def get_retry_after(self, response: Any) -> Optional[float]:
+        """The wait this response asks for, bounded.
+
+        Args:
+            response: The response carrying the header.
+
+        Returns:
+            Seconds to wait, never above :attr:`max_retry_after` and never
+            below zero, or ``None`` when the response named no usable wait --
+            in which case the caller falls through to exponential backoff
+            exactly as it always has.
+        """
+        try:
+            seconds = super().get_retry_after(response)
+        except InvalidHeader:
+            # urllib3 raises rather than returns on a header it cannot parse --
+            # a negative number, or prose. Uncaught, that turns a server's
+            # malformed reply into an exception escaping ``Retry.sleep``, which
+            # is a worse outcome than the header it came from. Treated as "no
+            # wait named" instead, so the computed backoff decides.
+            logger.debug("Ignoring an unparseable Retry-After header")
+            return None
+
+        if seconds is None:
+            return None
+
+        try:
+            wanted = float(seconds)
+        except (TypeError, ValueError):  # pragma: no cover - urllib3 parses it
+            return None
+
+        # A negative or non-finite value is a malformed header, not an
+        # instruction. Treated as "no wait named", so backoff decides.
+        if wanted != wanted or wanted < 0:
+            return None
+
+        capped = min(wanted, float(self.max_retry_after))
+        if capped < wanted:
+            logger.debug(
+                "Retry-After asked for {:.0f}s; waiting {:.0f}s instead",
+                wanted,
+                capped,
+            )
+        return capped
+
+    def new(self, **kw: Any) -> "BoundedRetry":
+        """Copy this policy, keeping the ceiling.
+
+        urllib3 rebuilds the policy after every attempt through this method,
+        and it copies only the fields it knows about. Without this the ceiling
+        would apply to the first attempt and be lost for the rest -- which is
+        precisely the attempt that would then sleep for an hour.
+
+        Args:
+            **kw: Fields urllib3 is overriding on the copy.
+
+        Returns:
+            The copy.
+        """
+        other = super().new(**kw)
+        other.max_retry_after = self.max_retry_after
+        return other
+
 
 class AdapterError(Exception):
     """Base class for every failure an adapter raises."""
@@ -70,22 +178,29 @@ class AdapterHttpError(AdapterError, RuntimeError):
     """A request failed, or the response could not be parsed."""
 
 
-def build_session(retries: int = DEFAULT_RETRIES) -> requests.Session:
+def build_session(
+    retries: int = DEFAULT_RETRIES,
+    retry_after_max: float = MAX_RETRY_AFTER,
+) -> requests.Session:
     """Create a session that retries transient failures with backoff.
 
     Retries cover connection errors, read errors and :data:`RETRY_STATUSES`, for
-    POST as well as GET, honouring ``Retry-After`` when the server sends it.
+    POST as well as GET, honouring ``Retry-After`` when the server sends it --
+    up to ``retry_after_max``, and no further.
 
     Args:
         retries: Total attempts per request, including the first. Values below
             ``1`` are treated as ``1``.
+        retry_after_max: Ceiling on a server-supplied ``Retry-After``, in
+            seconds. Defaults to :data:`MAX_RETRY_AFTER`. ``0`` ignores the
+            header entirely and always uses the computed backoff.
 
     Returns:
         A configured session. The caller owns it and should close it.
     """
     attempts = max(1, int(retries))
 
-    policy = Retry(
+    policy = BoundedRetry(
         total=attempts - 1,
         connect=attempts - 1,
         read=attempts - 1,
@@ -96,6 +211,7 @@ def build_session(retries: int = DEFAULT_RETRIES) -> requests.Session:
         respect_retry_after_header=True,
         raise_on_status=False,
     )
+    policy.max_retry_after = max(0.0, float(retry_after_max))
 
     session = requests.Session()
     session.headers.update(

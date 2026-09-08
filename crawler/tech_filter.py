@@ -36,7 +36,7 @@ operator finds the filter wrong about a title, the fix is a line here.
 from __future__ import annotations
 
 import re
-from typing import Final, FrozenSet, Iterable, Optional, Sequence, Tuple
+from typing import Any, Final, FrozenSet, Iterable, Optional, Sequence, Tuple
 
 from utils.encoding import strip_accents
 
@@ -48,9 +48,19 @@ __all__ = [
     "GENERIC_ROLES",
     "TECH_PHRASES",
     "TECH_QUALIFIERS",
+    "SUBSTRING_MATCH",
     "is_tech_job",
     "why",
 ]
+
+#: How a configured keyword is matched when it does not say. Whole words, so
+#: ``SAP`` does not fire on ``"sapphire"``. Mirrors
+#: :data:`crawler.keywords.DEFAULT_MATCH_TYPE`; spelled here rather than
+#: imported so this module keeps no dependency on the Sheets layer.
+PHRASE_MATCH: Final[str] = "phrase"
+
+#: The opt-in alternative, for an operator who wants a stem rather than a word.
+SUBSTRING_MATCH: Final[str] = "substring"
 
 #: Phrases that identify a technology role on their own. Matched as substrings
 #: of the normalised title, so word order and punctuation inside them matter.
@@ -271,7 +281,50 @@ def _contains(haystack: str, needle: str) -> bool:
     return f" {needle} " in haystack or haystack.startswith(f" {needle} ")
 
 
-def why(title: str, department: str = "", extra_keywords: Iterable[str] = ()) -> Tuple[bool, str]:
+def _configured_match(subject: str, keyword: Any) -> str:
+    """Test one operator-configured keyword against a normalised title.
+
+    A keyword arrives either as a bare string -- which is what every caller
+    passed before ``IT_KEYWORDS`` was wired in, and what the tests still pass --
+    or as a :class:`crawler.keywords.Keyword`, which additionally knows how the
+    operator wants it matched and what they filed it under. Both are accepted,
+    and a bare string behaves exactly as it always did.
+
+    Args:
+        subject: The normalised, space-padded title and department.
+        keyword: A string, or anything exposing ``folded`` / ``match_type`` /
+            ``category``.
+
+    Returns:
+        The reason this keyword decided the verdict, or ``""`` when it did not
+        match. A reason rather than a boolean because a wrong verdict has to be
+        traceable to the row of the spreadsheet that produced it.
+    """
+    term = getattr(keyword, "folded", None)
+    if term is None:
+        term = keyword
+
+    folded = _normalise(str(term or "")).strip()
+    if not folded:
+        return ""
+
+    how = str(getattr(keyword, "match_type", "") or PHRASE_MATCH).strip().lower()
+
+    if how == SUBSTRING_MATCH:
+        # Deliberately inside a longer word: the operator asked for a stem.
+        hit = folded in subject
+    else:
+        hit = _contains(subject, folded)
+
+    if not hit:
+        return ""
+
+    category = str(getattr(keyword, "category", "") or "").strip()
+    reason = f"matched configured keyword {folded!r}"
+    return f"{reason} ({category})" if category else reason
+
+
+def why(title: str, department: str = "", extra_keywords: Iterable[Any] = ()) -> Tuple[bool, str]:
     """Classify a posting and explain the verdict.
 
     Args:
@@ -279,8 +332,14 @@ def why(title: str, department: str = "", extra_keywords: Iterable[str] = ()) ->
         department: The department, when the board publishes one. Considered
             alongside the title, since ``"Engineer"`` in an ``"IT"`` department
             is a technology role and the title alone does not say so.
-        extra_keywords: Additional phrases that should count as technical, for
+        extra_keywords: Additional terms that should count as technical, for
             an operator who recruits into a niche the tables do not cover.
+            Either bare strings, matched as whole phrases, or
+            :class:`crawler.keywords.Keyword` objects read from the
+            ``IT_KEYWORDS`` tab, whose ``match_type`` and ``category`` are
+            honoured. Checked **after** the exclusions, so a configured term
+            cannot drag ``"Sales Engineer"`` back in, and **before** the
+            built-in tables, so the operator's list is what a report cites.
 
     Returns:
         ``(is_tech, reason)``. The reason names the phrase that decided it, so
@@ -303,10 +362,10 @@ def why(title: str, department: str = "", extra_keywords: Iterable[str] = ()) ->
         if core is None:
             return False, f"excluded by {soft!r}"
 
-    for phrase in extra_keywords:
-        folded = _normalise(phrase).strip()
-        if folded and _contains(subject, folded):
-            return True, f"matched configured keyword {folded!r}"
+    for keyword in extra_keywords:
+        reason = _configured_match(subject, keyword)
+        if reason:
+            return True, reason
 
     for phrase in TECH_PHRASES:
         if _contains(subject, phrase):
@@ -327,14 +386,15 @@ def why(title: str, department: str = "", extra_keywords: Iterable[str] = ()) ->
 def is_tech_job(
     title: str,
     department: str = "",
-    extra_keywords: Iterable[str] = (),
+    extra_keywords: Iterable[Any] = (),
 ) -> bool:
     """Whether a posting is an IT or technology role.
 
     Args:
         title: The posting title.
         department: The department, when known.
-        extra_keywords: Additional phrases that count as technical.
+        extra_keywords: Additional terms that count as technical -- strings,
+            or :class:`crawler.keywords.Keyword` objects from ``IT_KEYWORDS``.
 
     Returns:
         ``True`` for a technology role.

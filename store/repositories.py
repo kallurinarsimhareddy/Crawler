@@ -441,6 +441,81 @@ class JobRepository:
         )
         return len(gone)
 
+    def for_companies(self, company_keys: Sequence[str]) -> List[Dict[str, Any]]:
+        """Every stored posting belonging to these companies.
+
+        The weekly comparison needs what is already known about the companies
+        a batch just crawled, and only those. Reading the whole ledger instead
+        would mean pulling hundreds of thousands of rows once per batch to
+        answer a question about two hundred companies.
+
+        Args:
+            company_keys: The companies to fetch postings for.
+
+        Returns:
+            The rows, in no particular order. Empty when no keys are given.
+        """
+        keys = [str(key) for key in company_keys if key]
+        if not keys:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+
+        # SQLite's parameter limit is 999 by default, and a batch of companies
+        # can exceed it once the batch size is raised. Chunked rather than
+        # interpolated, so the keys stay parameters.
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                self.database.query(
+                    f"SELECT * FROM jobs WHERE company_key IN ({placeholders})",
+                    tuple(chunk),
+                )
+            )
+
+        return rows
+
+    def closed_among(self, job_keys: Sequence[str]) -> List[str]:
+        """Which of these postings the ledger currently marks closed.
+
+        Asked of the keys a report already holds rather than of the whole
+        ledger, so reconciling a spreadsheet costs a query about the rows in
+        front of us instead of two hundred thousand rows we would then throw
+        away.
+
+        Args:
+            job_keys: The postings to ask about.
+
+        Returns:
+            Those whose stored status is ``closed``. A key the ledger has never
+            heard of is **not** returned: storage cannot say a posting has
+            closed when it has no record of it opening, and reporting one as
+            closed on that basis would delete a row on the strength of
+            ignorance.
+        """
+        keys = [str(key) for key in job_keys if key]
+        if not keys:
+            return []
+
+        closed: List[str] = []
+
+        # Same chunking as for_companies, and for the same reason: SQLite's
+        # default parameter limit is 999.
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            closed.extend(
+                str(row["job_key"])
+                for row in self.database.query(
+                    f"SELECT job_key FROM jobs "
+                    f"WHERE status = 'closed' AND job_key IN ({placeholders})",
+                    tuple(chunk),
+                )
+            )
+
+        return closed
+
     def count(self, status: str = "") -> int:
         """How many postings are stored.
 

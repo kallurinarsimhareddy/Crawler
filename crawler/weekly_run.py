@@ -76,6 +76,7 @@ from crawler.checkpoint import (
     Checkpoint,
 )
 from crawler.crawler_engine import CrawlerEngine, CrawlResult, Outcome
+from crawler.keywords import KeywordSet, load_keywords
 from crawler.job_filters import (
     NARROWING_TYPES,
     DetectionMethod,
@@ -87,6 +88,7 @@ from crawler.job_filters import (
 from crawler.observations import observations_from_result
 from crawler.resolve import Resolution, resolve_company
 from crawler.retry import RetryPolicy, Verdict, classify
+from sheets.capacity import CapacityGuard, measure
 from store import Database, migrate
 from store.database import DEFAULT_DATABASE_PATH
 from store.queue import DEFAULT_LEASE_SECONDS, CrawlQueue, QueueItem, QueueState
@@ -263,6 +265,30 @@ class RunSummary:
     jobs_persisted: int = 0
     jobs_closed_locally: int = 0
 
+    # -- incremental persistence -------------------------------------------
+    # A run that writes once can read its totals off the single comparison it
+    # made. A run that writes per batch has no single comparison, so the totals
+    # are carried here instead and the batch's observations are then released.
+    segments: int = 0
+    jobs_new: int = 0
+    jobs_reopened: int = 0
+    jobs_closed: int = 0
+    jobs_still_active: int = 0
+    sheet_rows_written: int = 0
+    capacity_blocked: Dict[str, str] = field(default_factory=dict)
+
+    # -- the operator's keyword list ---------------------------------------
+    # Recorded so a verdict can be traced back to the list that produced it.
+    # Once the list is edited weekly, "why was this posting classified that
+    # way" is a question about which version of the list was in effect.
+    keywords_active: int = 0
+    keyword_categories: int = 0
+    keyword_fingerprint: str = ""
+
+    # -- reconciliation of the current-state tabs --------------------------
+    current_jobs_removed: int = 0
+    failures_resolved: int = 0
+
     @property
     def success_rate(self) -> Optional[float]:
         """Share of attempted companies that were read.
@@ -296,6 +322,18 @@ class RunSummary:
             Field name to value.
         """
         summary = self.changes.summary() if self.changes is not None else {}
+
+        # A segmented run accumulated its totals batch by batch; a single-write
+        # run reads them off the one comparison it made.
+        if self.segments:
+            jobs_active = self.observations
+            jobs_new = self.jobs_new
+            jobs_closed = self.jobs_closed
+        else:
+            jobs_active = summary.get("jobs_observed", self.observations)
+            jobs_new = summary.get("jobs_new", 0)
+            jobs_closed = summary.get("jobs_closed", 0)
+
         return {
             "companies_total": self.companies_total,
             "companies_checked": self.companies_attempted,
@@ -303,9 +341,9 @@ class RunSummary:
             "companies_failed": self.companies_failed,
             "companies_with_jobs": self.companies_with_jobs,
             "companies_no_jobs": self.companies_no_jobs,
-            "jobs_active": summary.get("jobs_observed", self.observations),
-            "jobs_new": summary.get("jobs_new", 0),
-            "jobs_closed": summary.get("jobs_closed", 0),
+            "jobs_active": jobs_active,
+            "jobs_new": jobs_new,
+            "jobs_closed": jobs_closed,
             "companies_discovered": 0,
         }
 
@@ -349,6 +387,7 @@ class RunSummary:
                     ("Closed this week", summary.get("jobs_closed", 0)),
                     ("Unchanged", summary.get("jobs_still_active", 0)),
                     ("Re-linked", summary.get("jobs_relinked", 0)),
+                    ("Removed from CURRENT_JOBS", self.current_jobs_removed),
                 ],
             ),
             (
@@ -367,6 +406,10 @@ class RunSummary:
                     ("Failure rate", self.rate_text[1]),
                     ("Closures withheld", summary.get("closures_withheld", 0)),
                     ("Companies not read", summary.get("companies_not_read", 0)),
+                    ("IT keywords in effect", self.keywords_active),
+                    ("Keyword categories", self.keyword_categories),
+                    ("Keyword list fingerprint", self.keyword_fingerprint or "none"),
+                    ("Failures resolved", self.failures_resolved),
                     ("Resumed", "yes" if self.resumed else "no"),
                     ("Interrupted", "yes" if self.interrupted else "no"),
                 ],
@@ -662,10 +705,18 @@ class WeeklyRun:
         self.queue: Optional[CrawlQueue] = None
         self._store_companies: Optional[StoreCompanyRepository] = None
         self._store_jobs: Optional[StoreJobRepository] = None
-        if self.queue_mode and database is not None:
-            self.queue = CrawlQueue(database)
+
+        # The repositories come up whenever there is a database, and the queue
+        # only when the queue is asked for. They used to be built together, so
+        # the durable job ledger was reachable only through queue mode -- which
+        # meant the default path crawled twelve thousand companies and stored
+        # none of them until the very end. Storage and work distribution are
+        # separate decisions; only the second one is opt-in.
+        if database is not None:
             self._store_companies = StoreCompanyRepository(database)
             self._store_jobs = StoreJobRepository(database)
+        if self.queue_mode and database is not None:
+            self.queue = CrawlQueue(database)
 
         #: Companies **this run** read successfully. The set handed to the
         #: weekly comparison, and the reason a resumed run does not close the
@@ -755,6 +806,16 @@ class WeeklyRun:
                 len(unusable),
             )
 
+        # --- the operator's keyword list, read once -------------------------
+        # Once per run, never per company. This is the whole reason the tab is
+        # worth having: a term added to IT_KEYWORDS on Thursday changes what
+        # Saturday recognises, with no code change and no deployment. Reading
+        # it per posting would instead spend the entire sixty-calls-a-minute
+        # quota on configuration.
+        keywords = self._load_keywords()
+        extra = tuple(extra_keywords)
+        classifier_terms: Tuple[Any, ...] = (*keywords.all(), *extra)
+
         # Either switch turns the queue on: the constructor's `queue_mode` and
         # this call's `use_queue` are the same decision reached from two
         # directions, and a runner given a database but neither flag stays on
@@ -786,6 +847,9 @@ class WeeklyRun:
             companies_total=total,
             companies_unusable=len(unusable),
             resumed=checkpoint.completed > 0,
+            keywords_active=len(keywords),
+            keyword_categories=len(keywords.categories()),
+            keyword_fingerprint=keywords.fingerprint() if keywords else "",
         )
 
         # Where the next batch comes from. The queue replaces this one thing
@@ -812,6 +876,46 @@ class WeeklyRun:
             len(pending),
             f" (resuming, {checkpoint.completed} already done)" if summary.resumed else "",
         )
+
+        # --- the durable store, for the JSON path too ------------------------
+        # Postings reference their company, so the roster has to exist before
+        # the first one is stored. Queue mode already does this inside
+        # _prepare_queue; this is the same upsert for the path that does not
+        # build a queue. Idempotent, and a blank cell never clears a stored
+        # value, so running it every week costs nothing.
+        incremental = self._store_jobs is not None and not dry_run
+        if incremental and queue is None and self._store_companies is not None:
+            stored_rows = self._store_companies.upsert_many(
+                {
+                    "company_key": record.get("company_key"),
+                    "company_name": record.get("company"),
+                    "website": record.get("website"),
+                    "career_url": record.get("career_url"),
+                    "it_link": record.get("it_link"),
+                }
+                for record in roster
+            )
+            logger.info("Durable store: {} company row(s) synchronised", stored_rows)
+
+        # Cleared until something has actually been written. The flag means
+        # "every company this file records has had its postings persisted", and
+        # it is set at the two points where that becomes true: after a batch is
+        # persisted, and after a graceful stop writes everything it accumulated.
+        # A checkpoint saved by a run that did neither is not resumable.
+        checkpoint.durable = False
+
+        # --- the cell budget -------------------------------------------------
+        capacity = None
+        if not dry_run:
+            try:
+                report = measure(self.client)
+                capacity = CapacityGuard(report)
+                logger.info("Spreadsheet capacity: {}", report.describe())
+            except Exception as exc:  # pragma: no cover - a metadata read failing
+                # A budget that cannot be measured must not stop a crawl whose
+                # results are durable anyway. The writes proceed unguarded and
+                # Google's own error is what surfaces if the ceiling is hit.
+                logger.warning("Could not measure the spreadsheet's capacity: {}", exc)
 
         if not dry_run:
             self.runs.start(
@@ -854,6 +958,14 @@ class WeeklyRun:
             # the batch is actually being worked on.
             self._start_heartbeat(queue)
 
+            # What the ledger knew about these companies *before* this batch
+            # touched them. Read here rather than after the crawl because
+            # _absorb stores each company's postings as it goes, and comparing
+            # against a ledger this batch has already updated would report
+            # every new posting as one it always knew about.
+            batch_keys = [str(record.get("company_key") or "") for record in batch]
+            prior_known = self._known_before(batch_keys, checkpoint.run_id)
+
             try:
                 # Work out where each company's jobs live before crawling it. A
                 # row that already names a board resolves without a request; one
@@ -886,7 +998,7 @@ class WeeklyRun:
                         company_outcomes,
                         checkpoint,
                         summary,
-                        extra_keywords,
+                        classifier_terms,
                         resolutions.get(str(record.get("company_key") or "")),
                         filter_sets.get(str(record.get("company_key") or "")),
                     )
@@ -898,16 +1010,53 @@ class WeeklyRun:
             finally:
                 self._stop_heartbeat()
 
+            # --- persist, then checkpoint ------------------------------------
+            # The order is the whole guarantee. Postings reached SQLite inside
+            # _absorb; this writes the operator-facing tabs; only then is the
+            # batch recorded as done. A crash anywhere before the checkpoint
+            # replays the batch, and every write it replays is keyed -- by
+            # job_key, by company_key, by (run, job, change) -- so the replay
+            # converges instead of duplicating.
+            #
+            # Checkpointing first would be the bug this run was stopped for:
+            # companies marked done whose postings exist nowhere.
+            if incremental:
+                self._persist_segment(
+                    observations=observations,
+                    failures=failures,
+                    company_outcomes=company_outcomes,
+                    known=prior_known,
+                    batch_keys=batch_keys,
+                    checkpoint=checkpoint,
+                    summary=summary,
+                    capacity=capacity,
+                )
+                # True only now: this batch's postings are in SQLite and its
+                # rows are in the sheet, so recording its companies as done
+                # cannot strand them.
+                checkpoint.durable = True
+
             # Deliberately not on a dry run. Writing the checkpoint would make
             # the next real run skip companies this one only pretended to crawl.
             if not dry_run:
                 self._save(checkpoint)
+
             logger.info(
                 "Progress: {}/{} company(ies), {} posting(s) so far",
                 checkpoint.completed,
                 len(roster),
-                len(observations),
+                summary.observations if incremental else len(observations),
             )
+
+            # --- release the batch -------------------------------------------
+            # Written and checkpointed, so the records themselves are no longer
+            # needed. `seen_keys` deliberately stays: it is the cross-batch
+            # dedup set, it holds keys rather than postings, and dropping it
+            # would let one posting be counted twice across two batches.
+            if incremental:
+                observations.clear()
+                failures.clear()
+                company_outcomes.clear()
 
         # In queue mode the loop ends by running out of claimable work, so a
         # stop request is noticed here rather than at the top of an iteration
@@ -936,43 +1085,97 @@ class WeeklyRun:
             )
 
         summary.seconds = time.monotonic() - clock
-        summary.observations = len(observations)
-        summary.tech_observations = sum(1 for item in observations if item.get("is_tech"))
-        summary.failures = failures
-        summary.blockers = self._blocker_counts(failures)
 
-        # --- write everything, once -----------------------------------------
-        applied = self.jobs.apply(
-            observations,
-            # This segment's companies, not every company the checkpoint has
-            # ever recorded. On a resume the earlier segment's companies are
-            # not re-crawled, so their postings are absent from `observations`
-            # -- and handing their keys to the comparison would read that
-            # absence as "these jobs have gone" and close every one of them.
-            crawled=checkpoint.crawled_this_session,
-            run_id=checkpoint.run_id,
-            tech_only=self.tech_only,
-            dry_run=dry_run,
-        )
-        summary.changes = applied.changes
+        if incremental:
+            # Every batch has already been written. What is left in the lists is
+            # the tail the loop never reached -- the unusable rows appended just
+            # above -- so the totals come from the running counters and only the
+            # remainder is written here.
+            #
+            # *Appended*, not assigned. `_persist_segment` accumulates each
+            # batch's failures onto the summary and then clears the list it was
+            # given, so at this point `failures` holds only the unusable rows.
+            # Assigning it discarded every real failure the run recorded, and
+            # the dashboard's failure breakdown then reported the handful of
+            # rows naming no URL as though they were the whole story.
+            summary.failures = [*summary.failures, *failures]
+            summary.blockers = self._blocker_counts(summary.failures)
+            if capacity is not None:
+                summary.capacity_blocked = dict(capacity.blocked)
+            if failures:
+                self.failures.upsert(failures, dry_run=False)
+        else:
+            summary.observations = len(observations)
+            summary.tech_observations = sum(
+                1 for item in observations if item.get("is_tech")
+            )
+            summary.failures = failures
+            summary.blockers = self._blocker_counts(failures)
+
+            # --- write everything, once -------------------------------------
+            applied = self.jobs.apply(
+                observations,
+                # This segment's companies, not every company the checkpoint has
+                # ever recorded. On a resume the earlier segment's companies are
+                # not re-crawled, so their postings are absent from
+                # `observations` -- and handing their keys to the comparison
+                # would read that absence as "these jobs have gone" and close
+                # every one of them.
+                crawled=checkpoint.crawled_this_session,
+                run_id=checkpoint.run_id,
+                tech_only=self.tech_only,
+                dry_run=dry_run,
+            )
+            summary.changes = applied.changes
+
+            if not dry_run:
+                self.companies.record_crawl(company_outcomes, dry_run=False)
+                self.failures.replace(failures, dry_run=False)
 
         if not dry_run:
-            self.companies.record_crawl(company_outcomes, dry_run=False)
-            self.failures.replace(failures, dry_run=False)
+            # Before the dashboard, so it reports what reconciliation did.
+            # Only on the incremental path: the whole-run path still writes
+            # CURRENT_JOBS with replace() and FAILURES with replace(), both of
+            # which already leave the tab holding exactly the current state.
+            if incremental:
+                self._reconcile_reports(checkpoint, summary)
+
             self.dashboard.write(
                 summary.dashboard_sections(), week_start=week_start, dry_run=False
             )
+            notes = f"{summary.observations} posting(s) observed"
+            notes += (
+                f"; {summary.keywords_active} IT keyword(s) in effect"
+                f" [{summary.keyword_fingerprint}]"
+                if summary.keywords_active
+                else "; no IT keywords in effect"
+            )
+            if summary.capacity_blocked:
+                # Recorded rather than raised. The postings are in SQLite; what
+                # ran out was a tab, and the operator needs to know which.
+                notes += (
+                    " — sheet capacity reached: "
+                    + "; ".join(
+                        f"{tab} ({reason})"
+                        for tab, reason in sorted(summary.capacity_blocked.items())
+                    )
+                )
+
             self.runs.finish(
                 checkpoint.run_id,
                 status="interrupted" if summary.interrupted else "done",
                 counts=summary.counts(),
-                notes=f"{summary.observations} posting(s) observed",
+                notes=notes,
                 dry_run=False,
             )
 
             if summary.interrupted:
                 # Kept in place, so the next invocation resumes rather than
-                # restarting the companies this one already covered.
+                # restarting the companies this one already covered. Safe to
+                # resume because everything above has just been written: a
+                # stop that runs to here has persisted what it accumulated,
+                # which a crash in the middle of the loop has not.
+                checkpoint.durable = True
                 self._save(checkpoint)
             else:
                 checkpoint.archive()
@@ -982,7 +1185,12 @@ class WeeklyRun:
             checkpoint.run_id,
             summary.companies_attempted,
             summary.observations,
-            applied.describe(),
+            (
+                f"{summary.jobs_new} new, {summary.jobs_reopened} reopened, "
+                f"{summary.jobs_closed} closed, {summary.jobs_still_active} unchanged"
+                if incremental
+                else applied.describe()
+            ),
         )
         return summary
 
@@ -1632,19 +1840,25 @@ class WeeklyRun:
                 )
             )
 
-        # -- and the durable store, when this company came from the queue -----
+        # -- the queue, when this company came from one -----------------------
         # Guarded on the claim rather than on the mode, so a company the JSON
         # path is crawling can never reach the queue by accident.
         if self.queue is not None and company_key in self._claimed:
             self._record_in_queue(company_key, result, readable, len(mine), run_id, summary)
 
-            if readable:
-                # The set handed to the weekly comparison. Successes only: a
-                # company that was not read proves nothing about what its board
-                # still advertises, and offering it would close every posting
-                # the crawl failed to see.
-                self.crawled_this_run.add(company_key)
-                self._store_postings(company_key, mine, run_id, summary)
+        # -- and the durable store, whenever there is one ---------------------
+        # This is where a posting becomes durable, and it happens here rather
+        # than at the end of the run: the batch's checkpoint is written after
+        # this, so a company is never recorded as done before its jobs are
+        # stored. Independent of the queue, because the JSON path needs the
+        # guarantee just as much.
+        if readable:
+            # The set handed to the weekly comparison. Successes only: a
+            # company that was not read proves nothing about what its board
+            # still advertises, and offering it would close every posting
+            # the crawl failed to see.
+            self.crawled_this_run.add(company_key)
+            self._store_postings(company_key, mine, run_id, summary)
 
     def _record_in_queue(
         self,
@@ -1736,7 +1950,7 @@ class WeeklyRun:
             summary: Counters, updated in place.
         """
         repository = self._store_jobs
-        if repository is None:  # pragma: no cover - built with the queue
+        if repository is None:  # pragma: no cover - only when there is no database
             return
 
         if postings:
@@ -1750,6 +1964,256 @@ class WeeklyRun:
             [str(posting.get("job_key") or "") for posting in postings],
             run_id=run_id,
         )
+
+    def _known_before(self, company_keys: Sequence[str], run_id: str) -> List[Dict[str, object]]:
+        """What the ledger held for these companies before this batch ran.
+
+        Rows this same run inserted are excluded. That matters on a replay: a
+        batch that stored its postings and then died before its checkpoint is
+        crawled again, and if its own insertions counted as prior knowledge the
+        replay would classify every one of them as an unremarkable posting it
+        had always known about, and the weekly log would never record them.
+        Dropping them restores the state the first attempt started from, which
+        is what makes the replay produce the same answer.
+
+        Args:
+            company_keys: The companies about to be crawled.
+            run_id: The run in progress.
+
+        Returns:
+            Ledger rows, in the field names ``sheets.jobs`` expects. Empty when
+            there is no durable store.
+        """
+        repository = self._store_jobs
+        if repository is None:
+            return []
+
+        return [
+            dict(row)
+            for row in repository.for_companies(company_keys)
+            if str(row.get("first_run_id") or "") != run_id
+        ]
+
+    def _persist_segment(
+        self,
+        observations: Sequence[Mapping[str, object]],
+        failures: Sequence[Mapping[str, str]],
+        company_outcomes: Mapping[str, Mapping[str, object]],
+        known: Sequence[Mapping[str, object]],
+        batch_keys: Sequence[str],
+        checkpoint: Checkpoint,
+        summary: RunSummary,
+        capacity: Optional[Any] = None,
+    ) -> None:
+        """Write one batch's results to the operator-facing tabs.
+
+        Called after the batch's postings are in SQLite and before its
+        checkpoint is written, which is the ordering that makes an interrupted
+        run safe to replay.
+
+        Every write here is keyed, so replaying a batch converges on the same
+        rows rather than adding a second copy: ``CURRENT_JOBS`` on ``job_key``,
+        ``FAILURES`` on ``company_key``, ``MASTER_COMPANIES`` on ``company_key``
+        and ``NEW_LAST_WEEK`` on the run, the job and the kind of change.
+
+        ``JOB_HISTORY`` is deliberately not written. SQLite is the ledger now,
+        and mirroring several hundred thousand rows into a seventeen-column tab
+        is what exhausts the spreadsheet.
+
+        Args:
+            observations: The batch's postings.
+            failures: The batch's failures.
+            company_outcomes: The batch's per-company notes for the roster.
+            known: What the ledger held before the batch, from
+                :meth:`_known_before`.
+            batch_keys: Company keys in this batch.
+            checkpoint: Progress, read for the companies actually read.
+            summary: Counters, updated in place.
+            capacity: The cell budget, consulted before each write.
+        """
+        summary.segments += 1
+
+        # Only this batch's successes. `crawled_this_session` grows across the
+        # whole run, and offering an earlier batch's companies here would let
+        # this comparison close postings it never looked at.
+        crawled = {key for key in batch_keys if key in checkpoint.crawled_this_session}
+
+        applied = self.jobs.apply(
+            observations,
+            crawled=crawled,
+            run_id=checkpoint.run_id,
+            tech_only=self.tech_only,
+            dry_run=False,
+            known=known,
+            incremental=True,
+            capacity=capacity,
+        )
+
+        # The most recent segment's comparison. Kept because a single-batch run
+        # -- which is most of them -- reads exactly as it always did, and
+        # because the alternative is accumulating every posting's comparison
+        # object for the whole run, which is the memory this change exists to
+        # release. Run-level totals live in the counters below, and
+        # RunSummary.counts() prefers them once a run has segments.
+        summary.changes = applied.changes
+
+        changes = applied.changes.summary() if applied.changes is not None else {}
+        summary.jobs_new += int(changes.get("jobs_new", 0))
+        summary.jobs_reopened += int(changes.get("jobs_reopened", 0))
+        summary.jobs_closed += int(changes.get("jobs_closed", 0))
+        summary.jobs_still_active += int(changes.get("jobs_still_active", 0))
+        summary.observations += len(observations)
+        summary.tech_observations += sum(1 for item in observations if item.get("is_tech"))
+
+        if company_outcomes:
+            self.companies.record_crawl(company_outcomes, dry_run=False)
+
+        # Upsert, never replace: a replace would make this batch's failures the
+        # only ones the tab holds.
+        if failures:
+            self.failures.upsert(failures, dry_run=False)
+            summary.blockers = self._blocker_counts(
+                [*summary.failures, *failures]
+            )
+            summary.failures = [*summary.failures, *failures]
+
+        if capacity is not None and capacity.blocked:
+            summary.capacity_blocked = dict(capacity.blocked)
+
+        # So WEEKLY_RUNS is worth reading during a crawl that takes hours
+        # rather than only after it.
+        self.runs.update_counts(checkpoint.run_id, summary.counts(), dry_run=False)
+
+    def _load_keywords(self) -> KeywordSet:
+        """Read ``IT_KEYWORDS`` once, for the whole run.
+
+        The tab is the configuration; this module only reads it. Called exactly
+        once per :meth:`execute`, which is what keeps a twelve-thousand-company
+        run to one Sheets call for its keyword list rather than twelve thousand.
+
+        Returns:
+            The enabled terms. Empty when the tab is absent, unreadable or
+            holds nothing — :func:`crawler.keywords.load_keywords` says so at
+            ERROR or WARNING in that case rather than passing an empty list
+            along in silence, and the run continues on the built-in tables in
+            :mod:`crawler.tech_filter`. Losing the operator's terms is bad;
+            losing the crawl because a tab could not be read would be worse.
+        """
+        try:
+            keywords = load_keywords(self.client)
+        except Exception as exc:  # noqa: BLE001 - configuration must not end a run
+            logger.error(
+                "IT_KEYWORDS could not be loaded ({}): {}. Classification falls "
+                "back to the built-in tables in crawler.tech_filter alone.",
+                type(exc).__name__,
+                exc,
+            )
+            return KeywordSet([])
+
+        if keywords:
+            logger.success(
+                "IT_KEYWORDS in effect: {} term(s), {} category(ies), fingerprint {}",
+                len(keywords),
+                len(keywords.categories()),
+                keywords.fingerprint(),
+            )
+        return keywords
+
+    def _reconcile_reports(self, checkpoint: Checkpoint, summary: RunSummary) -> None:
+        """Bring the two current-state tabs back in line with the ledger.
+
+        Both tabs promise to show *now*: ``CURRENT_JOBS`` what is open, and
+        ``FAILURES`` what is unresolved. An incremental run cannot keep either
+        promise by upserting alone — batch two has no reason to revisit a row
+        batch one wrote — so a posting that closes and a company that recovers
+        both linger. This is the pass that removes them, and it runs once, at
+        the end, rather than per batch: a rewrite costs the tail of a tab, and
+        paying that sixty-two times to keep a mid-run report tidy is not worth
+        the quota.
+
+        Driven by SQLite and by the checkpoint rather than by what this run
+        happened to observe, which is what makes it converge:
+
+        * a posting closed **this** run is closed in the ledger, so it goes;
+        * a posting closed in an **earlier** run whose removal never happened —
+          because that run crashed, or predates this code — is still closed in
+          the ledger, so it goes now;
+        * a posting the ledger has never heard of is left alone, because
+          storage cannot testify that something it never saw has ended;
+        * running the same ``run_id`` again finds nothing left to remove and
+          writes nothing, so a replay costs one read.
+
+        Neither removal can grow the grid, so neither is asked of the capacity
+        guard: :meth:`sheets.storage.TabStore.remove` can only ever leave a tab
+        the same size or shorter.
+
+        Failures here are logged and swallowed. A tidying pass that ran after
+        sixteen hours of crawling must not be the thing that loses the run.
+
+        Args:
+            checkpoint: Progress, for the companies read across every segment
+                of this run — not merely this process's, because a company an
+                earlier segment read is just as resolved as one this one did.
+            summary: Counters, updated in place.
+        """
+        repository = self._store_jobs
+
+        # -- CURRENT_JOBS: drop what the ledger marks closed ------------------
+        if repository is not None:
+            try:
+                shown = self.jobs.current_job_keys()
+                closed = repository.closed_among(shown) if shown else []
+                if closed:
+                    summary.current_jobs_removed = self.jobs.remove_current(closed)
+                    logger.info(
+                        "CURRENT_JOBS: removed {} posting(s) the ledger marks closed",
+                        summary.current_jobs_removed,
+                    )
+            except Exception as exc:  # noqa: BLE001 - tidying must not end a run
+                logger.warning(
+                    "CURRENT_JOBS could not be reconciled ({}): {}. The tab may "
+                    "still show postings SQLite has closed; the next run retries.",
+                    type(exc).__name__,
+                    exc,
+                )
+
+        # -- FAILURES: drop the companies that have since been read -----------
+        try:
+            resolved = checkpoint.crawled_keys
+            if resolved:
+                summary.failures_resolved = self.failures.resolve(resolved)
+                if summary.failures_resolved:
+                    logger.info(
+                        "FAILURES: removed {} row(s) for companies since read",
+                        summary.failures_resolved,
+                    )
+        except Exception as exc:  # noqa: BLE001 - tidying must not end a run
+            logger.warning(
+                "FAILURES could not be reconciled ({}): {}. The tab may still "
+                "show companies that have since succeeded; the next run retries.",
+                type(exc).__name__,
+                exc,
+            )
+
+        # -- and the run-level breakdown, from the reconciled tab -------------
+        # `summary.failures` holds what *this process* recorded, which is the
+        # wrong answer for a run that was interrupted and resumed: the earlier
+        # segment's failures are real, are still in the tab, and belong in the
+        # week's breakdown. The tab has just been brought up to date -- every
+        # resolved company removed, every unusable row added -- so it is now
+        # exactly "what is unresolved across this whole run", which is what the
+        # dashboard's failure section is for.
+        try:
+            counted = self.failures.counts_by_type()
+            if counted or not summary.blockers:
+                summary.blockers = counted
+        except Exception as exc:  # noqa: BLE001 - fall back to what we counted
+            logger.warning(
+                "FAILURES could not be counted ({}): {}. The dashboard reports "
+                "this process's own failures instead of the whole run's.",
+                type(exc).__name__,
+                exc,
+            )
 
     def _save(self, checkpoint: Checkpoint) -> None:
         """Write the checkpoint, treating a failure as non-fatal.
@@ -2036,10 +2500,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         output_dir=PROJECT_ROOT / "output",
     )
 
-    # Opened only for --queue. The JSON flow takes no database at all, which
-    # is what stops an ordinary run creating a state file it never reads.
+    # Opened for every run, not only --queue. The database is now where a
+    # posting becomes durable, and the JSON flow needs that as much as the
+    # queue does -- a run holding twelve thousand companies' results in memory
+    # until the end is one power cut away from having crawled nothing.
+    # `--queue` still decides only where the *work* comes from.
     database: Optional[Database] = None
-    if args.queue:
+    if not args.dry_run:
         database = Database(Path(args.database) if args.database else DEFAULT_DATABASE_PATH)
         migrate(database)
 

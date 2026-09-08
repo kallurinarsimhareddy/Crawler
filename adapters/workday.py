@@ -36,9 +36,9 @@ from urllib.parse import urlsplit
 import requests
 from loguru import logger
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from models.job import Job
+from utils.http import MAX_RETRY_AFTER, BoundedRetry
 from utils.location import derive_country
 
 __all__ = [
@@ -248,7 +248,9 @@ def build_session(retries: int = DEFAULT_RETRIES) -> requests.Session:
 
     Retries cover connection errors, read errors and the statuses in
     :data:`_RETRY_STATUSES`, for POST as well as GET. ``Retry-After`` is
-    honoured when Workday sends it.
+    honoured when Workday sends it, bounded by :data:`utils.http.MAX_RETRY_AFTER`
+    -- Workday hosts more of this roster than any other vendor, so an unbounded
+    wait it asks for is felt across hundreds of companies rather than one.
 
     Args:
         retries: Total attempts per request, including the first. Values below
@@ -259,7 +261,7 @@ def build_session(retries: int = DEFAULT_RETRIES) -> requests.Session:
     """
     attempts = max(1, int(retries))
 
-    policy = Retry(
+    policy = BoundedRetry(
         total=attempts - 1,
         connect=attempts - 1,
         read=attempts - 1,
@@ -270,6 +272,7 @@ def build_session(retries: int = DEFAULT_RETRIES) -> requests.Session:
         respect_retry_after_header=True,
         raise_on_status=False,
     )
+    policy.max_retry_after = MAX_RETRY_AFTER
 
     session = requests.Session()
     session.headers.update(
