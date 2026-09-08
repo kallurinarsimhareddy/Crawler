@@ -46,9 +46,22 @@ import queue
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Callable, Dict, Final, Iterable, List, Mapping, Optional, Protocol, Sequence, Tuple
+from typing import (
+    Callable,
+    Dict,
+    Final,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+)
 from urllib.parse import urlsplit
 
 from loguru import logger
@@ -201,6 +214,15 @@ _NEEDS_A_BROWSER: Final[re.Pattern[str]] = re.compile(
     re.IGNORECASE,
 )
 
+#: How long a worker waits for a browser slot before giving up on its rescue.
+#:
+#: Generous, because waiting is the point: a worker that cannot get a slot must
+#: not proceed without one. Bounded, because a render that wedges would
+#: otherwise hold the last slot for the rest of the run, and this crawler has
+#: been observed looping on anti-bot interstitials. Giving up yields the same
+#: outcome as a machine with no browser installed.
+_BROWSER_SLOT_TIMEOUT: Final[float] = 300.0
+
 #: URLs from the sheet tried per company before giving up on it. Two, because
 #: the pattern worth catching is a wrong ``it_link`` masking a good
 #: ``career_url``; going further mostly re-crawls the same marketing site under
@@ -351,6 +373,100 @@ class _HostThrottle:
             time.sleep(wait_for)
 
 
+class _BrowserSlots:
+    """Caps how many workers may be inside a browser rescue at once.
+
+    The rescue is the expensive path: an adapter that failed hands the page to
+    headless Chromium, which costs seconds and hundreds of megabytes where an
+    HTTP read costs milliseconds. Nothing bounded how many workers could be
+    doing that simultaneously -- :data:`~config.settings.Settings.browser_budget`
+    was declared, documented and read by no code at all -- so on a stretch of
+    roster where half the companies fail, every worker rendered at once.
+
+    A worker that cannot get a slot **waits** rather than proceeding without
+    one, because the alternative is the unbounded behaviour this exists to stop.
+    It waits with a deadline, though: a render that wedges would otherwise hold
+    the last slot for the rest of the run, and this crawler has already been
+    observed looping on anti-bot interstitials. A worker that waits past the
+    deadline skips its rescue, which is the same outcome as a machine with no
+    browser installed -- a degraded read, not a failed run.
+
+    Args:
+        limit: Concurrent rescues allowed. ``0`` means no cap, which is the
+            shipped default and the behaviour every run to date has had.
+    """
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(0, int(limit))
+        self._semaphore = (
+            threading.BoundedSemaphore(self.limit) if self.limit else None
+        )
+        self._lock = threading.Lock()
+
+        #: Rescues in flight right now, and the most ever at once. The second is
+        #: what a test asserts on: "never more than the budget" is a statement
+        #: about the peak, not about any single moment a test happens to look.
+        self.live = 0
+        self.peak = 0
+
+        #: Seconds spent waiting for a slot, and rescues skipped because the
+        #: wait ran out. Both are reported, so a budget set too low shows up as
+        #: a number rather than as a run that is mysteriously slower.
+        self.waited = 0.0
+        self.skipped = 0
+
+    @contextmanager
+    def hold(self, timeout: float = _BROWSER_SLOT_TIMEOUT) -> Iterator[bool]:
+        """Take a slot for the duration of a block.
+
+        Args:
+            timeout: Seconds to wait for a slot before giving up.
+
+        Yields:
+            ``True`` when a slot was taken and the caller may render, ``False``
+            when the wait ran out and it must not. The slot is released on the
+            way out however the block ends, so an exception in a render cannot
+            strand one.
+        """
+        if self._semaphore is None:
+            # No cap: the ungoverned behaviour every run has had so far.
+            yield True
+            return
+
+        started = time.monotonic()
+        taken = self._semaphore.acquire(timeout=max(0.0, float(timeout)))
+        waited = time.monotonic() - started
+
+        with self._lock:
+            self.waited += waited
+            if taken:
+                self.live += 1
+                self.peak = max(self.peak, self.live)
+            else:
+                self.skipped += 1
+
+        try:
+            yield taken
+        finally:
+            if taken:
+                with self._lock:
+                    self.live -= 1
+                self._semaphore.release()
+
+    def describe(self) -> str:
+        """One line for a run report.
+
+        Returns:
+            The budget and what it cost.
+        """
+        if not self.limit:
+            return "browser rescues: unlimited"
+        return (
+            f"browser rescues: at most {self.limit} at once "
+            f"(peak {self.peak}, {self.waited:.1f}s waiting, {self.skipped} skipped)"
+        )
+
+
 class CrawlerEngine:
     """Crawls company records into :class:`~models.job.Job` records.
 
@@ -363,18 +479,26 @@ class CrawlerEngine:
         session_factory: Builds the session handed to every adapter. When
             omitted, each adapter is passed ``None`` and builds its own, which
             is correct but forgoes connection reuse across companies.
+        browser_budget: Browser rescues allowed at once. ``None`` reads
+            :data:`~config.settings.SETTINGS`, which is what a run does;
+            passing a number is for tests that need a known cap without
+            mutating a process-wide singleton.
     """
 
     def __init__(
         self,
         registry: Optional[Mapping[Platform, JobFetcher]] = None,
         session_factory: Optional[SessionFactory] = None,
+        browser_budget: Optional[int] = None,
     ) -> None:
         self._registry: Dict[Platform, JobFetcher] = dict(
             registry if registry is not None else build_registry()
         )
         self._session_factory = session_factory
         self._throttle = _HostThrottle(SETTINGS.per_host_delay)
+        self.browser_slots = _BrowserSlots(
+            SETTINGS.browser_budget if browser_budget is None else browser_budget
+        )
 
     @property
     def supported_platforms(self) -> Sequence[Platform]:
@@ -629,8 +753,8 @@ class CrawlerEngine:
             discovered=discovered,
         )
 
-    @staticmethod
     def _rescue_with_browser(
+        self,
         company: str,
         seed_url: str,
         platform: Platform,
@@ -679,11 +803,30 @@ class CrawlerEngine:
         # Imported here so a browserless run never pulls in the module.
         from adapters.generic import render_and_extract
 
-        try:
-            jobs = render_and_extract(seed_url, company, platform.value, career_page_url=seed_url)
-        except Exception:  # noqa: BLE001 - the rescue must never end the run
-            logger.opt(exception=True).debug("{}: browser rescue failed on {}", company, seed_url)
-            return []
+        # The slot is taken *before* Chromium is asked for and given back on the
+        # way out however this ends, so a render that raises cannot strand one.
+        with self.browser_slots.hold() as slot:
+            if not slot:
+                logger.warning(
+                    "{}: skipping the browser rescue on {} — no slot free within "
+                    "{:.0f}s and the budget is {}. The board is reported as it "
+                    "read over HTTP.",
+                    company,
+                    seed_url,
+                    _BROWSER_SLOT_TIMEOUT,
+                    self.browser_slots.limit,
+                )
+                return []
+
+            try:
+                jobs = render_and_extract(
+                    seed_url, company, platform.value, career_page_url=seed_url
+                )
+            except Exception:  # noqa: BLE001 - the rescue must never end the run
+                logger.opt(exception=True).debug(
+                    "{}: browser rescue failed on {}", company, seed_url
+                )
+                return []
 
         if jobs:
             logger.success(

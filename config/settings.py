@@ -51,9 +51,23 @@ class Settings:
             ADP, Workday — from being hit in parallel by the whole pool.
         browser_fallback: Whether an adapter that finds nothing over HTTP may
             re-try the page in headless Chromium.
-        browser_budget: Companies per run allowed to use the browser. A browser
-            visit costs seconds rather than milliseconds, so a bulk run caps
-            how much of its wall clock can go that way. ``0`` means no cap.
+        browser_budget: Browser rescues allowed to run **at the same time**.
+            ``0`` means no cap, which is the shipped default and what every run
+            to date has effectively had.
+
+            The wording changed with the meaning. This used to read "companies
+            per run allowed to use the browser" -- a total, spent once and gone
+            -- but nothing ever read the value, so no run has been governed by
+            either reading. A concurrency cap is the more useful one: the cost a
+            bulk run needs to bound is how much CPU, memory and network the
+            renders take *at once*, and a total that is exhausted halfway
+            through leaves the rest of the roster with no rescue at all.
+
+            What it does not bound is the number of live Chromium processes.
+            :mod:`utils.browser` keeps one browser per worker thread and closes
+            it when the thread ends, so over a long enough batch every worker
+            can still acquire one; this caps concurrent *renders*, not resident
+            browsers. Bounding those means bounding workers.
         discover_careers: Whether a company with no usable board URL should
             have its website searched for a careers page.
         detect_filters: Whether a board that was read should also have its own

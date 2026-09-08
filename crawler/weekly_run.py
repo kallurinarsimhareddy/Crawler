@@ -2402,6 +2402,22 @@ def _parse_args(argv: Sequence[str]) -> argparse.Namespace:
         "--log-file", type=Path, default=None, help="Also write a full DEBUG log here"
     )
     parser.add_argument(
+        "--browser-budget",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Browser rescues allowed to run at the same time. A rescue hands a "
+            "failed board to headless Chromium, which costs seconds and "
+            "hundreds of megabytes where an HTTP read costs milliseconds, and "
+            "on a stretch of roster where half the companies fail every worker "
+            "renders at once. A worker that cannot get a slot waits, then "
+            "skips its rescue rather than proceeding without one. "
+            "Default 0, meaning no cap -- the behaviour every run to date has "
+            "had"
+        ),
+    )
+    parser.add_argument(
         "--lock-path",
         type=Path,
         default=None,
@@ -2566,6 +2582,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             max_workers=max(1, args.workers),
             per_host_delay=max(0.0, args.per_host_delay),
             browser_fallback=not args.no_browser,
+            # Zero by default, which is no cap: enforcing a setting that has
+            # never been read must not change what a run does until an operator
+            # asks for it.
+            browser_budget=max(0, args.browser_budget),
             discover_careers=not args.no_discover,
             detect_filters=bool(args.filters),
             filter_render_budget=max(0, args.filter_render) if args.filters else 0,
