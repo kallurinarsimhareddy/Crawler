@@ -1112,3 +1112,28 @@ a {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
+
+/* --- Phase 5C: environment banner ---------------------------------------- */
+
+.env-banner {
+  grid-column: 1 / -1;
+  background: var(--cancelled-soft);
+  color: var(--cancelled);
+  border-bottom: 1px solid var(--border);
+  font-size: 0.8rem;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-align: center;
+  padding: 4px 16px;
+}
+.env-banner--fixed {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 20;
+}
+.shell--staging .sidebar {
+  top: 27px;
+  height: calc(100vh - 27px);
+}

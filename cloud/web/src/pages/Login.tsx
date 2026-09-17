@@ -43,6 +43,11 @@ export function Login() {
 
   return (
     <div className="auth-page">
+      {import.meta.env.VITE_DEPLOY_ENV === "staging" && (
+        <div className="env-banner env-banner--fixed" role="note">
+          STAGING — test environment
+        </div>
+      )}
       <form className="card auth-card" onSubmit={onSubmit}>
         <div className="brand brand--center">
           <img src="/favicon.svg" alt="" width={32} height={32} />

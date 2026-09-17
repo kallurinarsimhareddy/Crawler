@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import FrozenSet, List, Mapping, Optional, Tuple
 
@@ -82,6 +82,31 @@ class Settings:
     supabase_jwt_audience: str = "authenticated"
     dev_jwt_secret: Optional[str] = field(default=None, repr=False)
     dev_token_ttl_seconds: int = 8 * 3600
+
+    # --- Phase 5C: deployment ------------------------------------------------
+    #: local (a directory) or s3 (Supabase Storage S3 protocol / Cloudflare R2).
+    storage_backend: str = "local"
+    s3_endpoint: Optional[str] = None
+    s3_region: Optional[str] = None
+    s3_bucket: Optional[str] = None
+    s3_access_key_id: Optional[str] = field(default=None, repr=False)
+    s3_secret_access_key: Optional[str] = field(default=None, repr=False)
+    #: Top-level prefix for result objects; must contain the environment when deployed.
+    results_namespace: Optional[str] = None
+    #: This API's public origin, e.g. https://api-staging.example.com.
+    api_origin: Optional[str] = None
+    #: JSON allowlist of each environment's resources (required when deployed).
+    resource_registry: Optional[str] = None
+    rate_limit_per_minute: int = 120
+    job_create_per_hour: int = 30
+    #: none, or cloudflare: trust CF-Connecting-IP from a loopback peer (Cloudflare Tunnel).
+    trust_proxy: str = "none"
+    log_format: str = "text"
+    log_level: str = "INFO"
+
+    @property
+    def deployed(self) -> bool:
+        return self.environment in ("staging", "production")
 
     def unused_placeholders(self) -> List[str]:
         """Names of variables that are set but have no effect with this configuration."""
@@ -166,6 +191,23 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         dev_token_ttl_seconds=int(
             env_float(env, "CAREERCLOUD_DEV_TOKEN_TTL_SECONDS", 8 * 3600, minimum=60, maximum=7 * 86400)
         ),
+    )
+    settings = replace(
+        settings,
+        storage_backend=env_choice(env, "CAREERCLOUD_STORAGE_BACKEND", "local", ("local", "s3")),
+        s3_endpoint=env_optional(env, "CAREERCLOUD_S3_ENDPOINT"),
+        s3_region=env_optional(env, "CAREERCLOUD_S3_REGION"),
+        s3_bucket=env_optional(env, "CAREERCLOUD_S3_BUCKET"),
+        s3_access_key_id=env_optional(env, "CAREERCLOUD_S3_ACCESS_KEY_ID"),
+        s3_secret_access_key=env_optional(env, "CAREERCLOUD_S3_SECRET_ACCESS_KEY"),
+        results_namespace=env_optional(env, "CAREERCLOUD_RESULTS_NAMESPACE"),
+        api_origin=(env_optional(env, "CAREERCLOUD_API_ORIGIN") or "").rstrip("/") or None,
+        resource_registry=env_optional(env, "CAREERCLOUD_RESOURCE_REGISTRY"),
+        rate_limit_per_minute=env_int(env, "CAREERCLOUD_RATE_LIMIT_PER_MINUTE", 120, minimum=1, maximum=100_000),
+        job_create_per_hour=env_int(env, "CAREERCLOUD_JOB_CREATE_PER_HOUR", 30, minimum=1, maximum=100_000),
+        trust_proxy=env_choice(env, "CAREERCLOUD_TRUST_PROXY", "none", ("none", "cloudflare")),
+        log_format=env_choice(env, "CAREERCLOUD_LOG_FORMAT", "text", ("text", "json")),
+        log_level=env_choice(env, "CAREERCLOUD_LOG_LEVEL", "info", ("debug", "info", "warning", "error")).upper(),
     )
     validate_settings(settings)
     for name in settings.unused_placeholders():

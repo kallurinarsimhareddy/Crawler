@@ -1,0 +1,71 @@
+# CareerCloud STAGING worker: runs cloud jobs through the existing CareerCrawler
+# engine (cloud/worker/careercrawler_runner.py) with staging configuration only.
+#
+# It is a separate system user, directory, virtualenv and unit from the
+# production crawler (careercrawler.service), which it never references, starts,
+# stops or orders against. Its outbound network is restricted by
+# /etc/nftables.d/careercloud-staging-egress.nft (matched on this unit's user).
+
+[Unit]
+Description=CareerCloud STAGING worker (CareerCrawler engine)
+After=network-online.target nftables.service
+Wants=network-online.target
+Requires=nftables.service
+
+[Service]
+Type=exec
+User=ccstg-worker
+Group=ccstg-worker
+WorkingDirectory=/opt/careercloud-staging/current
+EnvironmentFile=/etc/careercloud-staging/worker.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+# Refuses to start unless the egress firewall is loaded and every isolation check passes.
+ExecStartPre=+/usr/sbin/nft list table inet careercloud_staging_egress
+ExecStartPre=/opt/careercloud-staging/current/.venv/bin/python -m cloud.ops.safety_report --component worker --quiet
+ExecStart=/opt/careercloud-staging/current/.venv/bin/python -m cloud.worker
+
+# Graceful stop: SIGTERM makes running jobs stop between companies and go back
+# to the queue with their attempt refunded. A company can take a few minutes, so
+# allow that; if the stop still times out, SIGKILL follows and the reaper on the
+# next worker start recovers the job from its expired lease.
+KillSignal=SIGTERM
+TimeoutStopSec=300
+Restart=always
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=careercloud-staging-worker
+
+# Resource limits (see cloud/README.md → Staging → Resources)
+MemoryMax=2G
+CPUQuota=200%
+TasksMax=512
+LimitNOFILE=8192
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/careercloud-staging/runtime
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=yes
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

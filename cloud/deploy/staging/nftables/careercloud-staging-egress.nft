@@ -1,0 +1,79 @@
+#!/usr/sbin/nft -f
+#
+# Egress policy for the CareerCloud STAGING worker (user ccstg-worker).
+#
+# The worker crawls websites strangers submit, and the crawler follows redirects.
+# In-process, cloud/worker/egress.py refuses non-public addresses for every
+# urllib3 connection. This table is the kernel-level backstop for everything
+# else (a browser, a raw socket, a library that bypasses urllib3):
+#
+#   * allowed:  public IPv4/IPv6 (career sites, ATS APIs, Supabase, Redis, storage)
+#   * allowed:  DNS to the local stub resolver 127.0.0.53 only
+#   * refused:  loopback, RFC 1918, CGNAT, link-local (incl. 169.254.169.254
+#               metadata), multicast, documentation/benchmark/reserved ranges,
+#               IPv6 loopback/ULA/link-local/IPv4-mapped
+#
+# Only packets from the worker's user are matched; other users and services on
+# the host (including anything unrelated to CareerCloud) are unaffected.
+# Loaded by /etc/nftables.conf via `include "/etc/nftables.d/*.nft"`.
+
+table inet careercloud_staging_egress
+delete table inet careercloud_staging_egress
+
+table inet careercloud_staging_egress {
+    set blocked_v4 {
+        type ipv4_addr
+        flags interval
+        elements = {
+            0.0.0.0/8,          # "this" network
+            10.0.0.0/8,         # RFC 1918
+            100.64.0.0/10,      # CGNAT
+            127.0.0.0/8,        # loopback
+            169.254.0.0/16,     # link-local, cloud metadata (169.254.169.254)
+            172.16.0.0/12,      # RFC 1918
+            192.0.0.0/24,       # IETF protocol assignments
+            192.0.2.0/24,       # TEST-NET-1
+            192.88.99.0/24,     # 6to4 relay
+            192.168.0.0/16,     # RFC 1918
+            198.18.0.0/15,      # benchmarking
+            198.51.100.0/24,    # TEST-NET-2
+            203.0.113.0/24,     # TEST-NET-3
+            224.0.0.0/4,        # multicast
+            240.0.0.0/4         # reserved, broadcast
+        }
+    }
+
+    set blocked_v6 {
+        type ipv6_addr
+        flags interval
+        elements = {
+            ::/128,             # unspecified
+            ::1/128,            # loopback
+            ::ffff:0:0/96,      # IPv4-mapped
+            64:ff9b::/96,       # NAT64 (could reach private IPv4)
+            100::/64,           # discard
+            2001:db8::/32,      # documentation
+            fc00::/7,           # unique local
+            fe80::/10,          # link-local
+            ff00::/8            # multicast
+        }
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+
+        # Everyone except the staging worker is out of scope.
+        meta skuid != "ccstg-worker" accept
+
+        ct state established,related accept
+
+        # DNS only through the local stub resolver.
+        ip daddr 127.0.0.53 udp dport 53 accept
+        ip daddr 127.0.0.53 tcp dport 53 accept
+
+        ip daddr @blocked_v4 counter log prefix "ccstg-egress-block " level warn reject with icmpx type admin-prohibited
+        ip6 daddr @blocked_v6 counter log prefix "ccstg-egress-block " level warn reject with icmpx type admin-prohibited
+
+        accept
+    }
+}

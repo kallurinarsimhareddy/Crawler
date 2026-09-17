@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -43,8 +44,40 @@ def _load_env_file(path: Optional[str]) -> None:
     load_dotenv(path, override=False)
 
 
+def _build_storage(settings):
+    if settings.storage_backend == "s3":
+        from cloud.shared.s3_storage import S3Storage
+
+        return S3Storage.from_settings(
+            endpoint=settings.s3_endpoint,
+            region=settings.s3_region,
+            bucket=settings.s3_bucket,
+            namespace=settings.results_namespace or settings.environment,
+            access_key_id=settings.s3_access_key_id,
+            secret_access_key=settings.s3_secret_access_key,
+        )
+    return LocalFileStorage(settings.results_dir)
+
+
 def build_worker(stopping: threading.Event) -> Worker:
     settings = load_worker_settings()
+    if settings.log_format == "json":
+        from cloud.shared.logs import configure_logging
+
+        configure_logging(fmt="json", level=settings.log_level, service="careercloud-worker", environment=settings.environment)
+
+    from cloud.shared.environment import EnvironmentIsolationError, ResourceIdentity, enforce_isolation
+
+    identity = ResourceIdentity.from_urls(
+        settings.environment,
+        database_url=settings.database_url,
+        redis_url=settings.redis_url,
+        queue_prefix=settings.queue_prefix,
+        storage_bucket=settings.s3_bucket if settings.storage_backend == "s3" else None,
+        storage_endpoint=settings.s3_endpoint if settings.storage_backend == "s3" else None,
+        results_namespace=settings.results_namespace if settings.deployed else None,
+    )
+    enforce_isolation(identity, loaded_modules=list(sys.modules))
     database_url = resolve_database_url(
         settings.database_url, environment=settings.environment, allow_remote=settings.allow_remote_services
     )
@@ -58,6 +91,28 @@ def build_worker(stopping: threading.Event) -> Worker:
     queue = RedisJobQueue.from_url(redis_url, prefix=settings.queue_prefix)
     repository.ping()
     queue.ping()
+    storage = _build_storage(settings)
+    if settings.deployed:
+        from cloud.ops.stamps import verify_all
+
+        problems = verify_all(
+            settings.environment,
+            database_url=database_url,
+            redis_client=queue._redis,  # noqa: SLF001
+            queue_prefix=settings.queue_prefix,
+            storage=storage,
+        )
+        if problems:
+            raise EnvironmentIsolationError(settings.environment, problems)
+
+    if settings.egress_guard:
+        from urllib.parse import urlsplit
+
+        from cloud.worker.egress import install_egress_guard
+
+        # Only infrastructure the worker itself must reach over urllib3 is exempt.
+        infrastructure = [urlsplit(settings.s3_endpoint).hostname] if settings.s3_endpoint else []
+        install_egress_guard(allow_hosts=infrastructure)
 
     service = JobService(repository)
     policy = RetryPolicy(
@@ -67,6 +122,9 @@ def build_worker(stopping: threading.Event) -> Worker:
     )
     if settings.runner == "careercrawler":
         from cloud.worker.careercrawler_runner import CareerCrawlerRunner
+
+        # Re-check now the engine is importable: it must not have pulled in production state.
+        enforce_isolation(identity, loaded_modules=list(sys.modules))
 
         runner = CareerCrawlerRunner(
             company_concurrency=settings.company_concurrency,
@@ -84,21 +142,22 @@ def build_worker(stopping: threading.Event) -> Worker:
         runner,
         lease_seconds=settings.lease_seconds,
         retry_policy=policy,
-        result_writer=ResultWriter(LocalFileStorage(settings.results_dir)),
+        result_writer=ResultWriter(storage),
         runtime_root=settings.runtime_root,
         keep_workspaces=settings.keep_workspaces,
         on_requeue=lambda job_id, delay: queue.enqueue(job_id, delay_seconds=delay),
         stopping=stopping,
     )
     log.info(
-        "environment=%s database=%s redis=%s prefix=%s runner=%s runtime=%s results=%s",
+        "environment=%s database=%s redis=%s prefix=%s runner=%s runtime=%s storage=%s egress_guard=%s",
         settings.environment,
         describe_url(database_url),
         describe_url(redis_url),
         settings.queue_prefix,
         runner.name,
         settings.runtime_root,
-        settings.results_dir,
+        f"s3:{settings.s3_bucket}/{settings.results_namespace}" if settings.storage_backend == "s3" else settings.results_dir,
+        settings.egress_guard,
     )
     return Worker(
         service,
@@ -128,8 +187,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     _load_env_file(args.env_file)
 
     stopping = threading.Event()
+    from cloud.shared.environment import EnvironmentIsolationError
+
     try:
         worker = build_worker(stopping)
+    except EnvironmentIsolationError as error:
+        log.error("%s", error)
+        return 3
     except ValueError as error:
         log.error("%s", error)
         return 2
@@ -148,6 +212,21 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     signal.signal(signal.SIGINT, stop)
     signal.signal(signal.SIGTERM, stop)
+    if hasattr(signal, "SIGBREAK"):  # Windows: CTRL_BREAK_EVENT is the graceful stop
+        signal.signal(signal.SIGBREAK, stop)
+
+    # A stop file is the graceful stop where signals cannot reach the process
+    # (a Windows process in another console). Same effect as SIGTERM.
+    stop_file = os.environ.get("CAREERCLOUD_STOP_FILE")
+    if stop_file:
+        def watch() -> None:
+            while not stopping.wait(1.0):
+                if Path(stop_file).exists():
+                    log.info("stop file %s found: finishing current work and stopping", stop_file)
+                    Path(stop_file).unlink(missing_ok=True)
+                    stopping.set()
+
+        threading.Thread(target=watch, name="stop-file", daemon=True).start()
     worker.run()
     return 0
 

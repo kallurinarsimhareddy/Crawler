@@ -81,7 +81,9 @@ def current_user(
     if credentials is None or credentials.scheme.lower() != "bearer" or not credentials.credentials:
         raise _unauthorized("sign in required")
     try:
-        return verifier.verify(credentials.credentials)
+        principal = verifier.verify(credentials.credentials)
+        request.state.user_id = principal.user_id
+        return principal
     except AuthError as error:
         raise _unauthorized(str(error)) from error
     except AuthUnavailableError as error:
@@ -149,6 +151,13 @@ def create_job(
     dispatcher: JobDispatcher = Depends(get_dispatcher),
     settings: Settings = Depends(get_settings),
 ) -> JobCreatedResponse:
+    allowed, wait = request.app.state.job_limiter.allow(f"user:{user.user_id}")
+    if not allowed:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            "job creation limit reached; try again later",
+            headers={"Retry-After": str(max(1, int(wait + 0.999)))},
+        )
     if service.active_job_count(owner_id=user.user_id) >= settings.max_active_jobs_per_user:
         raise HTTPException(
             status.HTTP_429_TOO_MANY_REQUESTS,

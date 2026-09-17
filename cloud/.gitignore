@@ -11,3 +11,11 @@ dist/
 
 # Worker scratch space: one directory per job attempt, deleted after each run.
 runtime/
+
+# Templates the root .gitignore would otherwise hide (it ignores env/ for
+# virtualenvs and .env.* for secrets). These contain placeholders only.
+!/deploy/staging/env/
+!/web/.env.staging.example
+# ...but only the .example files: a filled-in env file dropped there stays ignored.
+/deploy/staging/env/*
+!/deploy/staging/env/*.example

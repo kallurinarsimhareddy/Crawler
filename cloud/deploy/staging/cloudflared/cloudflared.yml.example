@@ -1,0 +1,20 @@
+# Cloudflare Tunnel for the CareerCloud STAGING API.
+# Copy to /etc/careercloud-staging/cloudflared.yml (root:ccstg-tunnel, 0640).
+#
+# Create the tunnel once, from a machine logged in to the STAGING Cloudflare zone:
+#   cloudflared tunnel login
+#   cloudflared tunnel create careercloud-staging
+#   cloudflared tunnel route dns careercloud-staging api-staging.<your-domain>
+# then copy the credentials JSON it prints to /etc/careercloud-staging/tunnel.json.
+
+tunnel: <STAGING_TUNNEL_UUID>
+credentials-file: /etc/careercloud-staging/tunnel.json
+
+ingress:
+  # The API only. Uvicorn listens on loopback; nothing else on the host is published.
+  - hostname: api-staging.<your-domain>
+    service: http://127.0.0.1:8180
+    originRequest:
+      connectTimeout: 10s
+      keepAliveTimeout: 60s
+  - service: http_status:404

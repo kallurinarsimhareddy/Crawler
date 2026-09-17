@@ -251,8 +251,8 @@ class TestMigrations(PostgresTestCase):
                 }
         finally:
             drop_database(url)
-        self.assertEqual(tables, {"jobs", "crawl_targets", "job_events", "job_results", "schema_migrations"})
-        self.assertEqual(rls, {"jobs", "crawl_targets", "job_events", "job_results"})
+        self.assertEqual(tables, {"jobs", "crawl_targets", "job_events", "job_results", "schema_migrations", "deployment"})
+        self.assertEqual(rls, {"jobs", "crawl_targets", "job_events", "job_results", "deployment"})
 
 
 if __name__ == "__main__":

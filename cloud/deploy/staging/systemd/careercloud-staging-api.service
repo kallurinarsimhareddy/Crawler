@@ -1,0 +1,67 @@
+# CareerCloud STAGING API.
+#
+# Listens on 127.0.0.1 only; the internet reaches it through Cloudflare Tunnel
+# (careercloud-staging-tunnel.service). Never bound to a public interface.
+# Unrelated to careercrawler.service, the production crawler, which this unit
+# neither references nor orders against.
+
+[Unit]
+Description=CareerCloud STAGING API (FastAPI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=ccstg-api
+Group=ccstg-api
+WorkingDirectory=/opt/careercloud-staging/current
+EnvironmentFile=/etc/careercloud-staging/api.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=PYTHONUNBUFFERED=1
+# The API refuses to start unless CAREERCLOUD_ENV=staging passes every deployment
+# and isolation check (see cloud/api/deployment.py, cloud/shared/environment.py).
+ExecStartPre=/opt/careercloud-staging/current/.venv/bin/python -m cloud.ops.safety_report --component api --quiet
+ExecStart=/opt/careercloud-staging/current/.venv/bin/uvicorn cloud.api.main:app \
+    --host 127.0.0.1 --port 8180 --workers 2 \
+    --no-access-log --no-server-header --log-level warning \
+    --timeout-graceful-shutdown 20
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Logs: journalctl -u careercloud-staging-api  (JSON lines, CAREERCLOUD_LOG_FORMAT=json)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=careercloud-staging-api
+
+# Resource limits (documented in cloud/README.md → Staging → Resources)
+MemoryMax=512M
+CPUQuota=100%
+TasksMax=128
+LimitNOFILE=4096
+
+# Hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

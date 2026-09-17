@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "CareerCloud resource registry. Copy to /etc/careercloud-staging/resources.json (root:ccstg-api/ccstg-worker, 0640).",
+    "A process may use ONLY the resources listed under its own environment, and refuses any resource listed under another.",
+    "Hostnames, project refs, bucket names and origins are identifiers, not secrets. Passwords and keys never go here.",
+    "List the production identifiers too, even before production exists, so a copy-paste into staging is refused."
+  ],
+  "staging": {
+    "supabase_refs": ["<staging-project-ref>"],
+    "database_hosts": ["aws-0-<region>.pooler.supabase.com", "db.<staging-project-ref>.supabase.co"],
+    "redis_hosts": ["<staging-redis>.upstash.io"],
+    "storage_endpoint_hosts": ["<staging-project-ref>.storage.supabase.co"],
+    "storage_buckets": ["careercloud-staging-results"],
+    "api_origins": ["https://api-staging.<your-domain>"],
+    "dashboard_origins": ["https://careercloud-staging.pages.dev"]
+  },
+  "production": {
+    "supabase_refs": ["<production-project-ref-or-placeholder>"],
+    "database_hosts": ["db.<production-project-ref>.supabase.co"],
+    "redis_hosts": ["<production-redis>.upstash.io"],
+    "storage_endpoint_hosts": ["<production-project-ref>.storage.supabase.co"],
+    "storage_buckets": ["careercloud-production-results"],
+    "api_origins": ["https://api.<your-domain>"],
+    "dashboard_origins": ["https://app.<your-domain>"]
+  }
+}

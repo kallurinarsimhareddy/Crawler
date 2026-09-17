@@ -3,6 +3,7 @@
     python -m cloud.db.migrate status
     python -m cloud.db.migrate apply
     python -m cloud.db.migrate apply --database-url postgresql://...
+    python -m cloud.db.migrate stamp --environment staging
 
 The URL defaults to ``CAREERCLOUD_DATABASE_URL`` and goes through the same
 safety checks as the API (see :mod:`cloud.db.connection`).
@@ -109,11 +110,16 @@ def apply_migrations(database_url: str, migrations: Optional[Sequence[Migration]
     return applied_now
 
 
+def _confirmed(args) -> bool:
+    return bool(args.yes)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m cloud.db.migrate", description=__doc__.split("\n\n")[0])
-    parser.add_argument("command", choices=["status", "apply"])
+    parser.add_argument("command", choices=["status", "apply", "stamp"])
     parser.add_argument("--database-url", default=os.environ.get("CAREERCLOUD_DATABASE_URL"))
     parser.add_argument("--environment", default=os.environ.get("CAREERCLOUD_ENV", "development"))
+    parser.add_argument("--yes", action="store_true", help="confirm a permanent stamp")
     args = parser.parse_args(argv)
 
     try:
@@ -129,7 +135,27 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print("error: set CAREERCLOUD_DATABASE_URL or pass --database-url", file=sys.stderr)
         return 2
 
-    print(f"database: {describe_url(url)}")
+    print(f"database: {describe_url(url)}  environment: {args.environment}")
+    from cloud.shared.environment import EnvironmentIsolationError, ResourceIdentity, enforce_isolation
+
+    try:
+        enforce_isolation(ResourceIdentity.from_urls(args.environment, database_url=url))
+    except EnvironmentIsolationError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+    if args.command == "stamp":
+        from cloud.ops.stamps import StampMismatchError, read_database_stamp, stamp_database
+
+        if read_database_stamp(url) is None and not _confirmed(args):
+            print("error: stamping is permanent; re-run with --yes after checking the database host above", file=sys.stderr)
+            return 2
+        try:
+            print("stamped: " + stamp_database(url, args.environment))
+        except StampMismatchError as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 3
+        return 0
+
     migrations = load_migrations()
     if args.command == "status":
         import psycopg

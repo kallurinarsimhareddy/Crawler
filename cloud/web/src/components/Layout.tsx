@@ -48,8 +48,14 @@ export function Layout() {
   const location = useLocation();
   useEffect(() => setMenuOpen(false), [location.pathname]);
 
+  const staging = import.meta.env.VITE_DEPLOY_ENV === "staging";
   return (
-    <div className="shell">
+    <div className={`shell${staging ? " shell--staging" : ""}`}>
+      {staging && (
+        <div className="env-banner" role="note">
+          STAGING — test environment. Data may be deleted at any time.
+        </div>
+      )}
       <header className="sidebar">
         <div className="sidebar__top">
           <NavLink to="/" className="brand">

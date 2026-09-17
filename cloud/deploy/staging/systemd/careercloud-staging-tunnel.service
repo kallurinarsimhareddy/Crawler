@@ -1,0 +1,30 @@
+# Cloudflare Tunnel for the CareerCloud STAGING API: the only way in from the
+# internet. Outbound-only; no inbound port is opened on the VM.
+
+[Unit]
+Description=Cloudflare Tunnel for CareerCloud STAGING API
+After=network-online.target careercloud-staging-api.service
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=ccstg-tunnel
+Group=ccstg-tunnel
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate --config /etc/careercloud-staging/cloudflared.yml tunnel run
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=careercloud-staging-tunnel
+MemoryMax=256M
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

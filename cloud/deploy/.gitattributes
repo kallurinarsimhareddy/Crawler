@@ -1,0 +1,2 @@
+# Everything here runs on Linux. CRLF breaks shell scripts and systemd units.
+** text eol=lf

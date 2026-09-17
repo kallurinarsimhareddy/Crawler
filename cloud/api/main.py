@@ -21,6 +21,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from cloud.api.auth import DevTokenIssuer, SupabaseTokenVerifier, TokenVerifier
+from cloud.api.deployment import deployment_problems, identity_of
+from cloud.api.middleware import AccessLogMiddleware, RateLimiter, RateLimitMiddleware, SecurityHeadersMiddleware
+from cloud.shared.environment import EnvironmentIsolationError, enforce_isolation
 from cloud.api.routes import API_VERSION, router
 from cloud.api.settings import Settings, load_settings
 from cloud.db.connection import describe_url, resolve_database_url, resolve_redis_url
@@ -69,6 +72,35 @@ def _build_verifier(settings: Settings) -> Optional[TokenVerifier]:
     )
 
 
+def _build_storage(settings: Settings) -> ObjectStorage:
+    if settings.storage_backend == "s3":
+        from cloud.shared.s3_storage import S3Storage
+
+        return S3Storage.from_settings(
+            endpoint=settings.s3_endpoint or "",
+            region=settings.s3_region or "",
+            bucket=settings.s3_bucket or "",
+            namespace=settings.results_namespace or settings.environment,
+            access_key_id=settings.s3_access_key_id or "",
+            secret_access_key=settings.s3_secret_access_key or "",
+        )
+    return LocalFileStorage(settings.results_dir)
+
+
+def _verify_stamps(settings: Settings, queue: Optional[JobQueue], storage: ObjectStorage) -> None:
+    from cloud.ops.stamps import verify_all
+
+    problems = verify_all(
+        settings.environment,
+        database_url=settings.database_url,
+        redis_client=getattr(queue, "_redis", None),
+        queue_prefix=settings.queue_prefix,
+        storage=storage,
+    )
+    if problems:
+        raise EnvironmentIsolationError(settings.environment, problems)
+
+
 def create_app(
     settings: Optional[Settings] = None,
     *,
@@ -92,9 +124,14 @@ def create_app(
         token_verifier: Overrides what ``settings.auth_mode`` selects.
     """
     settings = settings or load_settings()
+    if settings.deployed:
+        problems = deployment_problems(settings)
+        if problems:
+            raise EnvironmentIsolationError(settings.environment, problems)
+        enforce_isolation(identity_of(settings))
     repository = repository or _build_repository(settings)
     service = JobService(repository)
-    storage = storage or LocalFileStorage(settings.results_dir)
+    storage = storage or _build_storage(settings)
     verifier = token_verifier if token_verifier is not None else _build_verifier(settings)
 
     runnable_types: FrozenSet[JobType] = frozenset(JobType)
@@ -134,6 +171,9 @@ def create_app(
     else:
         queue_name = dispatcher.name
 
+    if settings.deployed:
+        _verify_stamps(settings, queue, storage)
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
@@ -147,6 +187,11 @@ def create_app(
         version=API_VERSION,
         description="Control plane for CareerCrawler jobs.",
         lifespan=lifespan,
+        debug=False,
+        # No interactive docs or schema on deployed environments.
+        docs_url=None if settings.deployed else "/docs",
+        redoc_url=None if settings.deployed else "/redoc",
+        openapi_url=None if settings.deployed else "/openapi.json",
     )
     app.state.settings = settings
     app.state.job_service = service
@@ -156,6 +201,18 @@ def create_app(
     app.state.runnable_types = runnable_types
     app.state.queue_name = queue_name
 
+    app.state.job_limiter = RateLimiter(
+        capacity=settings.job_create_per_hour, refill_per_second=settings.job_create_per_hour / 3600
+    )
+    app.add_middleware(SecurityHeadersMiddleware, hsts=settings.deployed)
+    app.add_middleware(
+        RateLimitMiddleware,
+        limiter=RateLimiter(
+            capacity=settings.rate_limit_per_minute, refill_per_second=settings.rate_limit_per_minute / 60
+        ),
+        trust_proxy=settings.trust_proxy,
+    )
+    app.add_middleware(AccessLogMiddleware, trust_proxy=settings.trust_proxy)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
@@ -167,4 +224,14 @@ def create_app(
     return app
 
 
-app = create_app()
+def _asgi_app() -> FastAPI:
+    """The app uvicorn serves: configure process logging first, then build."""
+    settings = load_settings()
+    if settings.log_format == "json":
+        from cloud.shared.logs import configure_logging
+
+        configure_logging(fmt="json", level=settings.log_level, service="careercloud-api", environment=settings.environment)
+    return create_app(settings)
+
+
+app = _asgi_app()

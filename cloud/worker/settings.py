@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -48,6 +48,26 @@ class WorkerSettings:
     max_runtime_seconds: float = 3600.0
     fake_step_seconds: float = 1.0
 
+    # --- Phase 5C: deployment ------------------------------------------------
+    storage_backend: str = "local"
+    s3_endpoint: Optional[str] = None
+    s3_region: Optional[str] = None
+    s3_bucket: Optional[str] = None
+    s3_access_key_id: Optional[str] = field(default=None, repr=False)
+    s3_secret_access_key: Optional[str] = field(default=None, repr=False)
+    results_namespace: Optional[str] = None
+    resource_registry: Optional[str] = None
+    #: In-process guard on every crawler HTTP connection (see cloud/worker/egress.py).
+    egress_guard: bool = True
+    #: Set true only on a host whose nftables egress policy is installed and verified.
+    egress_firewall_confirmed: bool = False
+    log_format: str = "text"
+    log_level: str = "INFO"
+
+    @property
+    def deployed(self) -> bool:
+        return self.environment in ("staging", "production")
+
 
 def load_worker_settings(env: Optional[Mapping[str, str]] = None) -> WorkerSettings:
     env = os.environ if env is None else env
@@ -78,6 +98,21 @@ def load_worker_settings(env: Optional[Mapping[str, str]] = None) -> WorkerSetti
         max_runtime_seconds=env_float(env, "CAREERCLOUD_CRAWLER_MAX_RUNTIME_SECONDS", d.max_runtime_seconds, minimum=10, maximum=86400),
         fake_step_seconds=env_float(env, "CAREERCLOUD_FAKE_STEP_SECONDS", d.fake_step_seconds, minimum=0, maximum=60),
     )
+    settings = replace(
+        settings,
+        storage_backend=env_choice(env, "CAREERCLOUD_STORAGE_BACKEND", "local", ("local", "s3")),
+        s3_endpoint=env_optional(env, "CAREERCLOUD_S3_ENDPOINT"),
+        s3_region=env_optional(env, "CAREERCLOUD_S3_REGION"),
+        s3_bucket=env_optional(env, "CAREERCLOUD_S3_BUCKET"),
+        s3_access_key_id=env_optional(env, "CAREERCLOUD_S3_ACCESS_KEY_ID"),
+        s3_secret_access_key=env_optional(env, "CAREERCLOUD_S3_SECRET_ACCESS_KEY"),
+        results_namespace=env_optional(env, "CAREERCLOUD_RESULTS_NAMESPACE"),
+        resource_registry=env_optional(env, "CAREERCLOUD_RESOURCE_REGISTRY"),
+        egress_guard=env_bool(env, "CAREERCLOUD_EGRESS_GUARD", True),
+        egress_firewall_confirmed=env_bool(env, "CAREERCLOUD_EGRESS_FIREWALL_CONFIRMED", False),
+        log_format=env_choice(env, "CAREERCLOUD_LOG_FORMAT", "text", ("text", "json")),
+        log_level=env_choice(env, "CAREERCLOUD_LOG_LEVEL", "info", ("debug", "info", "warning", "error")).upper(),
+    )
     if not settings.database_url:
         raise ValueError("the worker needs CAREERCLOUD_DATABASE_URL (PostgreSQL, or 'localdev' in development)")
     if not settings.redis_url:
@@ -86,4 +121,53 @@ def load_worker_settings(env: Optional[Mapping[str, str]] = None) -> WorkerSetti
         raise ValueError("CAREERCLOUD_LEASE_SECONDS is too short to heartbeat reliably")
     check_runtime_root(settings.runtime_root)
     check_runtime_root(settings.results_dir)
+    problems = worker_deployment_problems(settings)
+    if problems:
+        raise ValueError("refusing to start the worker:\n  - " + "\n  - ".join(problems))
     return settings
+
+
+def worker_deployment_problems(settings: WorkerSettings) -> list:
+    """What a staging or production worker must satisfy. Empty for development."""
+    from urllib.parse import parse_qs, urlsplit
+
+    problems = []
+    if settings.browser_fallback and not settings.egress_firewall_confirmed and settings.deployed:
+        problems.append(
+            "CAREERCLOUD_CRAWLER_BROWSER_FALLBACK needs CAREERCLOUD_EGRESS_FIREWALL_CONFIRMED=true: "
+            "a browser bypasses the in-process egress guard"
+        )
+    if not settings.deployed:
+        return problems
+    env = settings.environment
+    if not settings.egress_guard:
+        problems.append(f"{env} must not disable CAREERCLOUD_EGRESS_GUARD")
+    if settings.runner != "careercrawler":
+        problems.append(f"{env} workers run CAREERCLOUD_WORKER_RUNNER=careercrawler")
+    if settings.database_url:
+        query = parse_qs(urlsplit(settings.database_url).query)
+        if query.get("sslmode", [""])[0] not in ("require", "verify-ca", "verify-full"):
+            problems.append("CAREERCLOUD_DATABASE_URL must set sslmode=require (or verify-full)")
+        if settings.database_url.strip() == "localdev":
+            problems.append("localdev database is development-only")
+    if settings.redis_url:
+        parts = urlsplit(settings.redis_url)
+        if parts.scheme != "rediss":
+            problems.append("CAREERCLOUD_REDIS_URL must use TLS (rediss://)")
+        if not parts.password:
+            problems.append("CAREERCLOUD_REDIS_URL must authenticate (password in the URL)")
+    if settings.storage_backend != "s3":
+        problems.append(f"{env} requires CAREERCLOUD_STORAGE_BACKEND=s3")
+    else:
+        if not (settings.s3_endpoint or "").startswith("https://"):
+            problems.append("CAREERCLOUD_S3_ENDPOINT must be https://")
+        for name in ("s3_bucket", "s3_region", "s3_access_key_id", "s3_secret_access_key"):
+            if not getattr(settings, name):
+                problems.append(f"CAREERCLOUD_{name.upper()} is required")
+    if not settings.results_namespace:
+        problems.append("CAREERCLOUD_RESULTS_NAMESPACE is required")
+    if not settings.resource_registry:
+        problems.append(f"{env} requires CAREERCLOUD_RESOURCE_REGISTRY")
+    if settings.log_format != "json":
+        problems.append(f"{env} requires CAREERCLOUD_LOG_FORMAT=json")
+    return problems
