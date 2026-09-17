@@ -1,0 +1,6 @@
+# The repository root already ignores .env, .env.*, venv/, .venv/ and caches.
+# These are the frontend's additions.
+node_modules/
+dist/
+*.tsbuildinfo
+.vite/
