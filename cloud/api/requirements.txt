@@ -1,8 +1,12 @@
 # CareerCloud API — kept apart from the crawler's requirements.txt on purpose.
-# The weekly run's venv never needs FastAPI, and this venv never needs Playwright.
+# The weekly run's venv never needs FastAPI, and the API never needs Playwright.
 #
 #   py -3.12 -m venv cloud/.venv
-#   cloud/.venv/Scripts/python -m pip install -r cloud/api/requirements-dev.txt
+#   cloud/.venv/Scripts/python -m pip install -r cloud/requirements-dev.txt
 fastapi>=0.115
 uvicorn[standard]>=0.30
 pydantic>=2.7
+PyJWT[crypto]>=2.9
+psycopg[binary]>=3.2
+psycopg-pool>=3.2
+redis>=5.0

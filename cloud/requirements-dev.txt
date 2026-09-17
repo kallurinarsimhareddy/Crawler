@@ -1,0 +1,12 @@
+# Everything to run CareerCloud locally and its tests:
+#
+#   py -3.12 -m venv cloud/.venv
+#   cloud/.venv/Scripts/python -m pip install -r cloud/requirements-dev.txt
+-r worker/requirements.txt
+
+# FastAPI's TestClient. Starlette prefers httpx2 and warns when given httpx.
+httpx2>=2.0
+
+# Local stand-ins, so development needs no Docker and no cloud account:
+pgserver>=0.1.4          # embedded PostgreSQL 16 (python -m cloud.devtools.localpg)
+fakeredis[lua]>=2.26     # queue tests, and python -m cloud.devtools.fake_redis

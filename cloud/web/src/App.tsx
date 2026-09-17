@@ -1,15 +1,24 @@
 import { Link, Route, Routes } from "react-router-dom";
+import { RequireAuth } from "./auth/RequireAuth";
 import { EmptyState } from "./components/Feedback";
 import { Layout } from "./components/Layout";
 import { Dashboard } from "./pages/Dashboard";
 import { JobDetail } from "./pages/JobDetail";
 import { Jobs } from "./pages/Jobs";
+import { Login } from "./pages/Login";
 import { NewCrawl } from "./pages/NewCrawl";
 
 export function App() {
   return (
     <Routes>
-      <Route element={<Layout />}>
+      <Route path="login" element={<Login />} />
+      <Route
+        element={
+          <RequireAuth>
+            <Layout />
+          </RequireAuth>
+        }
+      >
         <Route index element={<Dashboard />} />
         <Route path="new" element={<NewCrawl />} />
         <Route path="jobs" element={<Jobs />} />

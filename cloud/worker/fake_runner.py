@@ -11,7 +11,7 @@ from __future__ import annotations
 import time
 from typing import Callable, Optional
 
-from cloud.shared.models import Job
+from cloud.shared.models import Job, TargetStatus
 from cloud.worker.runner import JobRunner, RunContext, RunResult
 
 __all__ = ["FakeRunner"]
@@ -58,9 +58,20 @@ class FakeRunner(JobRunner):
         ]
         total = len(labels)
 
+        # The richer context calls exist on the executor's context; a bare
+        # Phase 5A context (report_progress/is_cancelled only) still works.
+        update = getattr(context, "update", None)
+        started = getattr(context, "target_started", None)
+        finished = getattr(context, "target_finished", None)
+        has_targets = bool(job.targets)
+
         for index, label in enumerate(labels):
             if context.is_cancelled():
                 return RunResult.cancelled()
+            if update is not None:
+                update(current_phase="crawling", current_company=label)
+            if started is not None and has_targets:
+                started(index)
             context.report_progress(index, total, f"Crawling {label}")
             if self._step_seconds:
                 self._sleep(self._step_seconds)
@@ -70,6 +81,8 @@ class FakeRunner(JobRunner):
                     raise self._raise_error
                 if self._fail_with is not None:
                     return RunResult.failed(self._fail_with)
+            if finished is not None and has_targets:
+                finished(index, status=TargetStatus.COMPLETED, platform="Simulated", outcome="no open jobs", jobs_found=0)
 
         if context.is_cancelled():
             return RunResult.cancelled()

@@ -146,10 +146,15 @@ export function NewCrawl() {
           </div>
         )}
 
-        {type === "weekly_crawl" && (
+        {(type === "weekly_crawl" || type === "discovery") && (
           <p className="alert alert--info">
-            Runs across the full company roster. In this preview the run is simulated — no real crawl is started.
+            The cloud runner does not run {type === "weekly_crawl" ? "weekly roster crawls" : "discovery jobs"} yet. The job will be
+            recorded but will not start.
           </p>
+        )}
+
+        {needsCompany && type === "single_company" && (
+          <p className="field__hint">A website is required to crawl. Companies given by name only are recorded and skipped.</p>
         )}
 
         {error && <ErrorBanner error={error} />}

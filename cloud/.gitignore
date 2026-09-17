@@ -1,6 +1,13 @@
 # The repository root already ignores .env, .env.*, venv/, .venv/ and caches.
-# These are the frontend's additions.
+
+# Frontend
 node_modules/
 dist/
 *.tsbuildinfo
 .vite/
+
+# Local development data: embedded PostgreSQL, result files, test databases.
+.localdev/
+
+# Worker scratch space: one directory per job attempt, deleted after each run.
+runtime/

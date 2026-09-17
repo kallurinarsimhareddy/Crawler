@@ -2,23 +2,42 @@
 
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from cloud.api.auth import DevTokenIssuer
 from cloud.api.main import create_app
 from cloud.api.settings import Settings
+from cloud.shared.storage import LocalFileStorage
 from cloud.worker.dispatcher import InlineDispatcher, NullDispatcher
 from cloud.worker.fake_runner import FakeRunner
 
+TEST_SECRET = "phase-5a-api-tests-secret-0123456789abcdef"
+
 
 class _ApiTest(unittest.TestCase):
-    """Jobs stay queued unless a test asks for a runner, so assertions are stable."""
+    """Jobs stay queued unless a test asks for a runner, so assertions are stable.
+
+    Phase 5B made every job endpoint require a signed-in user, so the client
+    carries a development token, and results go to a temporary directory.
+    """
 
     def make_client(self, **create_app_kwargs) -> TestClient:
         create_app_kwargs.setdefault("dispatcher", NullDispatcher())
-        self.app = create_app(Settings(fake_step_seconds=0), **create_app_kwargs)
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        issuer = DevTokenIssuer(TEST_SECRET)
+        self.app = create_app(
+            Settings(fake_step_seconds=0, auth_mode="dev", results_dir=Path(scratch.name) / "results"),
+            storage=LocalFileStorage(Path(scratch.name) / "results"),
+            token_verifier=issuer,
+            **create_app_kwargs,
+        )
         client = TestClient(self.app)
+        client.headers["Authorization"] = f"Bearer {issuer.issue('tester@example.com')['access_token']}"
         client.__enter__()
         self.addCleanup(client.__exit__, None, None, None)
         return client
@@ -43,13 +62,19 @@ class TestHealth(_ApiTest):
 
     def test_openapi_documents_every_endpoint(self) -> None:
         paths = self.client.get("/openapi.json").json()["paths"]
+        # Phase 5B added identity, per-company progress, timeline and results.
         self.assertEqual(
             set(paths),
             {
                 "/api/v1/health",
+                "/api/v1/me",
                 "/api/v1/jobs",
                 "/api/v1/jobs/{job_id}",
                 "/api/v1/jobs/{job_id}/cancel",
+                "/api/v1/jobs/{job_id}/targets",
+                "/api/v1/jobs/{job_id}/events",
+                "/api/v1/jobs/{job_id}/results",
+                "/api/v1/jobs/{job_id}/results/{result_id}/download",
             },
         )
 
@@ -108,7 +133,19 @@ class TestReadJobs(_ApiTest):
         self.assertEqual(body["targets"], [{"website": "https://example.com", "company_name": None}])
         self.assertIsNone(body["completed_at"])
         self.assertIsNone(body["error"])
-        self.assertEqual(body["progress"], {"completed": 0, "total": None, "message": None})
+        # Phase 5B: progress gained failed/jobs_found/current_company/current_phase.
+        self.assertEqual(
+            body["progress"],
+            {
+                "completed": 0,
+                "total": 1,
+                "message": None,
+                "failed": 0,
+                "jobs_found": 0,
+                "current_company": None,
+                "current_phase": "queued",
+            },
+        )
 
     def test_an_unknown_job_is_404(self) -> None:
         response = self.client.get("/api/v1/jobs/job_does_not_exist")

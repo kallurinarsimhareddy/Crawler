@@ -1,0 +1,16 @@
+# CareerCloud worker: the API's dependencies plus what the crawler ENGINE imports.
+#
+# The engine packages are listed by name, not copied from ../../requirements.txt,
+# because the worker deliberately omits the Google Sheets clients — a cloud job
+# never talks to Sheets. Keep these version floors in step with the crawler's.
+-r ../api/requirements.txt
+
+pandas>=2.2
+loguru>=0.7
+requests>=2.32
+beautifulsoup4>=4.12
+lxml>=5.0
+openpyxl>=3.1
+
+# Optional: the engine's headless-browser rescue (CAREERCLOUD_CRAWLER_BROWSER_FALLBACK=true).
+# playwright>=1.40

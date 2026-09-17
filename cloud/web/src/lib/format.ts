@@ -1,4 +1,4 @@
-import type { CompanyInput, JobStatus, JobType } from "../api/types";
+import type { CompanyInput, JobStatus, JobType, ResultKind, TargetStatus } from "../api/types";
 
 export const JOB_TYPE_LABELS: Record<JobType, string> = {
   single_company: "Single company",
@@ -10,8 +10,8 @@ export const JOB_TYPE_LABELS: Record<JobType, string> = {
 export const JOB_TYPE_DESCRIPTIONS: Record<JobType, string> = {
   single_company: "Crawl every open job on one company's careers site.",
   bulk_companies: "Crawl a list of companies — paste them or upload a CSV.",
-  weekly_crawl: "Run the full scheduled roster crawl.",
-  discovery: "Find a company's careers page and job platform, without crawling postings.",
+  weekly_crawl: "Run the full scheduled roster crawl. Not yet available in the cloud.",
+  discovery: "Find a company's careers page and job platform. Not yet available in the cloud.",
 };
 
 export const STATUS_LABELS: Record<JobStatus, string> = {
@@ -22,7 +22,59 @@ export const STATUS_LABELS: Record<JobStatus, string> = {
   cancelled: "Cancelled",
 };
 
+export const TARGET_STATUS_LABELS: Record<TargetStatus, string> = {
+  pending: "Pending",
+  running: "Crawling",
+  completed: "Done",
+  failed: "Failed",
+  skipped: "Skipped",
+};
+
+const PHASE_LABELS: Record<string, string> = {
+  queued: "Waiting for a worker",
+  starting: "Starting",
+  crawling: "Crawling",
+  saving_results: "Saving results",
+  retry_scheduled: "Retry scheduled",
+  requeued: "Requeued after a worker stopped",
+  completed: "Completed",
+  failed: "Failed",
+  cancelled: "Cancelled",
+  unsupported: "Not supported yet",
+};
+
+export function phaseLabel(phase: string | null | undefined): string {
+  if (!phase) return "—";
+  return PHASE_LABELS[phase] ?? phase.replace(/_/g, " ");
+}
+
+export const RESULT_LABELS: Record<ResultKind, string> = {
+  jobs_xlsx: "Jobs (Excel)",
+  jobs_csv: "Jobs (CSV)",
+  summary_json: "Summary (JSON)",
+  crawl_log: "Crawl log",
+};
+
+const EVENT_LABELS: Record<string, string> = {
+  created: "Job created",
+  claimed: "Picked up by a worker",
+  completed: "Completed",
+  failed: "Failed",
+  cancelled: "Cancelled",
+  cancel_requested: "Cancellation requested",
+  retry_scheduled: "Retry scheduled",
+  reaped_requeued: "Worker stopped responding — requeued",
+  reaped_failed: "Worker stopped responding — failed",
+  reaped_cancelled: "Worker stopped responding — cancelled",
+  released_on_shutdown: "Worker restarting — requeued",
+};
+
+export function eventLabel(kind: string): string {
+  return EVENT_LABELS[kind] ?? kind.replace(/_/g, " ");
+}
+
 const dateTime = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short" });
+const timeOnly = new Intl.DateTimeFormat(undefined, { timeStyle: "medium" });
 
 export function formatDateTime(iso: string | null): string {
   if (!iso) return "—";
@@ -30,26 +82,31 @@ export function formatDateTime(iso: string | null): string {
   return Number.isNaN(date.getTime()) ? "—" : dateTime.format(date);
 }
 
-export function formatRelative(iso: string | null, now: number = Date.now()): string {
+export function formatTime(iso: string | null): string {
   if (!iso) return "—";
-  const seconds = Math.round((now - new Date(iso).getTime()) / 1000);
-  if (Number.isNaN(seconds)) return "—";
-  if (seconds < 45) return "just now";
-  const minutes = Math.round(seconds / 60);
-  if (minutes < 60) return `${minutes} min ago`;
-  const hours = Math.round(minutes / 60);
-  if (hours < 24) return `${hours} h ago`;
-  return formatDateTime(iso);
+  const date = new Date(iso);
+  return Number.isNaN(date.getTime()) ? "—" : timeOnly.format(date);
+}
+
+export function formatSeconds(total: number | null): string {
+  if (total === null || !Number.isFinite(total)) return "—";
+  const seconds = Math.max(0, Math.round(total));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }
 
 export function formatDuration(startIso: string | null, endIso: string | null): string {
   if (!startIso) return "—";
   const end = endIso ? new Date(endIso).getTime() : Date.now();
-  const seconds = Math.max(0, Math.round((end - new Date(startIso).getTime()) / 1000));
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
-  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
+  return formatSeconds((end - new Date(startIso).getTime()) / 1000);
+}
+
+export function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export function shortId(jobId: string): string {

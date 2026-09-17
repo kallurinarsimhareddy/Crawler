@@ -1,4 +1,2 @@
--r requirements.txt
-
-# FastAPI's TestClient. Starlette prefers httpx2 and warns when given httpx.
-httpx2>=2.0
+# Superseded by cloud/requirements-dev.txt, which also installs the worker.
+-r ../requirements-dev.txt

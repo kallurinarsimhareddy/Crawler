@@ -25,17 +25,38 @@ from pydantic import (
     model_validator,
 )
 
-from cloud.shared.models import CompanyTarget, Job, JobProgress, JobStatus, JobType
+from cloud.shared.models import (
+    CompanyTarget,
+    Job,
+    JobEvent,
+    JobProgress,
+    JobStatus,
+    JobType,
+    ResultFile,
+    ResultKind,
+    TargetRecord,
+    TargetStatus,
+)
+from cloud.shared.urls import check_public_host
 
 __all__ = [
     "BulkCompaniesJobRequest",
     "CompanyInput",
     "DiscoveryJobRequest",
+    "DevSessionRequest",
+    "DevSessionResponse",
+    "EventListResponse",
+    "EventResponse",
     "HealthResponse",
     "JobCreateRequest",
     "JobCreatedResponse",
     "JobListResponse",
     "JobResponse",
+    "MeResponse",
+    "ResultListResponse",
+    "ResultResponse",
+    "TargetListResponse",
+    "TargetResponse",
     "MAX_BULK_COMPANIES",
     "SingleCompanyJobRequest",
     "WeeklyCrawlJobRequest",
@@ -57,7 +78,8 @@ def normalise_website(value: str) -> str:
     """Return ``scheme://host[:port][/path]`` for a user-typed website.
 
     A missing scheme becomes ``https``. Anything that is not http(s), has no
-    dotted host, or carries credentials is refused with :class:`ValueError`.
+    dotted host, carries credentials, or can only mean a local or private
+    address (see :mod:`cloud.shared.urls`) is refused with :class:`ValueError`.
     Query strings and fragments are dropped: they identify a page, not a
     company.
     """
@@ -84,6 +106,7 @@ def normalise_website(value: str) -> str:
         raise ValueError("website has an invalid port") from error
     if not host or "." not in host.strip("."):
         raise ValueError("website must include a domain, e.g. example.com")
+    check_public_host(host, port)
 
     netloc = host if port is None else f"{host}:{port}"
     path = parts.path.rstrip("/")
@@ -193,9 +216,26 @@ class JobResponse(BaseModel):
     completed_at: Optional[datetime] = None
     error: Optional[str] = None
     progress: JobProgress
+    cancel_requested: bool = False
+    attempts: int = 0
+    max_attempts: int = 1
+    elapsed_seconds: Optional[float] = Field(
+        default=None, description="Seconds since started_at, up to completed_at if finished."
+    )
+    runnable: bool = Field(
+        default=True,
+        description="False when no runner in this deployment executes this job type yet.",
+    )
 
     @classmethod
-    def from_job(cls, job: Job) -> "JobResponse":
+    def from_job(
+        cls, job: Job, *, runnable: bool = True, now: Optional[datetime] = None
+    ) -> "JobResponse":
+        elapsed = None
+        if job.started_at is not None:
+            end = job.completed_at or now
+            if end is not None:
+                elapsed = max(0.0, (end - job.started_at).total_seconds())
         return cls(
             job_id=job.job_id,
             type=job.type,
@@ -207,6 +247,11 @@ class JobResponse(BaseModel):
             completed_at=job.completed_at,
             error=job.error,
             progress=job.progress,
+            cancel_requested=job.cancel_requested,
+            attempts=job.attempts,
+            max_attempts=job.max_attempts,
+            elapsed_seconds=elapsed,
+            runnable=runnable,
         )
 
 
@@ -214,8 +259,95 @@ class JobListResponse(BaseModel):
     jobs: List[JobResponse]
     total: int = Field(description="Jobs matching the filter, before limit/offset.")
     counts: Dict[JobStatus, int] = Field(
-        description="Every job in the store, by status, regardless of the filter."
+        description="Every job visible to the caller, by status, regardless of the filter."
     )
+
+
+class TargetResponse(BaseModel):
+    position: int
+    website: Optional[str]
+    company_name: Optional[str]
+    status: TargetStatus
+    platform: Optional[str]
+    outcome: Optional[str]
+    jobs_found: int
+    error: Optional[str]
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+    @classmethod
+    def from_record(cls, record: TargetRecord) -> "TargetResponse":
+        return cls(**record.model_dump(exclude={"job_id"}))
+
+
+class TargetListResponse(BaseModel):
+    targets: List[TargetResponse]
+
+
+class EventResponse(BaseModel):
+    kind: str
+    created_at: datetime
+    attempt: Optional[int]
+    message: Optional[str]
+
+    @classmethod
+    def from_event(cls, event: JobEvent) -> "EventResponse":
+        return cls(
+            kind=event.kind,
+            created_at=event.created_at,
+            attempt=event.attempt,
+            message=event.message,
+        )
+
+
+class EventListResponse(BaseModel):
+    events: List[EventResponse]
+
+
+class ResultResponse(BaseModel):
+    result_id: str
+    kind: ResultKind
+    filename: str
+    content_type: str
+    size_bytes: int
+    row_count: Optional[int]
+    created_at: datetime
+    download_url: str
+
+    @classmethod
+    def from_result(cls, result: ResultFile) -> "ResultResponse":
+        return cls(
+            result_id=result.result_id,
+            kind=result.kind,
+            filename=result.filename,
+            content_type=result.content_type,
+            size_bytes=result.size_bytes,
+            row_count=result.row_count,
+            created_at=result.created_at,
+            download_url=f"/api/v1/jobs/{result.job_id}/results/{result.result_id}/download",
+        )
+
+
+class ResultListResponse(BaseModel):
+    results: List[ResultResponse]
+
+
+class MeResponse(BaseModel):
+    user_id: str
+    email: Optional[str] = None
+    auth_mode: str
+
+
+class DevSessionRequest(_Strict):
+    email: str = Field(min_length=3, max_length=254, pattern=r"^[^@\s]+@[^@\s]+$")
+
+
+class DevSessionResponse(BaseModel):
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_in: int
+    user_id: str
+    email: str
 
 
 class HealthResponse(BaseModel):
@@ -225,3 +357,5 @@ class HealthResponse(BaseModel):
     environment: str
     runner: str
     storage: str
+    queue: Optional[str] = None
+    auth: Optional[str] = None
