@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CareerCrawler Demo</title>
+  <meta name="description" content="CareerCrawler presentation mode: a simulated crawl with sample data. Nothing here touches the real crawler." />
+  <link rel="icon" type="image/svg+xml" href="assets/favicon.svg" />
+  <link rel="stylesheet" href="assets/demo.css" />
+</head>
+<body>
+  <div class="demo-ribbon" role="note">
+    <span class="dot"></span>
+    <strong>Demo mode.</strong> Simulated crawl with sample data. No crawler, database or network is used.
+  </div>
+
+  <header class="topbar">
+    <div class="wrap topbar-inner">
+      <a class="brand" href="#top" aria-label="CareerCrawler home">
+        <img src="assets/favicon.svg" alt="" width="30" height="30" />
+        <span>Career<b>Crawler</b></span>
+      </a>
+      <nav class="nav" aria-label="Sections">
+        <a href="#crawl">Crawl</a>
+        <a href="#dashboard">Dashboard</a>
+        <a href="#how">How it works</a>
+        <a href="#platforms">Platforms</a>
+        <a href="#scale">Scale</a>
+      </nav>
+      <a class="btn btn-small btn-ghost nav-cta" href="#crawl">Try it</a>
+    </div>
+  </header>
+
+  <main id="top">
+    <!-- Hero ------------------------------------------------------------- -->
+    <section class="hero">
+      <div class="hero-bg" aria-hidden="true"></div>
+      <div class="wrap hero-inner">
+        <p class="eyebrow reveal">Universal Career &amp; ATS Intelligence Platform</p>
+        <h1 class="hero-title reveal">Discover Jobs <span class="grad">Automatically</span></h1>
+        <p class="hero-sub reveal">
+          Give CareerCrawler a company website. It finds the careers page, identifies the
+          applicant tracking system, crawls every open role and hands back clean, normalized jobs.
+        </p>
+
+        <!-- Crawl box -->
+        <form id="crawl" class="crawl-box reveal" autocomplete="off" novalidate>
+          <label for="site" class="crawl-label">Company website</label>
+          <div class="crawl-row">
+            <div class="input-wrap">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M3 12h18M12 3c2.8 3 2.8 15 0 18M12 3c-2.8 3-2.8 15 0 18" fill="none" stroke="currentColor" stroke-width="1.8"/></svg>
+              <input id="site" name="site" type="text" inputmode="url" spellcheck="false"
+                     placeholder="https://example.com" value="https://example.com" />
+            </div>
+            <button id="run" class="btn btn-primary btn-run" type="submit">
+              <span class="spinner" aria-hidden="true"></span>
+              <span class="btn-label">RUN CRAWL</span>
+            </button>
+          </div>
+          <p class="crawl-hint">
+            Separate several sites with commas to crawl a batch, or
+            <button type="button" class="linklike" id="sample-batch">load a sample batch</button>.
+          </p>
+          <p id="crawl-error" class="crawl-error" role="alert" hidden></p>
+        </form>
+      </div>
+    </section>
+
+    <!-- Live progress ---------------------------------------------------- -->
+    <section class="wrap live" id="live" hidden aria-live="polite">
+      <div class="panel live-panel">
+        <div class="live-head">
+          <div>
+            <p class="eyebrow">Live crawl</p>
+            <h2 id="live-title">Crawling…</h2>
+          </div>
+          <span id="live-badge" class="badge badge-running"><span class="pulse"></span>Running</span>
+        </div>
+
+        <div class="live-stats">
+          <div class="stat"><span class="stat-label">Companies</span><span class="stat-value tabular" id="ls-companies">0 / 0</span></div>
+          <div class="stat"><span class="stat-label">Jobs discovered</span><span class="stat-value tabular" id="ls-jobs">0</span></div>
+          <div class="stat"><span class="stat-label">Current company</span><span class="stat-value truncate" id="ls-current">—</span></div>
+          <div class="stat"><span class="stat-label">ATS detected</span><span class="stat-value" id="ls-ats">—</span></div>
+          <div class="stat"><span class="stat-label">Progress</span><span class="stat-value tabular" id="ls-pct">0%</span></div>
+        </div>
+
+        <div class="progress" role="progressbar" aria-label="Crawl progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div class="progress-fill" id="progress-fill"></div>
+        </div>
+
+        <ol class="stages" id="stages">
+          <li data-stage="0"><span class="stage-icon"></span><span class="stage-text">Discovering career page</span><span class="stage-meta"></span></li>
+          <li data-stage="1"><span class="stage-icon"></span><span class="stage-text">Detecting ATS</span><span class="stage-meta"></span></li>
+          <li data-stage="2"><span class="stage-icon"></span><span class="stage-text">Discovering jobs</span><span class="stage-meta"></span></li>
+          <li data-stage="3"><span class="stage-icon"></span><span class="stage-text">Normalizing jobs</span><span class="stage-meta"></span></li>
+          <li data-stage="4"><span class="stage-icon"></span><span class="stage-text">Crawl completed</span><span class="stage-meta"></span></li>
+        </ol>
+
+        <div class="log mono" id="log" aria-label="Crawl log"></div>
+      </div>
+    </section>
+
+    <!-- Dashboard -------------------------------------------------------- -->
+    <section class="wrap section" id="dashboard">
+      <div class="section-head reveal">
+        <p class="eyebrow">Dashboard</p>
+        <h2 class="section-title">Crawl activity</h2>
+        <p class="muted">Sample session data. Numbers update as you run crawls above.</p>
+      </div>
+
+      <div class="cards">
+        <article class="card reveal">
+          <div class="card-icon ic-blue"><svg viewBox="0 0 24 24"><path d="M4 20V8l8-4 8 4v12M9 20v-6h6v6" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/></svg></div>
+          <p class="card-label">Companies Crawled</p>
+          <p class="card-value tabular" id="c-companies">0</p>
+          <p class="card-foot" id="c-companies-foot">this session</p>
+        </article>
+        <article class="card reveal">
+          <div class="card-icon ic-green"><svg viewBox="0 0 24 24"><rect x="3" y="7" width="18" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="M9 7V5a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2" fill="none" stroke="currentColor" stroke-width="1.8"/></svg></div>
+          <p class="card-label">Jobs Found</p>
+          <p class="card-value tabular" id="c-jobs">0</p>
+          <p class="card-foot">normalized postings</p>
+        </article>
+        <article class="card reveal">
+          <div class="card-icon ic-amber"><svg viewBox="0 0 24 24"><path d="M12 3v4M12 17v4M4.2 7l3.4 2M16.4 15l3.4 2M4.2 17l3.4-2M16.4 9l3.4-2" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></div>
+          <p class="card-label">Running Jobs</p>
+          <p class="card-value tabular" id="c-running">0</p>
+          <p class="card-foot" id="c-running-foot">idle</p>
+        </article>
+        <article class="card reveal">
+          <div class="card-icon ic-violet"><svg viewBox="0 0 24 24"><path d="M5 13l4 4L19 7" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg></div>
+          <p class="card-label">Success Rate</p>
+          <p class="card-value tabular" id="c-success">0%</p>
+          <p class="card-foot">of completed crawls</p>
+        </article>
+      </div>
+
+      <div class="grid-2">
+        <aside class="panel detail reveal" id="detail" aria-live="polite">
+          <div class="panel-head">
+            <h3>Crawl result</h3>
+            <span class="badge badge-completed" id="d-status">Completed</span>
+          </div>
+          <div class="detail-body">
+          <dl class="detail-list">
+            <div><dt>Company</dt><dd id="d-company">Example Corporation</dd></div>
+            <div><dt>Career page</dt><dd><a id="d-url" class="mono" href="#" data-url="https://example.com/careers">https://example.com/careers</a></dd></div>
+            <div><dt>ATS</dt><dd id="d-ats"><span class="ats-chip">Workday</span></dd></div>
+            <div><dt>Jobs</dt><dd class="tabular big" id="d-jobs">247</dd></div>
+            <div><dt>Duration</dt><dd class="tabular" id="d-duration">38.4 s</dd></div>
+          </dl>
+          <div class="detail-roles">
+            <p class="detail-sub">Sample roles</p>
+            <ul class="role-list" id="d-roles"></ul>
+          </div>
+          </div>
+        </aside>
+        <div class="panel reveal">
+          <div class="panel-head">
+            <h3>Recent Crawls</h3>
+            <span class="muted small" id="recent-count"></span>
+          </div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr><th>Company</th><th>Career URL</th><th>ATS / Platform</th><th class="num">Jobs</th><th>Status</th></tr>
+              </thead>
+              <tbody id="recent-body"></tbody>
+            </table>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- How it works ----------------------------------------------------- -->
+    <section class="band" id="how">
+      <div class="wrap section">
+        <div class="section-head reveal">
+          <p class="eyebrow">Pipeline</p>
+          <h2 class="section-title">How CareerCrawler Works</h2>
+          <p class="muted">Six steps from a bare domain to structured job data.</p>
+        </div>
+        <ol class="flow">
+          <li class="flow-step reveal"><span class="flow-n">1</span><h4>Company Website</h4><p>Start from any company domain, one or thousands.</p></li>
+          <li class="flow-step reveal"><span class="flow-n">2</span><h4>Career Discovery</h4><p>Finds the careers page from links, sitemaps and common paths.</p></li>
+          <li class="flow-step reveal"><span class="flow-n">3</span><h4>ATS Detection</h4><p>Fingerprints the hiring platform behind the page.</p></li>
+          <li class="flow-step reveal"><span class="flow-n">4</span><h4>Universal Crawler</h4><p>Runs the right adapter, with a generic fallback for custom sites.</p></li>
+          <li class="flow-step reveal"><span class="flow-n">5</span><h4>Job Normalization</h4><p>Title, location, department and URL in one consistent schema.</p></li>
+          <li class="flow-step reveal"><span class="flow-n">6</span><h4>Results</h4><p>Deduplicated jobs, ready for dashboards, exports and alerts.</p></li>
+        </ol>
+      </div>
+    </section>
+
+    <!-- Platforms -------------------------------------------------------- -->
+    <section class="wrap section" id="platforms">
+      <div class="section-head reveal">
+        <p class="eyebrow">Technology</p>
+        <h2 class="section-title">Platforms it understands</h2>
+        <p class="muted">A few of the applicant tracking systems CareerCrawler detects and crawls.</p>
+      </div>
+      <div class="platforms">
+        <div class="platform reveal"><span class="logo" style="--c:#f2a33a">W</span><div><h4>Workday</h4><p>Enterprise myworkdayjobs tenants</p></div></div>
+        <div class="platform reveal"><span class="logo" style="--c:#24a47f">G</span><div><h4>Greenhouse</h4><p>boards.greenhouse.io and embeds</p></div></div>
+        <div class="platform reveal"><span class="logo" style="--c:#2f7de1">i</span><div><h4>iCIMS</h4><p>Hosted and portal careers sites</p></div></div>
+        <div class="platform reveal"><span class="logo" style="--c:#7a5af8">S</span><div><h4>SmartRecruiters</h4><p>Public postings API</p></div></div>
+        <div class="platform reveal"><span class="logo" style="--c:#c2410c">P</span><div><h4>PeopleAdmin</h4><p>Higher-ed and public sector</p></div></div>
+        <div class="platform reveal"><span class="logo" style="--c:#64748b">?</span><div><h4>Custom / Unknown</h4><p>Generic HTML crawler fallback</p></div></div>
+      </div>
+    </section>
+
+    <!-- Scale ------------------------------------------------------------ -->
+    <section class="band band-dark" id="scale">
+      <div class="wrap section">
+        <div class="section-head reveal">
+          <p class="eyebrow">Scale</p>
+          <h2 class="section-title">Built for large company lists</h2>
+          <p class="muted">Sample metrics for presentation purposes.</p>
+        </div>
+        <div class="scale">
+          <div class="scale-item reveal"><span class="scale-num tabular" data-count="12377">0</span><span class="scale-label">companies</span></div>
+          <div class="scale-item reveal"><span class="scale-num tabular" data-count="359" data-suffix="K+">0</span><span class="scale-label">jobs ledger</span></div>
+          <div class="scale-item reveal"><span class="scale-num tabular" data-count="60" data-suffix="+">0</span><span class="scale-label">platform adapters</span></div>
+        </div>
+        <p class="scale-note"><span class="tag">Demo / sample metrics</span></p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="wrap footer-inner">
+      <span class="brand brand-small"><img src="assets/favicon.svg" alt="" width="20" height="20" /> CareerCrawler</span>
+      <span class="muted small">Presentation mode. All data on this page is simulated.</span>
+    </div>
+  </footer>
+
+  <div class="toast" id="toast" role="status" hidden></div>
+
+  <script src="assets/demo.js"></script>
+</body>
+</html>
