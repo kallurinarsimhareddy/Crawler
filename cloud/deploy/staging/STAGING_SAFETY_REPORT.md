@@ -80,7 +80,9 @@ finding, left unchanged here because the crawler engine is out of scope.
    S3 access keys for Storage, and two staging test users.
 2. **Redis**: an Upstash (or equivalent) database with TLS and a password, for
    staging only.
-3. **Linux VM**: Oracle Cloud Always Free (Ubuntu 24.04, Ampere) with SSH access.
+3. **A host for the worker and API**: either a Windows machine running
+   `run-worker.bat` (the current arrangement), or any Linux VM with systemd and
+   SSH access. No particular provider is required.
 4. **Cloudflare**: a zone/domain for `api-staging.<domain>`, a tunnel, and a
    Pages project for the dashboard.
 5. **Resource registry**: fill `resources.json` with the staging identifiers

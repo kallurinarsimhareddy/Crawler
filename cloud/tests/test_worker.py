@@ -441,6 +441,62 @@ class TestOrphansAndShutdown(WorkerHarness):
         self.assertIs(self.job(job_id).status, JobStatus.COMPLETED)
 
 
+class TestWorkerPresence(WorkerHarness):
+    """The heartbeat behind the dashboard's "Crawler worker offline" banner."""
+
+    def test_a_fresh_worker_has_not_announced_itself_yet(self) -> None:
+        self.worker(CountingRunner())
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 0)
+
+    def test_heartbeat_marks_the_worker_online(self) -> None:
+        self.worker(CountingRunner()).heartbeat()
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 1)
+
+    def test_run_announces_immediately_and_retracts_on_a_clean_stop(self) -> None:
+        """Online within moments of starting, offline the instant it stops."""
+        stopping = threading.Event()
+        worker = self.worker(CountingRunner(), stopping=stopping)
+        worker._config = WorkerConfig(poll_interval=0.01, reap_interval=0.01)
+        thread = threading.Thread(target=worker.run)
+        thread.start()
+        deadline = time.monotonic() + 5
+        while self.queue.worker_presence(stale_after=90).online == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 1, "did not come online")
+        stopping.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(
+            self.queue.worker_presence(stale_after=90).online, 0, "a clean shutdown must retract presence"
+        )
+
+    def test_a_killed_worker_goes_stale_rather_than_retracting(self) -> None:
+        """Nothing runs on a kill, so presence has to expire by itself."""
+        self.worker(CountingRunner()).heartbeat()
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 1)
+        self.clocks.advance(91)
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 0)
+
+    def test_two_workers_are_counted_separately(self) -> None:
+        self.worker(CountingRunner(), worker_id="worker-a").heartbeat()
+        self.worker(CountingRunner(), worker_id="worker-b").heartbeat()
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 2)
+
+    def test_a_queue_that_refuses_heartbeats_does_not_stop_the_worker(self) -> None:
+        """Presence is a hint. Losing it must never cost a crawl."""
+
+        class RefusingQueue(InMemoryJobQueue):
+            def heartbeat_worker(self, worker_id: str) -> None:
+                raise ConnectionError("redis is down")
+
+        self.queue = RefusingQueue(clock=self.clocks.epoch)
+        job_id = self.submit()
+        worker = self.worker(CountingRunner())
+        worker.heartbeat()  # must not raise
+        worker.process_next()
+        self.assertIs(self.job(job_id).status, JobStatus.COMPLETED)
+
+
 class TestWorkerOnPostgresAndRedis(PostgresTestCase):
     """The same guarantees on real PostgreSQL and the Redis queue scripts."""
 

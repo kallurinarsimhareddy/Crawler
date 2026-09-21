@@ -26,6 +26,15 @@ both):
     Pushes the deadline out; the worker calls it with every heartbeat.
 ``ack(delivery)``
     Forgets the delivery.
+
+**Worker presence.** Separately from deliveries, each running worker records a
+liveness timestamp (:meth:`JobQueue.heartbeat_worker`), and
+:meth:`JobQueue.worker_presence` reports how many are still fresh. This is what
+tells the dashboard whether a worker is online, and it is deliberately kept out
+of PostgreSQL: presence is ephemeral, it must expire on its own when a worker is
+killed, and it must be readable when no job is running. A worker that stops
+cleanly removes its own entry (:meth:`JobQueue.forget_worker`); one that is
+killed simply goes stale.
 """
 
 from __future__ import annotations
@@ -37,7 +46,18 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Callable, Deque, Dict, List, Optional, Set, Tuple
 
-__all__ = ["Delivery", "InMemoryJobQueue", "JobQueue", "QueueStats", "RedisJobQueue"]
+__all__ = [
+    "Delivery",
+    "InMemoryJobQueue",
+    "JobQueue",
+    "QueueStats",
+    "RedisJobQueue",
+    "WorkerPresence",
+]
+
+#: A worker whose last heartbeat is older than this is treated as gone. Three
+#: times the worker's default 30 s heartbeat, so one missed beat is not an outage.
+DEFAULT_WORKER_STALE_AFTER = 90.0
 
 
 @dataclass(frozen=True)
@@ -53,6 +73,32 @@ class QueueStats:
     ready: int
     delayed: int
     in_flight: int
+
+    @property
+    def waiting(self) -> int:
+        """Jobs the queue still owes a worker: ready now plus waiting on a retry."""
+        return self.ready + self.delayed
+
+
+@dataclass(frozen=True)
+class WorkerPresence:
+    """Who is running, as of ``checked_at``."""
+
+    #: Workers whose heartbeat is newer than the staleness threshold.
+    online: int
+    #: Epoch seconds of the freshest heartbeat from any worker, stale ones included.
+    last_heartbeat: Optional[float]
+    checked_at: float
+
+    @property
+    def any_online(self) -> bool:
+        return self.online > 0
+
+    @property
+    def seconds_since_heartbeat(self) -> Optional[float]:
+        if self.last_heartbeat is None:
+            return None
+        return max(0.0, self.checked_at - self.last_heartbeat)
 
 
 class JobQueue(ABC):
@@ -80,6 +126,18 @@ class JobQueue(ABC):
     def stats(self) -> QueueStats:
         """Counts, for health checks and tests."""
 
+    @abstractmethod
+    def heartbeat_worker(self, worker_id: str) -> None:
+        """Record that ``worker_id`` is alive right now. Called on a timer."""
+
+    @abstractmethod
+    def forget_worker(self, worker_id: str) -> None:
+        """Drop ``worker_id``'s presence, on a clean shutdown. Idempotent."""
+
+    @abstractmethod
+    def worker_presence(self, *, stale_after: float = DEFAULT_WORKER_STALE_AFTER) -> WorkerPresence:
+        """How many workers have beaten within ``stale_after`` seconds."""
+
     def ping(self) -> None:
         """Raise if the queue backend is unreachable."""
 
@@ -100,6 +158,7 @@ class InMemoryJobQueue(JobQueue):
         self._waiting: Set[str] = set()
         self._in_flight: Dict[str, Tuple[float, str]] = {}
         self._deliveries: Dict[str, int] = {}
+        self._workers: Dict[str, float] = {}
 
     def enqueue(self, job_id: str, *, delay_seconds: float = 0.0) -> bool:
         with self._lock:
@@ -154,6 +213,21 @@ class InMemoryJobQueue(JobQueue):
         with self._lock:
             return QueueStats(len(self._ready), len(self._delayed), len(self._in_flight))
 
+    def heartbeat_worker(self, worker_id: str) -> None:
+        with self._lock:
+            self._workers[worker_id] = self._clock()
+
+    def forget_worker(self, worker_id: str) -> None:
+        with self._lock:
+            self._workers.pop(worker_id, None)
+
+    def worker_presence(self, *, stale_after: float = DEFAULT_WORKER_STALE_AFTER) -> WorkerPresence:
+        with self._lock:
+            now = self._clock()
+            beats = list(self._workers.values())
+            online = sum(1 for beat in beats if now - beat <= stale_after)
+            return WorkerPresence(online=online, last_heartbeat=max(beats, default=None), checked_at=now)
+
 
 # --- Redis ---------------------------------------------------------------------
 
@@ -163,10 +237,15 @@ class InMemoryJobQueue(JobQueue):
 #   {p}:waiting     SET    ids in ready or delayed, for idempotent enqueue
 #   {p}:inflight    ZSET   reserved ids; score = visibility deadline
 #   {p}:deliveries  HASH   id -> times delivered since last ack
+#   {p}:workers     ZSET   worker id -> epoch seconds of its last heartbeat
 #
 # Every multi-key step is a Lua script, so it is atomic across workers. Times are
 # passed in from the client rather than read with TIME, which keeps the scripts
 # deterministic and testable; worker clocks need only agree to within seconds.
+
+#: Presence entries older than this are deleted outright. Long enough that the
+#: dashboard can still say how long ago the last worker was seen.
+_WORKER_FORGET_AFTER = 7 * 86400.0
 
 _ENQUEUE = """
 if redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then return 0 end
@@ -241,7 +320,7 @@ class RedisJobQueue(JobQueue):
         self._clock = clock
         self._keys = {
             name: f"{prefix}:{name}"
-            for name in ("ready", "delayed", "waiting", "inflight", "deliveries")
+            for name in ("ready", "delayed", "waiting", "inflight", "deliveries", "workers")
         }
         register = client.register_script  # type: ignore[attr-defined]
         self._enqueue = register(_ENQUEUE)
@@ -299,6 +378,26 @@ class RedisJobQueue(JobQueue):
         pipe.zcard(k["inflight"])
         ready, delayed, in_flight = pipe.execute()
         return QueueStats(int(ready), int(delayed), int(in_flight))
+
+    def heartbeat_worker(self, worker_id: str) -> None:
+        self._redis.zadd(self._keys["workers"], {worker_id: self._clock()})  # type: ignore[attr-defined]
+
+    def forget_worker(self, worker_id: str) -> None:
+        self._redis.zrem(self._keys["workers"], worker_id)  # type: ignore[attr-defined]
+
+    def worker_presence(self, *, stale_after: float = DEFAULT_WORKER_STALE_AFTER) -> WorkerPresence:
+        key = self._keys["workers"]
+        now = self._clock()
+        # Drop entries far past the staleness threshold so a fleet that churns
+        # worker ids cannot grow the set without bound. Recent-but-stale entries
+        # are kept: `last_heartbeat` is how the dashboard says "offline since".
+        self._redis.zremrangebyscore(key, "-inf", now - _WORKER_FORGET_AFTER)  # type: ignore[attr-defined]
+        pipe = self._redis.pipeline()  # type: ignore[attr-defined]
+        pipe.zcount(key, now - stale_after, "+inf")
+        pipe.zrange(key, -1, -1, withscores=True)
+        online, newest = pipe.execute()
+        last = float(newest[0][1]) if newest else None
+        return WorkerPresence(online=int(online), last_heartbeat=last, checked_at=now)
 
     def ping(self) -> None:
         self._redis.ping()  # type: ignore[attr-defined]

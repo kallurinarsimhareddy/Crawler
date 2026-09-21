@@ -768,6 +768,12 @@ a {
   background: var(--running-soft);
   color: var(--running);
 }
+/* The worker being offline is normal while it runs on someone's desk: it is a
+   thing to act on, not a failure, so it reads amber rather than red. */
+.alert--warning {
+  background: var(--cancelled-soft);
+  color: var(--cancelled);
+}
 .error-text {
   margin: 6px 0 0;
   white-space: pre-wrap;
@@ -1136,4 +1142,59 @@ a {
 .shell--staging .sidebar {
   top: 27px;
   height: calc(100vh - 27px);
+}
+
+/* --- worker presence ------------------------------------------------------ */
+
+.worker-banner {
+  display: block;
+}
+.worker-banner__detail {
+  margin-top: 6px;
+  font-size: 0.85rem;
+  opacity: 0.85;
+}
+.worker-banner__detail code {
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgb(0 0 0 / 8%);
+  font-family: ui-monospace, "Cascadia Code", Menlo, Consolas, monospace;
+  font-size: 0.85em;
+}
+@media (prefers-color-scheme: dark) {
+  .worker-banner__detail code {
+    background: rgb(255 255 255 / 10%);
+  }
+}
+
+.worker {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 10px;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+.worker__dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--queued);
+  flex: none;
+}
+.worker__dot--on {
+  background: var(--completed);
+}
+.worker__dot--off {
+  background: var(--cancelled);
+}
+.worker--off {
+  color: var(--cancelled);
+}
+.worker__count {
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  font-size: 0.75rem;
 }

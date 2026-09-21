@@ -4,14 +4,19 @@ CareerCloud puts CareerCrawler on the web. A signed-in user enters a company or
 a list, clicks **Run crawl**, watches each company progress live, and downloads
 the results as Excel, CSV or JSON.
 
-**Status: Phase 5C, staging prepared but not deployed.** Phase 5B built
+**Status: Phase 5D, local worker working; cloud staging not yet deployed.**
+Phase 5B built
 PostgreSQL/Supabase persistence with row-level security, Supabase Auth, a Redis
 job queue, a separate worker with leases, heartbeats, bounded retries and crash
 recovery, and a runner that crawls through the **existing** CareerCrawler engine.
 Phase 5C added staging isolation guards, S3 result storage, an egress guard,
 API hardening, deployment files, a safety report and end-to-end staging tests.
-All of it was rehearsed locally with real crawls. **Actual deployment is
-blocked on cloud accounts.** See [Staging status](#staging-status-and-blockers).
+Phase 5D removed the last assumption that the worker lives on a particular
+cloud provider, added the `run-worker.bat` / `stop-worker.bat` launchers, worker
+heartbeats, the `/status` endpoint and the dashboard's worker indicator. **The
+cloud staging deployment still has not happened**, because it needs Supabase,
+Upstash and Cloudflare accounts. See
+[Staging status](#staging-status-and-blockers).
 
 - [Architecture](#architecture)
 - [Isolation from production CareerCrawler](#isolation-from-production-careercrawler)
@@ -19,7 +24,9 @@ blocked on cloud accounts.** See [Staging status](#staging-status-and-blockers).
 - [Queue and worker lifecycle](#queue-and-worker-lifecycle)
 - [Authentication and multi-tenancy](#authentication-and-multi-tenancy)
 - [API](#api)
+  - [Health and status](#health-and-status)
 - [Local development](#local-development)
+- [The local worker](#the-local-worker)
 - [Tests](#tests)
 - [Known limits](#known-limits)
 - **Staging (Phase 5C)**
@@ -28,6 +35,7 @@ blocked on cloud accounts.** See [Staging status](#staging-status-and-blockers).
   - [Isolation](#staging-isolation-how-staging-is-kept-off-production)
   - [Secrets and configuration](#secrets-and-configuration)
   - [Deployment steps](#staging-deployment-steps)
+  - [Running the worker on another host](#running-the-worker-on-another-host)
   - [Test procedure](#staging-test-procedure)
   - [Operations: health, logs, resources, rollback](#operations)
   - [Troubleshooting](#troubleshooting)
@@ -244,7 +252,8 @@ bearer token.
 
 | Method | Path | Result |
 |---|---|---|
-| GET | `/health` | Public. `{status, version, environment, runner, storage, queue, auth}` |
+| GET | `/health` | Public. `{status, version, environment, runner, storage, queue, auth}`. Touches no backend: it says the API process is up and how it is configured, nothing more. |
+| GET | `/status` | **Signed in.** Actually checks each dependency: `{status, environment, checked_at, api, database, redis, queue, worker}`. See [Health and status](#health-and-status). |
 | GET | `/me` | `{user_id, email, auth_mode}` |
 | POST | `/jobs` | 201 `{job_id, status}` · 422 invalid · 429 too many active jobs |
 | GET | `/jobs?status=&limit=&offset=` | Caller's jobs, `total`, `counts` |
@@ -255,6 +264,53 @@ bearer token.
 | GET | `/jobs/{id}/results` | Result files with `download_url` |
 | GET | `/jobs/{id}/results/{result_id}/download` | Streams the file (`attachment`, `nosniff`, `no-store`) · 404 · 410 file missing |
 | POST | `/auth/dev-session` | Development only: `{email}` returns a token |
+
+### Health and status
+
+Two endpoints, on purpose.
+
+**`/api/v1/health`** is public and shallow. It reports that the API answered and
+how it is configured. It opens no connections, so it stays fast and cannot be
+made to hang by a sick database. Use it for uptime checks.
+
+**`/api/v1/status`** requires a signed-in caller and actually checks things:
+
+```jsonc
+{
+  "status": "degraded",            // ok, or degraded if a dependency is down
+  "environment": "staging",
+  "checked_at": "2026-09-21T09:14:03Z",
+  "api":      { "status": "ok", "backend": "fastapi" },
+  "database": { "status": "ok", "backend": "postgres", "latency_ms": 12.4 },
+  "redis":    { "status": "ok", "backend": "redis",    "latency_ms": 31.8 },
+  "queue":    { "ready": 3, "delayed": 0, "in_flight": 1 },
+  "worker": {
+    "online": false,
+    "count": 0,
+    "last_heartbeat": "2026-09-21T08:52:11Z",
+    "seconds_since_heartbeat": 1312.4,
+    "stale_after_seconds": 90,
+    "message": "Crawler worker offline. 3 crawls queued. Start the worker to process new crawls."
+  }
+}
+```
+
+Each component is `ok`, `down` (configured but unreachable) or `disabled` (not
+configured — for example `redis` in local development, where jobs run in the API
+process). A `down` dependency makes the overall `status` **degraded** but still
+answers **200**: a status endpoint that fails when a backend fails is useless
+exactly when it is needed.
+
+Queue depth and worker presence are **not** on the public `/health` because they
+describe how much work the system is carrying, which anonymous callers have no
+business knowing.
+
+**Worker presence** is a heartbeat the worker writes to the queue (a Redis
+sorted set, `<prefix>:workers`) every 30 seconds. It lives there rather than in
+PostgreSQL deliberately: presence is ephemeral, it has to expire on its own when
+a worker is killed, and it must be readable when no job is running. A worker
+that stops cleanly removes its own entry; one that is killed goes stale after
+`CAREERCLOUD_WORKER_STALE_AFTER_SECONDS` (default 90, three missed beats).
 
 ## Local development
 
@@ -298,6 +354,37 @@ cd cloud\web; npm run dev
 
 Open http://localhost:5173 and sign in with any email (dev mode).
 
+### No production credentials, locally
+
+Local development uses **no real account of any kind**: PostgreSQL is embedded
+(`pgserver`), Redis is `fakeredis`, auth is locally issued dev tokens, and
+results are written to a directory. Nothing reaches the internet except the
+career sites a crawl actually visits.
+
+Keep it that way:
+
+- **Never** put the Supabase service-role key anywhere — not in the API's
+  environment, not in a `VITE_*` variable, not in a file in this repository. The
+  API is built so it never needs it, and `unused_placeholders()` warns if it is
+  set.
+- **Never** put a database URL, Redis URL or any secret in a `VITE_*` variable.
+  Everything `VITE_*` is compiled into the dashboard bundle and served to every
+  visitor. Only the Supabase **anon** key belongs there — it is designed to be
+  public and is useless without a signed-in session, because RLS is what
+  actually protects the data.
+- `.env`, `.env.local` and `cloud/deploy/staging/env/*.env` are git-ignored.
+  Only the `.example` files are committed, and they contain no real values.
+- A remote database or Redis is **refused** in `development` unless you set
+  `CAREERCLOUD_ALLOW_REMOTE_SERVICES=1` on purpose, so a pasted production URL
+  cannot connect by accident.
+- Use a **separate Supabase project** for staging, never the production one.
+  `cloud/ops/stamps.py` stamps each database, queue prefix and bucket with the
+  environment it belongs to, and a process refuses to start against a resource
+  stamped as something else.
+- The production CareerCrawler's `secrets/` directory and Google credentials are
+  never read by any CareerCloud process; `cloud/tests/test_isolation.py` proves
+  it by spying on `open()` during a real job.
+
 **Quickest UI-only mode.** Set `CAREERCLOUD_STORAGE=memory` and
 `CAREERCLOUD_QUEUE=inline` in `cloud\api\.env`. The API then runs simulated jobs
 itself, and needs no Postgres, Redis or worker.
@@ -340,6 +427,75 @@ cloud\.venv\Scripts\python -m cloud.db.migrate apply   # uses CAREERCLOUD_DATABA
 
 Never put the service-role key, database URL or Redis URL in a `VITE_*`
 variable, and never give the service-role key to the API.
+
+## The local worker
+
+The worker is the process that actually crawls. The API only records jobs and
+puts their ids on the queue; until a worker is running, crawls queue up and the
+dashboard says **Crawler worker offline**. That is a normal state, not a fault.
+
+Right now the worker runs on this Windows machine. Nothing else in CareerCloud
+knows or cares — see
+[Running the worker on another host](#running-the-worker-on-another-host).
+
+### Start and stop
+
+From the repository root (`E:\Crawlers\CareerCrawler-cloud`):
+
+```bat
+run-worker.bat
+```
+
+and, in another window (or just press Ctrl+C in the worker's window):
+
+```bat
+stop-worker.bat
+```
+
+`run-worker.bat` reads `cloud\worker\.env`, or a path you pass as the first
+argument. Before starting anything it checks, and explains in plain language
+what to do if a check fails:
+
+| Check | Why |
+|---|---|
+| `cloud\.venv` exists | otherwise prints the two commands that create it |
+| the env file exists | otherwise points at `cloud\worker\.env.example` |
+| `CAREERCLOUD_ENV` is not `production` | a production worker belongs on a managed host, not in a console window someone can close |
+| the env file names no SQLite database or `crawler.db` | CareerCloud is PostgreSQL-only; the production crawler's `state\crawler.db` must never be opened by a cloud worker |
+
+It then reports the exit code in words rather than as a number: configuration
+error (2), environment-isolation refusal (3), or an unreachable database or
+Redis.
+
+**`stop-worker.bat` is the graceful stop.** It writes the file named by
+`CAREERCLOUD_STOP_FILE` (default `cloud\.localdev\worker.stop`); the worker
+notices within a second, finishes the company it is crawling, puts any
+unfinished job back on the queue **with its attempt refunded**, and exits. No
+crawl is lost and no retry is burned. Closing the window instead kills the
+worker; the job's lease then expires and the reaper requeues it, which also
+works but takes a minute or so.
+
+### Operator workflow
+
+| Step | What you do |
+|---|---|
+| **Start worker** | `run-worker.bat` — leave the window open. The dashboard's sidebar turns to **Worker online** within a few seconds. |
+| **Run crawl** | In the dashboard, **New crawl** → enter a company or paste a list → **Run**. |
+| **View progress** | The job page updates every few seconds: per-company status, platform, jobs found, and a live timeline. |
+| **Download results** | On a finished job, **Results** → Excel, CSV, JSON summary or the crawl log. Downloads are authenticated `fetch` calls, so no token ever appears in a URL. |
+| **Stop worker** | `stop-worker.bat`, or Ctrl+C in the worker's window. |
+
+While the worker is stopped you can still create crawls. They queue, the
+dashboard says so, and they start on their own when a worker comes back.
+
+### What the worker never touches
+
+Enforced in code and asserted by `cloud/tests/test_isolation.py`, not just by
+convention: the production weekly run, `state/crawler.db` and its checkpoint,
+`output/`, `input/`, `secrets/`, the Google Sheet, Seamless, and the crawler's
+`max_workers` default. The worker reads `CAREERCLOUD_*` variables only, uses
+its own venv, and crawls inside `cloud/runtime/<job id>/attempt-<n>/`.
+
 
 ## Tests
 
@@ -410,7 +566,7 @@ available and were not substituted:
 |---|---|---|
 | Supabase staging project | new project (not the production one): ref, region, DB password, anon key, Storage S3 keys, 2 test users | **blocked** |
 | Redis | Upstash database (TLS + password), staging only | **blocked** |
-| Worker/API host | Oracle Cloud Always Free VM (Ubuntu 24.04), SSH access | **blocked** |
+| Worker/API host | **none required** — the worker runs on this Windows machine (`run-worker.bat`). Any Linux VM works later; see [Running the worker on another host](#running-the-worker-on-another-host) | **not blocking** |
 | HTTPS | Cloudflare zone + tunnel for `api-staging.<domain>` | **blocked** |
 | Dashboard hosting | Cloudflare Pages project | **blocked** |
 
@@ -430,7 +586,7 @@ Internet
   └── api-staging.<domain>            Cloudflare edge (TLS, rate-limit rule)
            │ Cloudflare Tunnel (outbound-only; no open inbound port)
            ▼
-  Oracle Always Free VM (Ubuntu 24.04)
+  Compute host — any Linux VM with systemd (provider does not matter)
   ├── careercloud-staging-tunnel      cloudflared         user ccstg-tunnel
   ├── careercloud-staging-api         uvicorn 127.0.0.1:8180, 2 workers    user ccstg-api
   │        ├── JWT via Supabase JWKS ──────────────► Supabase STAGING: Auth
@@ -563,11 +719,18 @@ $env:CAREERCLOUD_TEST_REDIS_URL="rediss://default:<password>@<host>:6379"
 cloud\.venv\Scripts\python -m unittest cloud.tests.test_queue -v     # the 7 real-Redis tests now run
 ```
 
-### 4. VM (Oracle Cloud Always Free)
+### 4. Compute host for the API and worker
 
-Create an Ampere A1 instance (Ubuntu 24.04, 1–2 OCPU, 6–12 GB). In its security
-list, add **no ingress rules** besides SSH from your IP: the tunnel is
-outbound-only. Then:
+**You do not need one to get started.** The worker runs on this Windows machine
+today (see [The local worker](#the-local-worker)), and the API can be exposed
+through a Cloudflare Tunnel from the same machine. This section is for when you
+want the API and worker to run unattended on a server instead.
+
+Any Linux VM with systemd will do — a VPS, a cloud instance from any provider,
+or hardware you own. Ubuntu 22.04 or 24.04, 1–2 vCPU and 4–8 GB is comfortable;
+CareerCloud is not provider-specific and `install.sh` contains nothing tied to
+one. Whatever you pick, add **no inbound rules** besides SSH from your own IP:
+the tunnel is outbound-only, so the API never needs an open port. Then:
 
 ```bash
 sudo apt update && sudo apt install -y python3.12 python3.12-venv nftables git curl
@@ -663,6 +826,50 @@ cloud\.venv\Scripts\python -m cloud.ops.staging_e2e --api https://api-staging.<d
 Also check the dashboard manually: sign in, create a job, watch live progress,
 use the job list and detail pages, cancel a job, and download results.
 
+## Running the worker on another host
+
+The worker is deliberately provider-neutral. It is a plain Python process whose
+entire contract with the rest of the system is:
+
+* **outbound** TLS to PostgreSQL, to Redis, and to object storage;
+* **outbound** HTTPS to the career sites it crawls;
+* no inbound connections at all — nothing ever calls the worker;
+* no shared filesystem with the API; results travel through object storage;
+* no local state worth keeping: everything durable is in PostgreSQL.
+
+So moving it is a matter of running the same command somewhere else. Nothing in
+the API, the database, the queue or the dashboard changes, and workers on
+different hosts can run at the same time — the atomic claim in PostgreSQL is
+what stops two of them running the same job.
+
+| Host | How it starts | When it makes sense |
+|---|---|---|
+| **Windows machine (today)** | `run-worker.bat` | Getting going. Zero cost, zero setup, but crawls only run while the window is open. |
+| Any Linux VM or VPS | `careercloud-staging-worker.service` (in `cloud/deploy/staging/systemd/`), installed by `cloud/deploy/staging/install.sh` | Unattended running. Any provider; the unit and installer contain nothing provider-specific. |
+| A container host | `python -m cloud.worker` as the entrypoint | If you already run containers. Nothing extra is needed. |
+
+To move it, put the same `CAREERCLOUD_*` values on the new host and start the
+process there. The only settings that must match the API are
+`CAREERCLOUD_DATABASE_URL`, `CAREERCLOUD_REDIS_URL` and
+`CAREERCLOUD_QUEUE_PREFIX`. Then stop the local one with `stop-worker.bat`; the
+handover loses nothing, because a worker shutting down releases its job back to
+the queue.
+
+On Linux, also install the nftables egress policy
+(`cloud/deploy/staging/nftables/`) before enabling browser fallback — the
+in-process egress guard covers `urllib3` only.
+
+**Oracle Cloud, specifically.** An Always Free Ampere A1 instance is a
+reasonable free option and was the original plan for Phase 5C, but it is *only*
+an option and nothing depends on it. Any Linux VM is equivalent, and its
+sign-up needs a payment card. There is no Oracle-specific code, configuration
+or account in CareerCloud.
+
+*(Unrelated: `adapters/oracle.py` and `adapters/taleo.py` read job postings from
+**Oracle Recruiting** career sites. That is crawler functionality and has
+nothing to do with where anything is hosted.)*
+
+
 ## Staging test procedure
 
 | # | Test | Pass criteria (automated in `ops/staging_e2e.py`) |
@@ -735,9 +942,14 @@ sudo systemctl disable --now careercloud-staging-tunnel careercloud-staging-api 
 | All crawls fail with `not a public internet address` | DNS points somewhere private, or the resolver is not 127.0.0.53 | `resolvectl status`; the nft policy allows DNS only to the local stub |
 | API 503 `authentication is unavailable` | JWKS fetch to Supabase failed | check `https://<ref>.supabase.co/auth/v1/.well-known/jwks.json` from the VM |
 | API 401 on every call | wrong project (token issuer) or expired session | the dashboard and API must use the same staging project |
-| Jobs stay `queued` | worker down, Redis prefix mismatch, or the type isn't runnable | `systemctl status careercloud-staging-worker`; the prefix must be `careercloud:staging` in both env files |
+| Jobs stay `queued` | worker down, Redis prefix mismatch, or the type isn't runnable | Check the dashboard first — it says **Crawler worker offline** when that is the cause. Locally: `run-worker.bat`. On a server: `systemctl status careercloud-staging-worker`. The queue prefix must match in both env files. |
 | Upstash free quota exhausted | poll interval too short | `CAREERCLOUD_POLL_INTERVAL=10` or more (see cost notes) |
 | Download returns 410 | object deleted from the bucket | results are gone; re-run the job |
+| Dashboard says **Crawler worker offline** but the worker window is open | the worker cannot reach Redis, or it is pointed at a different `CAREERCLOUD_QUEUE_PREFIX` than the API | Read the worker window: a connection error is printed there. Then compare `CAREERCLOUD_REDIS_URL` and `CAREERCLOUD_QUEUE_PREFIX` in `cloud\api\.env` and `cloud\worker\.env` — they must be identical. |
+| Worker shows offline for ~90 s after starting | presence is a heartbeat, not a connection | Normal only if it lasts a few seconds. `run-worker.bat` beats immediately at startup, so a full 90 s gap means the beat is not reaching Redis. |
+| `run-worker.bat` exits 3 straight away | environment-isolation guard refused the configuration | Its database, queue prefix or bucket does not match the environment it claims. Nothing was touched. Compare against `resources.json`. |
+| `run-worker.bat` says it will not start a production worker | `CAREERCLOUD_ENV=production` in the env file | Intended. Use `development` or `staging` locally; deploy production to a real host. |
+| `stop-worker.bat` seems to do nothing | the worker checks once a second, then finishes the company it is on | Give it a moment; a slow career site can take a while. Its window prints `worker … stopped` when it is done. |
 
 ## Security checks (staging)
 
@@ -764,12 +976,19 @@ at sign-up. Nothing here is upgraded or created automatically.
 |---|---|---|---|
 | Postgres + Auth + Storage | Supabase Free | 2 free projects per org; 500 MB database; 1 GB storage; 5 GB egress; 50K monthly active users; **paused after ~7 days without activity**; no daily backups | Free. Pro ($25/month per project) only if staging must never pause or needs backups. |
 | Redis | Upstash Free | ~500K commands/month; 256 MB; TLS. A worker polling every 10 s uses ~260K/month | Free at the template's poll interval. A 1–2 s poll would exceed it and move to pay-as-you-go (~$0.20 per 100K commands). |
-| VM (API, worker, tunnel) | Oracle Cloud Always Free, Ampere A1 | up to 4 OCPU / 24 GB in total; 200 GB block storage; 10 TB egress per month; idle instances can be reclaimed | Free. Sign-up needs a card. **Do not upgrade the account to pay-as-you-go** unless intended; shapes outside Always Free are billed. |
+| Compute (API, worker, tunnel) | **the Windows machine you already have** | none | Free. A Linux VM is optional — see the note under this table. |
 | HTTPS tunnel | Cloudflare Tunnel | – | Free |
 | Dashboard hosting | Cloudflare Pages | 500 builds per month | Free |
 | Rate limiting / Access | Cloudflare free plan | 1 rate-limit rule; Access free for up to 50 users | Free |
 | Domain | an existing domain on Cloudflare | – | Free if you already have one. A new domain costs ~$10–15/year. Avoid domains used for cold email, whose reputation matters. |
 | Alternative storage | Cloudflare R2 | 10 GB-month; no egress fees | Free at staging volume |
+
+**Compute is not on the list above because it is not needed yet.** The worker
+runs locally, so there is no host to pay for. If you later move it to a server,
+the usual options are a small VPS (~$4–6/month), a free-tier cloud VM from any
+of the large providers, or a machine you already own. CareerCloud does not
+depend on any of them — see
+[Running the worker on another host](#running-the-worker-on-another-host).
 
 **Definitely costs money:** only a new domain if none is available, and only
 if you choose it. Every other component fits a free tier at staging volume

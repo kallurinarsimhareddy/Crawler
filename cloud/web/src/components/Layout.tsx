@@ -3,6 +3,7 @@ import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 import { usePolling } from "../hooks/usePolling";
+import { WorkerPill, useWorkerStatus } from "./WorkerStatus";
 
 const NAV = [
   { to: "/", label: "Dashboard", end: true },
@@ -41,6 +42,11 @@ function UserMenu() {
       </button>
     </div>
   );
+}
+
+function WorkerIndicator() {
+  const { data, error } = useWorkerStatus();
+  return <WorkerPill status={data} error={error} />;
 }
 
 export function Layout() {
@@ -82,6 +88,7 @@ export function Layout() {
         </nav>
         <div className="sidebar__footer">
           <UserMenu />
+          <WorkerIndicator />
           <ApiStatus />
         </div>
       </header>

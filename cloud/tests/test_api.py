@@ -63,10 +63,12 @@ class TestHealth(_ApiTest):
     def test_openapi_documents_every_endpoint(self) -> None:
         paths = self.client.get("/openapi.json").json()["paths"]
         # Phase 5B added identity, per-company progress, timeline and results.
+        # Phase 5D added the authenticated operational status endpoint.
         self.assertEqual(
             set(paths),
             {
                 "/api/v1/health",
+                "/api/v1/status",
                 "/api/v1/me",
                 "/api/v1/jobs",
                 "/api/v1/jobs/{job_id}",

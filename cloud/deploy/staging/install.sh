@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
-# Install or upgrade CareerCloud STAGING on a Linux VM (Ubuntu 22.04/24.04, Oracle Cloud Always Free).
+# Install or upgrade CareerCloud STAGING on any Linux VM (Ubuntu 22.04/24.04).
+#
+# Provider-neutral: it needs systemd, Python 3.12 and nftables, and nothing else.
+# A VPS, a cloud instance from any provider, or a machine in a cupboard all work.
 #
 #   sudo ./install.sh --release <git-commit> --i-am-deploying-staging
 #   sudo ./install.sh --release <git-commit> --archive /tmp/careercloud-<commit>.tar --i-am-deploying-staging

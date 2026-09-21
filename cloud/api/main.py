@@ -200,6 +200,8 @@ def create_app(
     app.state.token_verifier = verifier
     app.state.runnable_types = runnable_types
     app.state.queue_name = queue_name
+    # `/status` reads queue depth and worker presence straight off the queue.
+    app.state.queue = queue
 
     app.state.job_limiter = RateLimiter(
         capacity=settings.job_create_per_hour, refill_per_second=settings.job_create_per_hour / 3600

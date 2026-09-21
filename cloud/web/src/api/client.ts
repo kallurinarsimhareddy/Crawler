@@ -9,6 +9,7 @@ import type {
   JobStatus,
   Me,
   ResultFile,
+  Status,
   TargetRecord,
 } from "./types";
 
@@ -95,6 +96,8 @@ export const api = {
   health: (signal?: AbortSignal) => request<Health>("/api/v1/health", { signal }, false),
 
   me: (signal?: AbortSignal) => request<Me>("/api/v1/me", { signal }),
+
+  status: (signal?: AbortSignal) => request<Status>("/api/v1/status", { signal }),
 
   devSession: (email: string) =>
     request<DevSession>("/api/v1/auth/dev-session", { method: "POST", body: JSON.stringify({ email }) }, false),

@@ -8,6 +8,8 @@ one that does not exist: both are 404, so ids cannot be probed.
 from __future__ import annotations
 
 import logging
+import time
+from datetime import datetime, timezone
 from typing import Iterator, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
@@ -18,6 +20,7 @@ from cloud.api.auth import AuthError, AuthUnavailableError, DevTokenIssuer, Prin
 from cloud.api.settings import Settings
 from cloud.shared.models import JobStatus, JobType
 from cloud.shared.schemas import (
+    ComponentStatus,
     DevSessionRequest,
     DevSessionResponse,
     EventListResponse,
@@ -28,10 +31,13 @@ from cloud.shared.schemas import (
     JobListResponse,
     JobResponse,
     MeResponse,
+    QueueDepth,
     ResultListResponse,
     ResultResponse,
+    StatusResponse,
     TargetListResponse,
     TargetResponse,
+    WorkerStatus,
 )
 from cloud.shared.service import InvalidTransitionError, JobNotFoundError, JobService
 from cloud.shared.storage import ObjectStorage
@@ -63,6 +69,11 @@ def get_settings(request: Request) -> Settings:
 
 def get_storage(request: Request) -> ObjectStorage:
     return request.app.state.storage
+
+
+def get_queue(request: Request):
+    """The queue object, or ``None`` when jobs run inside the API process."""
+    return getattr(request.app.state, "queue", None)
 
 
 def _unauthorized(detail: str) -> HTTPException:
@@ -117,6 +128,164 @@ def health(
         storage=request.app.state.job_service.repository.name,
         queue=request.app.state.queue_name,
         auth=verifier.mode if verifier is not None else "unconfigured",
+    )
+
+
+def _timed(check) -> ComponentStatus:
+    """Run a liveness check and report it, turning any failure into ``down``.
+
+    A status endpoint that raises is useless precisely when it is needed, so
+    every backend error becomes a reported state instead of a 500.
+    """
+    started = time.perf_counter()
+    try:
+        backend = check()
+    except Exception as error:  # noqa: BLE001 - reporting the failure *is* the job
+        return ComponentStatus(
+            status="down",
+            detail=f"{type(error).__name__}: {error}"[:200],
+            latency_ms=round((time.perf_counter() - started) * 1000, 1),
+        )
+    return ComponentStatus(
+        status="ok", backend=backend, latency_ms=round((time.perf_counter() - started) * 1000, 1)
+    )
+
+
+def _database_status(request: Request) -> ComponentStatus:
+    repository = request.app.state.job_service.repository
+    if repository.name == "memory":
+        return ComponentStatus(
+            status="disabled", backend="memory", detail="in-process store; jobs are lost when the API restarts"
+        )
+
+    def check() -> str:
+        repository.ping()
+        return repository.name
+
+    return _timed(check)
+
+
+def _redis_status(request: Request) -> ComponentStatus:
+    queue = get_queue(request)
+    if queue is None or queue.name != "redis":
+        return ComponentStatus(
+            status="disabled",
+            backend=request.app.state.queue_name,
+            detail="no external queue; jobs run in the API process",
+        )
+
+    def check() -> str:
+        queue.ping()
+        return queue.name
+
+    return _timed(check)
+
+
+def _worker_status(request: Request, settings: Settings, redis_ok: bool) -> tuple[WorkerStatus, QueueDepth]:
+    """Worker presence and queue depth, both read from the queue.
+
+    With no external queue there is no separate worker to look for: the API runs
+    jobs itself, so it reports itself as the thing doing the work.
+    """
+    queue = get_queue(request)
+    stale_after = settings.worker_stale_after_seconds
+    if queue is None or queue.name != "redis":
+        return (
+            WorkerStatus(
+                online=True,
+                count=0,
+                stale_after_seconds=stale_after,
+                message="Jobs run inside the API process; no separate worker is needed.",
+            ),
+            QueueDepth(),
+        )
+    if not redis_ok:
+        return (
+            WorkerStatus(
+                online=False,
+                stale_after_seconds=stale_after,
+                message="Cannot tell: the queue is unreachable, so worker heartbeats cannot be read.",
+            ),
+            QueueDepth(),
+        )
+    try:
+        presence = queue.worker_presence(stale_after=stale_after)
+        stats = queue.stats()
+    except Exception as error:  # noqa: BLE001
+        log.warning("worker presence unavailable: %s", error)
+        return (
+            WorkerStatus(
+                online=False,
+                stale_after_seconds=stale_after,
+                message="Cannot tell: the queue did not answer.",
+            ),
+            QueueDepth(),
+        )
+    depth = QueueDepth(ready=stats.ready, delayed=stats.delayed, in_flight=stats.in_flight)
+    last_beat = (
+        datetime.fromtimestamp(presence.last_heartbeat, tz=timezone.utc)
+        if presence.last_heartbeat is not None
+        else None
+    )
+    waiting = depth.ready + depth.delayed
+    if presence.online > 0:
+        message = (
+            f"{presence.online} worker{'s' if presence.online != 1 else ''} online."
+            if waiting == 0
+            else f"{presence.online} worker{'s' if presence.online != 1 else ''} online, "
+            f"{waiting} crawl{'s' if waiting != 1 else ''} waiting."
+        )
+    elif waiting > 0:
+        message = (
+            f"Crawler worker offline. {waiting} crawl{'s' if waiting != 1 else ''} "
+            "queued. Start the worker to process new crawls."
+        )
+    else:
+        message = "Crawler worker offline. Start the worker to process new crawls."
+    return (
+        WorkerStatus(
+            online=presence.online > 0,
+            count=presence.online,
+            last_heartbeat=last_beat,
+            seconds_since_heartbeat=(
+                round(presence.seconds_since_heartbeat, 1)
+                if presence.seconds_since_heartbeat is not None
+                else None
+            ),
+            stale_after_seconds=stale_after,
+            message=message,
+        ),
+        depth,
+    )
+
+
+@router.get("/status", response_model=StatusResponse, tags=["system"])
+def status_report(
+    request: Request,
+    _user: Principal = Depends(current_user),
+    settings: Settings = Depends(get_settings),
+) -> StatusResponse:
+    """Is every moving part working? Requires a signed-in caller.
+
+    Unlike ``/health`` this actually touches PostgreSQL and Redis, and reports
+    how deep the queue is and whether a worker is alive. It answers 200 even
+    when a dependency is down — that is what ``status: degraded`` is for.
+    """
+    database = _database_status(request)
+    redis = _redis_status(request)
+    worker, depth = _worker_status(request, settings, redis_ok=redis.status == "ok")
+    degraded = database.status == "down" or redis.status == "down"
+    return StatusResponse(
+        status="degraded" if degraded else "ok",
+        service="careercloud-api",
+        version=API_VERSION,
+        environment=settings.environment,
+        checked_at=datetime.now(timezone.utc),
+        api=ComponentStatus(status="ok", backend="fastapi"),
+        database=database,
+        redis=redis,
+        queue=depth,
+        worker=worker,
     )
 
 

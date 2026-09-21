@@ -4,6 +4,7 @@ import { api } from "../api/client";
 import { JOB_TYPES, type JobCreateRequest, type JobType } from "../api/types";
 import { ErrorBanner } from "../components/Feedback";
 import { JOB_TYPE_DESCRIPTIONS, JOB_TYPE_LABELS, parseCompanyLines } from "../lib/format";
+import { WorkerBanner, useWorkerStatus } from "../components/WorkerStatus";
 
 const MAX_FILE_BYTES = 2 * 1024 * 1024;
 
@@ -16,6 +17,7 @@ export function NewCrawl() {
   const [fileNote, setFileNote] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<Error | null>(null);
+  const { data: workerStatus, error: workerError } = useWorkerStatus();
 
   const bulkCompanies = useMemo(() => parseCompanyLines(bulkText), [bulkText]);
   const needsCompany = type === "single_company" || type === "discovery";
@@ -71,6 +73,8 @@ export function NewCrawl() {
           <p className="muted">Choose what to crawl, then run it.</p>
         </div>
       </div>
+
+      <WorkerBanner status={workerStatus} error={workerError} />
 
       <form className="card form" onSubmit={onSubmit} noValidate>
         <fieldset className="field">

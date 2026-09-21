@@ -14,3 +14,6 @@ deploy/**       text eol=lf
 *.sh            text eol=lf
 *.service       text eol=lf
 *.timer         text eol=lf
+
+# Batch files must keep CRLF to run reliably under cmd.exe.
+*.bat          text eol=crlf

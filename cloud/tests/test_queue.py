@@ -108,6 +108,89 @@ class QueueContract:
         self.assertEqual(sorted(taken), sorted(ids))
 
 
+    # --- worker presence -----------------------------------------------------
+    #
+    # Presence is what tells the dashboard "Crawler worker offline". It is a
+    # heartbeat with a staleness threshold, not a connection, so every case
+    # below is about time passing rather than about sockets.
+
+    def test_no_workers_have_ever_beaten(self) -> None:
+        presence = self.queue.worker_presence(stale_after=90)
+        self.assertEqual(presence.online, 0)
+        self.assertIsNone(presence.last_heartbeat)
+        self.assertIsNone(presence.seconds_since_heartbeat)
+        self.assertFalse(presence.any_online)
+
+    def test_a_beating_worker_is_online(self) -> None:
+        self.queue.heartbeat_worker("worker-1")
+        presence = self.queue.worker_presence(stale_after=90)
+        self.assertEqual(presence.online, 1)
+        self.assertTrue(presence.any_online)
+        self.assertAlmostEqual(presence.seconds_since_heartbeat, 0.0, places=3)
+
+    def test_several_workers_are_counted(self) -> None:
+        for name in ("w1", "w2", "w3"):
+            self.queue.heartbeat_worker(name)
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 3)
+
+    def test_heartbeating_twice_does_not_double_count(self) -> None:
+        self.queue.heartbeat_worker("w1")
+        self.clock.now += 5
+        self.queue.heartbeat_worker("w1")
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 1)
+
+    def test_a_worker_goes_offline_once_its_heartbeat_is_stale(self) -> None:
+        self.queue.heartbeat_worker("w1")
+        self.clock.now += 89
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 1)
+        self.clock.now += 2  # now 91s old
+        presence = self.queue.worker_presence(stale_after=90)
+        self.assertEqual(presence.online, 0)
+        self.assertFalse(presence.any_online)
+        # The timestamp survives: the dashboard says how long ago it was seen.
+        self.assertIsNotNone(presence.last_heartbeat)
+        self.assertAlmostEqual(presence.seconds_since_heartbeat, 91.0, places=3)
+
+    def test_a_stale_worker_that_beats_again_comes_back_online(self) -> None:
+        self.queue.heartbeat_worker("w1")
+        self.clock.now += 600
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 0)
+        self.queue.heartbeat_worker("w1")
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 1)
+
+    def test_forgetting_a_worker_takes_it_offline_at_once(self) -> None:
+        self.queue.heartbeat_worker("w1")
+        self.queue.heartbeat_worker("w2")
+        self.queue.forget_worker("w1")
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 1)
+
+    def test_forgetting_an_unknown_worker_is_harmless(self) -> None:
+        self.queue.forget_worker("never-existed")
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 0)
+
+    def test_last_heartbeat_is_the_freshest_of_several(self) -> None:
+        self.queue.heartbeat_worker("old")
+        self.clock.now += 50
+        self.queue.heartbeat_worker("new")
+        presence = self.queue.worker_presence(stale_after=90)
+        self.assertAlmostEqual(presence.seconds_since_heartbeat, 0.0, places=3)
+        self.assertEqual(presence.online, 2)
+
+    def test_presence_is_independent_of_queue_depth(self) -> None:
+        """A busy queue with no worker is exactly the case the banner is for."""
+        for name in ("a", "b"):
+            self.queue.enqueue(name)
+        self.assertEqual(self.queue.stats().waiting, 2)
+        self.assertEqual(self.queue.worker_presence(stale_after=90).online, 0)
+
+    def test_waiting_counts_ready_and_delayed(self) -> None:
+        self.queue.enqueue("now")
+        self.queue.enqueue("later", delay_seconds=30)
+        stats = self.queue.stats()
+        self.assertEqual((stats.ready, stats.delayed), (1, 1))
+        self.assertEqual(stats.waiting, 2)
+
+
 class TestInMemoryQueue(QueueContract, unittest.TestCase):
     def setUp(self) -> None:
         self.clock = Clock()

@@ -47,6 +47,7 @@ __all__ = [
     "DevSessionResponse",
     "EventListResponse",
     "EventResponse",
+    "ComponentStatus",
     "HealthResponse",
     "JobCreateRequest",
     "JobCreatedResponse",
@@ -55,6 +56,9 @@ __all__ = [
     "MeResponse",
     "ResultListResponse",
     "ResultResponse",
+    "StatusResponse",
+    "QueueDepth",
+    "WorkerStatus",
     "TargetListResponse",
     "TargetResponse",
     "MAX_BULK_COMPANIES",
@@ -359,3 +363,65 @@ class HealthResponse(BaseModel):
     storage: str
     queue: Optional[str] = None
     auth: Optional[str] = None
+
+
+# --- operational status ------------------------------------------------------
+#
+# `/health` stays public and deliberately shallow: it says the API process is up
+# and how it is configured, and touches no backend. `/status` needs a signed-in
+# caller because queue depth and worker presence describe how much work the
+# system is carrying, which is not something to hand to anonymous callers.
+
+
+class ComponentStatus(BaseModel):
+    """One dependency, as the API last saw it."""
+
+    #: ok = reachable; down = configured but unreachable; disabled = not configured.
+    status: Literal["ok", "down", "disabled"]
+    #: What it is (``postgres``, ``redis``, ``memory``…), for the operator.
+    backend: Optional[str] = None
+    #: Why it is down, or how it is configured. Never contains credentials.
+    detail: Optional[str] = None
+    #: How long the check took, when one was made.
+    latency_ms: Optional[float] = None
+
+
+class QueueDepth(BaseModel):
+    ready: int = 0
+    delayed: int = 0
+    in_flight: int = 0
+
+    @property
+    def waiting(self) -> int:
+        return self.ready + self.delayed
+
+
+class WorkerStatus(BaseModel):
+    """Whether anything is around to run jobs."""
+
+    online: bool = False
+    #: Workers that have beaten recently enough to count as alive.
+    count: int = 0
+    last_heartbeat: Optional[datetime] = None
+    seconds_since_heartbeat: Optional[float] = None
+    #: A heartbeat older than this means the worker is gone.
+    stale_after_seconds: float = 90.0
+    #: Plain-language line the dashboard can show as-is.
+    message: str = "Worker status is unknown."
+
+
+class StatusResponse(BaseModel):
+    """The operator view: is each moving part actually working?"""
+
+    #: ok = everything needed is up; degraded = the API is up but something it
+    #: depends on is not. The API answering at all is why there is no "down".
+    status: Literal["ok", "degraded"] = "ok"
+    service: str
+    version: str
+    environment: str
+    checked_at: datetime
+    api: ComponentStatus
+    database: ComponentStatus
+    redis: ComponentStatus
+    queue: QueueDepth = QueueDepth()
+    worker: WorkerStatus = WorkerStatus()

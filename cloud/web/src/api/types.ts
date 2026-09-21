@@ -103,6 +103,44 @@ export interface Health {
   auth: string | null;
 }
 
+export type ComponentState = "ok" | "down" | "disabled";
+
+export interface ComponentStatus {
+  status: ComponentState;
+  backend: string | null;
+  detail: string | null;
+  latency_ms: number | null;
+}
+
+export interface QueueDepth {
+  ready: number;
+  delayed: number;
+  in_flight: number;
+}
+
+export interface WorkerStatus {
+  online: boolean;
+  count: number;
+  last_heartbeat: string | null;
+  seconds_since_heartbeat: number | null;
+  stale_after_seconds: number;
+  message: string;
+}
+
+/** `/status`: the operator view. Needs a signed-in caller, unlike `/health`. */
+export interface Status {
+  status: "ok" | "degraded";
+  service: string;
+  version: string;
+  environment: string;
+  checked_at: string;
+  api: ComponentStatus;
+  database: ComponentStatus;
+  redis: ComponentStatus;
+  queue: QueueDepth;
+  worker: WorkerStatus;
+}
+
 export interface Me {
   user_id: string;
   email: string | null;

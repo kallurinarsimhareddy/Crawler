@@ -17,6 +17,11 @@ its writes are conditional, so several workers reaping at once is safe):
   again, in case the API crashed between committing the job and enqueueing it
   or the queue lost the id. The enqueue is idempotent.
 
+**Presence**: every maintenance tick the worker also stamps its own liveness on
+the queue, so the API can report whether any worker is running even when nothing
+is queued. A clean shutdown removes the stamp; a killed worker's simply goes
+stale. See :meth:`cloud.shared.queue.JobQueue.worker_presence`.
+
 **Shutdown** (SIGINT/SIGTERM): stop taking deliveries; running jobs see
 ``is_cancelled()`` become true, stop between companies, and are released back
 to the queue with their attempt refunded, so a deploy never burns a retry.
@@ -116,6 +121,13 @@ class Worker:
             self._queue.ack(delivery)
         return True
 
+    def heartbeat(self) -> None:
+        """Tell the queue this worker is alive. Never fatal: presence is a hint."""
+        try:
+            self._queue.heartbeat_worker(self.worker_id)
+        except Exception:
+            log.warning("could not record worker presence", exc_info=True)
+
     def maintain(self) -> MaintenanceReport:
         """One pass of stale-lease reaping and orphan re-enqueueing."""
         report = MaintenanceReport()
@@ -182,12 +194,24 @@ class Worker:
         ]
         for thread in threads:
             thread.start()
-        while not self.stopping.is_set():
+        # Announce before the first maintenance pass so the dashboard flips to
+        # "online" as soon as the process is up, not one reap interval later.
+        self.heartbeat()
+        try:
+            while not self.stopping.is_set():
+                try:
+                    self.maintain()
+                except Exception:
+                    log.exception("maintenance pass failed")
+                self.stopping.wait(self._config.reap_interval)
+                if not self.stopping.is_set():
+                    self.heartbeat()
+            for thread in threads:
+                thread.join(timeout=120)
+        finally:
+            # A clean stop retracts presence at once; a kill leaves it to go stale.
             try:
-                self.maintain()
+                self._queue.forget_worker(self.worker_id)
             except Exception:
-                log.exception("maintenance pass failed")
-            self.stopping.wait(self._config.reap_interval)
-        for thread in threads:
-            thread.join(timeout=120)
+                log.warning("could not clear worker presence", exc_info=True)
         log.info("worker %s stopped", self.worker_id)
