@@ -147,15 +147,45 @@ Sheet, Seamless and the weekly run's worker count were not read or written. The
 cloud worker used only `cloud/runtime/` and the staging Supabase/Upstash
 resources above. No Oracle resource is involved anywhere.
 
+### Real single-company crawl (2026-09-21)
+
+One crawl, run end to end through the staging API by a real Supabase-authenticated
+user signing in on the dashboard. `job_e1fc48c5b9a647dbaf07cb7e6b950d83`.
+
+| Stage | Evidence |
+|---|---|
+| Supabase authentication | dashboard sign-in; `/me` returned the caller's real `auth.users` id with `auth_mode=supabase` |
+| Job creation | `POST /jobs` -> 201, status `queued` |
+| Redis queue | `/status` sampled immediately after creation showed `ready: 1` under `careercloud:staging` |
+| Worker pickup | job observed in `running`; `attempts=1`; event `claimed` |
+| Crawl execution | Greenhouse board, real HTTP, **8 jobs found**, 1.86 s |
+| Progress | phases `starting` -> `completed`; `1/1` companies, `failed=0` |
+| Events | `created` -> `claimed` -> `completed` |
+| Worker heartbeat | `/status` reported 1 worker online throughout |
+| Completion | status `completed`, `error=null` |
+| Supabase persistence | rows in `jobs`, `crawl_targets` (1), `job_events` (3), `job_results` (4); `owner_id` equals the signed-in user |
+| Result integrity | all four files' SHA-256 match the `job_results` rows byte for byte |
+| CSV | 8 data rows, 7 columns, no cell begins `=` `+` `-` `@` (formula injection neutralised) |
+| XLSX | valid zip, 10 parts, sheet `Jobs`, 8 data rows x 7 columns, opens in openpyxl |
+| Authorisation | `/jobs/{id}`, `/results` and `/results/{id}/download` all 401 without a token |
+
+**One caveat, recorded rather than glossed over.** The final authenticated HTTP
+*download* of the file bytes using the Supabase token could not be executed from
+the automation: the browser extension refuses to let automation handle a JWT,
+and the dashboard tab reports `visibilityState: hidden`, which pauses polling by
+design. What was verified instead: the results list was fetched *with* the real
+token, the stored bytes match the SHA-256 recorded in Supabase, and the download
+route refuses unauthenticated callers. The same download path was exercised
+end-to-end earlier in local development. To close it completely, open the job in
+a visible dashboard tab and click Download.
+
 ### Still outstanding
 
-1. **One real single-company crawl has not been run.** It needs an
-   authenticated API call, and the staging API verifies real Supabase Auth.
-   Signing in needs the test user's password, which has not been supplied;
-   `mailer_autoconfirm` is off, so a fresh signup cannot self-confirm either.
-2. **Supabase Storage S3 keys** are not issued, so results are written to local
-   files. The private bucket exists and is ready.
-3. **Cloudflare Pages is not connected to the API.** See
+1. **Supabase Storage is not yet in use.** Results are written to local
+   files on the worker's machine, so they do not survive moving the worker to
+   another host. The private bucket exists and is ready; it needs S3 access
+   keys.
+2. **Cloudflare Pages is not connected to the API.** See
    cloud/README.md → Running the worker on another host, and the tunnel steps.
 
 ## 6. Blocked on (manual, needs the account owner)
