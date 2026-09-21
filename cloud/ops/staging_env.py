@@ -135,10 +135,20 @@ def _validate(values: Dict[str, str]) -> List[str]:
         elif "@" not in redis_url:
             problems.append("UPSTASH_REDIS_URL has no password in it")
     key = values.get("SUPABASE_ANON_KEY", "")
-    if key and ("service_role" in key or key.startswith("sbp_")):
+    # Supabase has two generations of keys. Legacy projects issue a JWT pair
+    # (anon / service_role); newer ones issue sb_publishable_… / sb_secret_….
+    # Either privileged form bypasses row-level security, so both are refused.
+    privileged = ("service_role" in key) or key.startswith(("sbp_", "sb_secret_"))
+    if key and privileged:
         problems.append(
-            "SUPABASE_ANON_KEY looks like a service-role or personal key. "
-            "Use the anon/publishable key; the service-role key must never be used here"
+            "SUPABASE_ANON_KEY looks like a secret or service-role key. Use the "
+            "anon (legacy) or sb_publishable_ key; a privileged key bypasses "
+            "row-level security and must never reach the API or the browser"
+        )
+    if key and not (key.startswith(("sb_publishable_", "eyJ")) or privileged):
+        problems.append(
+            "SUPABASE_ANON_KEY is neither a legacy anon JWT (eyJ…) nor an "
+            "sb_publishable_ key; check what was copied"
         )
     password = values.get("SUPABASE_DB_PASSWORD", "")
     if password and password in redis_url:

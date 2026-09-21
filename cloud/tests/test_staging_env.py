@@ -161,10 +161,22 @@ class TestValidation(unittest.TestCase):
     def test_a_redis_url_without_a_password_is_caught(self) -> None:
         self.assertIn("no password", self.problems(UPSTASH_REDIS_URL="rediss://example.upstash.io:6379"))
 
-    def test_a_service_role_key_is_refused(self) -> None:
-        """The service-role key bypasses RLS. It must never reach the API or browser."""
-        problems = self.problems(SUPABASE_ANON_KEY="eyJhbGci.service_role.xxx")
-        self.assertIn("service-role", problems)
+    def test_a_legacy_service_role_key_is_refused(self) -> None:
+        """A privileged key bypasses RLS. It must never reach the API or browser."""
+        self.assertIn("service-role", self.problems(SUPABASE_ANON_KEY="eyJhbGci.service_role.xxx"))
+
+    def test_a_new_format_secret_key_is_refused(self) -> None:
+        """Newer projects issue sb_secret_… instead of a service_role JWT."""
+        problems = self.problems(SUPABASE_ANON_KEY="sb_secret_ZZZZinventedvalue")
+        self.assertIn("row-level security", problems)
+
+    def test_a_new_format_publishable_key_is_accepted(self) -> None:
+        self.assertEqual(
+            staging_env._validate(dict(FAKE, SUPABASE_ANON_KEY="sb_publishable_ZZZZinventedvalue")), []
+        )
+
+    def test_something_that_is_not_a_key_at_all_is_caught(self) -> None:
+        self.assertIn("check what was copied", self.problems(SUPABASE_ANON_KEY="my-project-name"))
 
     def test_a_validation_message_never_quotes_the_value(self) -> None:
         problems = self.problems(SUPABASE_PROJECT_REF="https://supersecret.supabase.co")
