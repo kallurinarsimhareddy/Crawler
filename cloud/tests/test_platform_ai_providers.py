@@ -446,6 +446,25 @@ class ApiNoSecretLeak(unittest.TestCase):
         self.assertEqual(turn["run"]["planner"], "rules")
         self.assertEqual(self.platform.store.count(Ctx.for_system(self.ws), "ai_usage"), 0, "no external call was made")
 
+    def test_a_failed_live_test_says_why(self) -> None:
+        class Retired(ScriptedProvider):
+            def _generate(self, system, prompt, *, max_tokens, schema=None):
+                raise AIUnavailable("AI provider rejected the request (404): model is no longer available")
+
+        self.owner.post(self.base + "/agent/ai/key", json={"provider": "claude", "api_key": SECRET_KEY_VALUE})
+        self.owner.patch(self.base, json={"changes": {"ai_external_allowed": True}})
+        self.owner.put(self.base + "/agent/ai-config", json={"provider": "claude"})
+        registry = self.platform.service("ai")
+        registry._factory = lambda name, model, secrets=None, settings=None: Retired()  # noqa: SLF001
+        registry._cache.clear()  # noqa: SLF001
+        result = self.owner.post(self.base + "/agent/ai/test", json={}).json()
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["configured"])
+        self.assertIn("no longer available", result["error"])
+        self.assertNotIn(SECRET_KEY_VALUE, json.dumps(result))
+        usage = self.owner.get(self.base + "/agent/ai/usage").json()["recent"]
+        self.assertEqual([(u["purpose"], u["success"]) for u in usage], [("intent_interpretation", False)])
+
 
 if __name__ == "__main__":
     unittest.main()

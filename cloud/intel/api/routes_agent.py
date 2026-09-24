@@ -356,5 +356,7 @@ def test_ai(body: Dict[str, Any] = Body(default={}), ctx: Ctx = Depends(write_ct
     except AIError as error:
         return {"ok": False, "configured": True, "error": str(error)[:300]}
     usage = getattr(ai, "last_usage", None)
+    error = getattr(ai, "last_error", None)   # interpret_intent falls back quietly; the test must say why
     return jsonable_encoder({"ok": refined is not None, "configured": True, "provider": ai.name, "model": ai.model,
-                             "intent": refined, "usage": usage.as_dict() if usage is not None else None})
+                             "intent": refined, "usage": usage.as_dict() if usage is not None else None,
+                             "error": error[:300] if error else None})

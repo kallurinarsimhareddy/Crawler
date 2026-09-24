@@ -121,7 +121,7 @@ class _Tracked(AIProvider):
             raise
         finally:
             usage = (result.usage if result is not None else None) or getattr(self.inner, "last_usage", None)
-            self.last_usage = usage
+            self.last_usage, self.last_error = usage, error
             self.registry.record(self.ctx, self.inner, self.purpose, usage, error,
                                  (time.monotonic() - started) * 1000, run_id=self.run_id)
 
