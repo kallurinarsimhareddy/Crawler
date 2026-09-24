@@ -1,0 +1,4 @@
+# Optional: external AI providers for the platform (cloud/intel/ai).
+# Without these the platform uses its deterministic rules everywhere.
+# Gemini and OpenAI-compatible providers need only `requests` (already installed).
+anthropic>=1.0
