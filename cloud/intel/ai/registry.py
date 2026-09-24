@@ -15,6 +15,13 @@ The provider handed back is wrapped so that every call
   in :data:`PII_PURPOSES` (e.g. personalisation, which needs a name);
 * records a ``usage_events`` row (provider, purpose, success, latency) in the
   workspace, via the system scope.
+
+**Per-workspace choice.** A workspace may pick its own provider and model in
+``settings.ai`` (``{"provider": "gemini", "model": "…"}``) and may list
+``fallbacks`` (``[{"provider": "claude"}]``). Fallbacks are used **only** when
+listed, and only when the primary is unavailable or failing transiently — never
+after a refusal. API keys stay in server environment variables; nothing here is
+exposed to the browser.
 """
 
 from __future__ import annotations
@@ -24,7 +31,7 @@ import re
 import time
 from typing import Any, Callable, Dict, Mapping, Optional
 
-from cloud.intel.ai.base import AIError, AIProvider, AIUnavailable
+from cloud.intel.ai.base import AIError, AIProvider, AIRefused, AIRetryable, AIUnavailable
 from cloud.intel.ai.rules import RulesProvider
 from cloud.intel.core.context import Ctx
 
@@ -95,6 +102,38 @@ class _Tracked(AIProvider):
         return self.inner.describe()
 
 
+class FallbackProvider(AIProvider):
+    """Try providers in the order the workspace listed them; stop at a refusal."""
+
+    def __init__(self, providers: list) -> None:
+        self.providers = providers
+        self.name = "+".join(p.name for p in providers)
+        self.external = any(p.external for p in providers)
+        self.model = providers[0].model
+
+    def _try(self, call: Callable[[AIProvider], Any]) -> Any:
+        last: Optional[Exception] = None
+        for provider in self.providers:
+            try:
+                return call(provider)
+            except AIRefused:
+                raise
+            except (AIUnavailable, AIRetryable) as error:
+                log.warning("AI provider %s failed (%s); trying the next configured fallback", provider.name, error)
+                last = error
+        raise last or AIUnavailable("no AI provider available")
+
+    def complete_json(self, system: str, prompt: str, schema: Mapping[str, Any], *,
+                      max_tokens: int = 4000) -> Dict[str, Any]:
+        return self._try(lambda p: p.complete_json(system, prompt, schema, max_tokens=max_tokens))
+
+    def complete_text(self, system: str, prompt: str, *, max_tokens: int = 2000) -> str:
+        return self._try(lambda p: p.complete_text(system, prompt, max_tokens=max_tokens))
+
+    def describe(self) -> Dict[str, Any]:
+        return {"name": self.name, "external": self.external, "chain": [p.describe() for p in self.providers]}
+
+
 class AIRegistry:
     def __init__(self, platform: Any, *, factory: Optional[Callable[[str, Optional[str]], AIProvider]] = None) -> None:
         self.platform = platform
@@ -105,20 +144,39 @@ class AIRegistry:
     def configured(self) -> str:
         return (self.platform.config.ai_provider or "rules").lower()
 
-    def _provider(self) -> AIProvider:
-        name = self.configured
+    def _named(self, name: str, model: Optional[str]) -> AIProvider:
+        name = (name or "rules").lower()
         if name == "rules":
             return RulesProvider()
-        if name not in self._cache:
+        key = f"{name}:{model or ''}"
+        if key not in self._cache:
             try:
-                self._cache[name] = self._factory(name, self.platform.config.ai_model)
+                self._cache[key] = self._factory(name, model)
             except AIUnavailable as error:
                 log.warning("AI provider %s unavailable: %s", name, error)
                 return RulesProvider(str(error))
-        return self._cache[name]
+        return self._cache[key]
+
+    def _provider(self) -> AIProvider:
+        return self._named(self.configured, self.platform.config.ai_model)
+
+    def workspace_config(self, ctx: Ctx) -> Dict[str, Any]:
+        lookup = getattr(self.platform.store, "system_membership", None)
+        info = lookup(ctx.workspace_id) if callable(lookup) else None
+        ai = ((info or {}).get("settings") or {}).get("ai") or {}
+        return {"provider": ai.get("provider"), "model": ai.get("model"), "fallbacks": list(ai.get("fallbacks") or [])}
 
     def for_ctx(self, ctx: Ctx, purpose: str) -> AIProvider:
-        provider = self._provider()
+        config = self.workspace_config(ctx)
+        if config["provider"]:
+            provider = self._named(config["provider"], config["model"] or self.platform.config.ai_model)
+        else:
+            provider = self._provider()
+        chain = [provider] + [self._named(f.get("provider", ""), f.get("model")) for f in config["fallbacks"]
+                              if isinstance(f, Mapping) and f.get("provider")]
+        chain = [p for p in chain if p.external] or [provider]
+        if len(chain) > 1:
+            provider = FallbackProvider(chain)
         if provider.external and not ctx.ai_external_allowed:
             return RulesProvider("this workspace has not allowed its data to be sent to external AI providers")
         if not provider.external:

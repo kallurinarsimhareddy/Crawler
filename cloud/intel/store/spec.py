@@ -72,6 +72,9 @@ class EntitySpec:
     system_write: bool = False
     default_order: str = "created_at desc"
     description: str = ""
+    #: Which generated migration creates this table. Applied migrations never
+    #: change, so new entities go into a new migration file.
+    migration: str = "0003"
 
     def column(self, name: str) -> Col:
         return self.columns[name]
@@ -815,6 +818,118 @@ entity("idempotency_keys", "ik", {
     "status_code": Col("int", required=True),
     "response": _j(),
 }, unique=(("key",),), append_only=True)
+
+
+# ---------------------------------------------------------------------------
+# AI Control Room (migration 0004)
+# ---------------------------------------------------------------------------
+
+_M4 = {"migration": "0004"}
+
+entity("agent_sessions", "as", {
+    "title": _t(300, required=True, search=True),
+    "mode": _choice("auto", "research", "prospecting", "hiring", "data", "campaign", "crm", "monitoring"),
+    "status": _choice("active", "archived"),
+    "working_set": _j(),
+    "last_run_id": _t(40),
+}, **_M4, description="A Control Room conversation: messages plus the current working result set.")
+
+entity("agent_messages", "am", {
+    "session_id": _t(40, required=True, index=True),
+    "role": _choice("user", "assistant", "system"),
+    "content": _t(20000, required=True),
+    "run_id": _t(40),
+    "data": _j(),
+}, **_M4, append_only=True, default_order="created_at asc")
+
+entity("agent_runs", "ar", {
+    "session_id": _t(40, index=True),
+    "request": _t(8000, required=True, search=True),
+    "mode": _t(40, required=True),
+    "intent": _j(),
+    "plan": _j([]),
+    "status": _choice("planned", "running", "awaiting_approval", "completed", "failed", "cancelled"),
+    "planner": _t(60),
+    "estimate": _j(),
+    "result": _j(),
+    "summary": _t(20000),
+    "task_id": _t(40),
+    "error": _t(4000),
+    "progress": _j(),
+}, **_M4, description="One request: intent, plan, estimate, execution state and synthesised result.")
+
+entity("agent_steps", "sp", {
+    "run_id": _t(40, required=True, index=True),
+    "position": Col("int", required=True, minimum=0),
+    "tool": _t(80, required=True, index=True),
+    "params": _j(),
+    "risk": _t(20, required=True),
+    "status": _choice("planned", "running", "done", "failed", "skipped", "awaiting_approval", "rejected"),
+    "requires_approval": Col("bool", required=True, default=False),
+    "estimate": _j(),
+    "output": _j(),
+    "error": _t(4000),
+    "started_at": Col("ts"),
+    "finished_at": Col("ts"),
+    "duration_ms": Col("float"),
+    "reservation_ids": _tags(),
+    "idempotency_key": _t(200),
+}, **_M4, system_write=True, unique=(("run_id", "position"),), default_order="position asc",
+   description="Every tool call: parameters (secrets redacted), risk, credits, output and errors.")
+
+entity("agent_approvals", "ap", {
+    "run_id": _t(40, required=True, index=True),
+    "step_id": _t(40, required=True, index=True),
+    "action": _t(300, required=True),
+    "reason": _t(4000),
+    "risk": _t(20, required=True),
+    "impact": _j(),
+    "credits": _j(),
+    "status": _choice("pending", "approved", "rejected", "expired"),
+    "decided_by": Col("uuid"),
+    "decided_at": Col("ts"),
+}, **_M4, system_write=True)
+
+entity("agent_results", "ax", {
+    "run_id": _t(40, required=True, index=True),
+    "entity_type": _t(40, required=True, index=True),
+    "entity_id": _t(40),
+    "rank": Col("int", required=True, minimum=0),
+    "title": _t(500),
+    "data": _j(),
+    "score": _score(),
+    "reasons": _j([]),
+    "evidence": _j([]),
+}, **_M4, system_write=True, default_order="rank asc")
+
+entity("ai_memory", "mm", {
+    "kind": _choice("alias", "preference", "campaign_definition", "saved_pattern", "source_priority",
+                    "scoring_preference", "allowed_providers", "default_filter", "preferred_fields"),
+    "key": _t(120, required=True, search=True),
+    "value": _j(),
+    "text": _t(2000, search=True),
+    "enabled": Col("bool", required=True, default=True),
+}, **_M4, unique=(("kind", "key"),), description="Workspace AI memory. Never holds secrets.")
+
+entity("ai_insights", "in", {
+    "kind": _t(60, required=True, index=True),
+    "title": _t(500, required=True),
+    "detail": _t(4000),
+    "severity": _choice("info", "notable", "high"),
+    "company_ids": _tags(),
+    "evidence": _j([]),
+    "status": _choice("new", "seen", "dismissed", "acted"),
+    "fingerprint": _t(200, required=True),
+    "suggested_request": _t(2000),
+}, **_M4, unique=(("fingerprint",),), default_order="created_at desc")
+
+entity("saved_requests", "sv", {
+    "name": _t(200, required=True, search=True),
+    "request": _t(8000, required=True),
+    "mode": _t(40),
+    "kind": _choice("request", "view"),
+    "config": _j(),
+}, **_M4)
 
 
 def entities() -> Iterable[EntitySpec]:

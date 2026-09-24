@@ -167,6 +167,9 @@ class PlatformWorker:
         self.maintenance_seconds = maintenance_seconds
         self._stopping = threading.Event()
         self._last_maintenance = 0.0
+        self._last_insights: Dict[str, float] = {}
+        #: Proactive AI insights are swept at most this often per workspace.
+        self.insight_seconds = 3600.0
 
     def stop(self) -> None:
         self._stopping.set()
@@ -200,6 +203,10 @@ class PlatformWorker:
                 # Sequence steps advance only where sending is actually permitted
                 # (production + explicit flag). Elsewhere every send would just be
                 # recorded as "blocked" again each cycle, so nothing is scheduled.
+                if time.monotonic() - self._last_insights.get(workspace_id, -1e9) >= self.insight_seconds:
+                    self._last_insights[workspace_id] = time.monotonic()
+                    report["insights"] = report.get("insights", 0) + len(
+                        self.platform.service("insights").generate(ctx))
                 if self.platform.config.allow_email_sending:
                     stats = self.platform.service("sequences").process_due(ctx)
                     report["sequence_steps"] = report.get("sequence_steps", 0) + stats.get("processed", 0)

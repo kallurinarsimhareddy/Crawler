@@ -253,6 +253,11 @@ def _export(platform: Any, ctx: Ctx, run_id: str, rows: List[Dict[str, Any]], fm
 def run_research_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: Any) -> Dict[str, Any]:
     from cloud.intel.tasks.worker import PermanentTaskError, TaskCancelled
 
+    if task["params"].get("agent_run_id"):
+        # AI Control Room runs share the research task kind (task kinds are fixed by migration 0003).
+        from cloud.intel.agent.service import run_agent_task
+
+        return run_agent_task(platform, ctx, task, reporter)
     store = platform.store
     run = store.find(ctx, "research_runs", task["params"].get("run_id", ""))
     if run is None:

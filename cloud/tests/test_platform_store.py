@@ -206,17 +206,24 @@ class TestPostgresStore(StoreContract, unittest.TestCase):
 
 
 class TestGeneratedMigration(unittest.TestCase):
-    def test_committed_migration_matches_the_specs(self) -> None:
-        from cloud.intel.store.ddl import MIGRATION, generate
+    def test_committed_migrations_match_the_specs(self) -> None:
+        from cloud.intel.store.ddl import GENERATED, generate
 
-        self.assertEqual(MIGRATION.read_text(encoding="utf-8"), generate(),
-                         "run: python -m cloud.intel.store.ddl --write")
+        for version, path in GENERATED.items():
+            self.assertEqual(path.read_text(encoding="utf-8"), generate(version),
+                             f"{path.name} drifted; run: python -m cloud.intel.store.ddl --write")
 
-    def test_every_table_has_rls(self) -> None:
-        from cloud.intel.store.ddl import generate
+    def test_applied_migration_0003_never_changes(self) -> None:
+        # 0003 may already be applied somewhere; later entities must go to later migrations.
         from cloud.intel.store.spec import ENTITIES
 
-        sql = generate()
+        self.assertEqual(sum(1 for s in ENTITIES.values() if s.migration == "0003"), 47)
+
+    def test_every_table_has_rls(self) -> None:
+        from cloud.intel.store.ddl import GENERATED, generate
+        from cloud.intel.store.spec import ENTITIES
+
+        sql = "".join(generate(version) for version in GENERATED)
         for spec in ENTITIES.values():
             self.assertIn(f"alter table careercloud.{spec.table} enable row level security;", sql)
             self.assertIn(f"create policy {spec.table}_select", sql)

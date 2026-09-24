@@ -53,6 +53,10 @@ SERVICES: Dict[str, str] = {
     "sequences": "cloud.intel.gtm.sequences:SequenceService",
     "automation": "cloud.intel.automation.engine:AutomationEngine",
     "analytics": "cloud.intel.analytics.service:AnalyticsService",
+    # AI Control Room
+    "agent": "cloud.intel.agent.service:AgentService",
+    "agent_memory": "cloud.intel.agent.memory:MemoryService",
+    "insights": "cloud.intel.agent.insights:InsightService",
 }
 
 
