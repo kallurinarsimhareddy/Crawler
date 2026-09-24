@@ -185,7 +185,7 @@ export function ListDetail() {
       <PageHeader
         title={String(list.data.name)}
         subtitle={`${fmt(list.data.member_count)} ${String(list.data.entity_type).replace(/_/g, " ")}`}
-        actions={<button className="button button--ghost" disabled={action.busy} onClick={() => action.run(() => client.post("/exports", { entity_type: "list_members", filters: { list_id: listId }, format: "xlsx" }))}>Export XLSX</button>}
+        actions={<button className="button button--ghost" disabled={action.busy} onClick={() => action.run(() => client.post("/exports", { entity_type: "list", filters: { list_id: listId }, format: "xlsx" }))}>Export XLSX</button>}
       />
       {action.error && <ErrorBanner error={action.error} />}
       <KeyValues items={[["Description", fmt(list.data.description)], ["Source", fmt(list.data.source)]]} />

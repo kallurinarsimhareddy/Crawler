@@ -197,6 +197,12 @@ class PlatformWorker:
                 report["reaped"] += len(self.platform.tasks.reap(ctx))
                 report["requeued"] += self.platform.tasks.requeue_orphans(ctx)
                 report["monitors"] += self.platform.service("monitoring").schedule_due(ctx)
+                # Sequence steps advance only where sending is actually permitted
+                # (production + explicit flag). Elsewhere every send would just be
+                # recorded as "blocked" again each cycle, so nothing is scheduled.
+                if self.platform.config.allow_email_sending:
+                    stats = self.platform.service("sequences").process_due(ctx)
+                    report["sequence_steps"] = report.get("sequence_steps", 0) + stats.get("processed", 0)
             except Exception:  # noqa: BLE001
                 log.exception("maintenance failed for workspace %s", workspace_id)
         return report

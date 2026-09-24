@@ -24,14 +24,15 @@ export interface Workspace {
 
 export type Query = Record<string, string | number | boolean | undefined | null>;
 
-function qs(query: Query = {}): string {
+function qs(query: Query = {}, path = ""): string {
   const params = new URLSearchParams();
   for (const [key, value] of Object.entries(query)) {
     if (value === undefined || value === null || value === "") continue;
     params.set(key, String(value));
   }
   const text = params.toString();
-  return text ? `?${text}` : "";
+  if (!text) return "";
+  return path.includes("?") ? `&${text}` : `?${text}`;
 }
 
 export const platform = {
@@ -46,9 +47,9 @@ export function ws(workspaceId: string) {
   return {
     base,
     get: <T = unknown>(path: string, query?: Query, signal?: AbortSignal) =>
-      request<T>(`${base}${path}${qs(query)}`, { signal }),
+      request<T>(`${base}${path}${qs(query, path)}`, { signal }),
     list: <T = Row>(path: string, query?: Query, signal?: AbortSignal) =>
-      request<PageOf<T>>(`${base}${path}${qs(query)}`, { signal }),
+      request<PageOf<T>>(`${base}${path}${qs(query, path)}`, { signal }),
     post: <T = unknown>(path: string, body?: unknown, idempotencyKey?: string) =>
       request<T>(`${base}${path}`, {
         method: "POST",

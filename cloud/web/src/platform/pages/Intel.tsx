@@ -126,7 +126,7 @@ export function Postings() {
       <PageHeader
         title="Jobs"
         subtitle="Every posting from the careers crawler and permitted sources, classified and deduplicated."
-        actions={<button className="button button--ghost" disabled={action.busy} onClick={() => action.run(() => client.post("/crawl", { all: true }))}>Crawl all companies</button>}
+        actions={<button className="button button--ghost" disabled={action.busy} onClick={() => action.run(() => client.post("/crawl", { filters: { status: "active" } }))}>Crawl all companies</button>}
       />
       {action.error && <ErrorBanner error={action.error} />}
       <ResourceList

@@ -532,7 +532,7 @@ export function Settings() {
           <button className="button button--primary" disabled={action.busy || !secret} onClick={() => action.run(async () => {
             let secrets: Record<string, string>;
             try { secrets = JSON.parse(secret); } catch { secrets = { api_key: secret }; }
-            await client.put(`/providers/${provider}`, { secrets });
+            await client.post(`/providers/${provider}/credentials`, { secrets });
             setSecret("");
             providers.refresh();
           })}>Save credentials</button>
