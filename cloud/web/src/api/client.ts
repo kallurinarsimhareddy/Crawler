@@ -44,7 +44,7 @@ const TYPE_SEGMENTS = new Set(["single_company", "bulk_companies", "weekly_crawl
 
 // FastAPI answers 422 with a list of issues and everything else with a string.
 // Turn either into one sentence a person can act on.
-function describeError(status: number, body: unknown): string {
+export function describeError(status: number, body: unknown): string {
   const detail = (body as { detail?: unknown } | null)?.detail;
   if (typeof detail === "string") return detail;
   if (Array.isArray(detail) && detail.length > 0) {
@@ -59,9 +59,10 @@ function describeError(status: number, body: unknown): string {
   return `Request failed (${status})`;
 }
 
-async function send(path: string, init: RequestInit = {}, authenticated = true): Promise<Response> {
+export async function send(path: string, init: RequestInit = {}, authenticated = true): Promise<Response> {
   const headers: Record<string, string> = { Accept: "application/json" };
-  if (init.body) headers["Content-Type"] = "application/json";
+  // Multipart uploads set their own boundary; only JSON bodies get a content type here.
+  if (init.body && !(init.body instanceof FormData)) headers["Content-Type"] = "application/json";
   if (authenticated) {
     const token = await tokenProvider();
     if (token) headers.Authorization = `Bearer ${token}`;
@@ -77,7 +78,7 @@ async function send(path: string, init: RequestInit = {}, authenticated = true):
   return response;
 }
 
-async function request<T>(path: string, init: RequestInit = {}, authenticated = true): Promise<T> {
+export async function request<T>(path: string, init: RequestInit = {}, authenticated = true): Promise<T> {
   const response = await send(path, init, authenticated);
   const text = await response.text();
   let body: unknown = null;

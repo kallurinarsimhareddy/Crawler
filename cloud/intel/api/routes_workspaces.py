@@ -57,10 +57,12 @@ def get_workspace(ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depend
 @router.patch("/w/{workspace_id}")
 def update_workspace(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
                      platform: Platform = Depends(get_platform)):
+    # Accept the generic {"changes": {...}} shape the UI uses for every PATCH, or plain fields.
+    changes = body.get("changes") if isinstance(body.get("changes"), dict) else body
     try:
         ctx.require_admin()
-        row = platform.store.update_workspace(ctx, **body)
-        audit(platform.store, ctx, "workspace.update", changes=body)
+        row = platform.store.update_workspace(ctx, **changes)
+        audit(platform.store, ctx, "workspace.update", changes=changes)
         return jsonable_encoder(row)
     except PlatformError as error:
         raise http_error(error) from error

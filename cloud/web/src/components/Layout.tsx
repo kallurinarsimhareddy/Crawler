@@ -4,11 +4,61 @@ import { api } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 import { usePolling } from "../hooks/usePolling";
 import { WorkerPill, useWorkerStatus } from "./WorkerStatus";
+import { WorkspaceSwitcher } from "../platform/Shell";
 
-const NAV = [
-  { to: "/", label: "Dashboard", end: true },
-  { to: "/new", label: "New Crawl", end: false },
-  { to: "/jobs", label: "Jobs", end: false },
+const NAV_GROUPS: { title: string; items: { to: string; label: string; end?: boolean }[] }[] = [
+  {
+    title: "Intelligence",
+    items: [
+      { to: "/", label: "Dashboard", end: true },
+      { to: "/companies", label: "Companies" },
+      { to: "/contacts", label: "Contacts" },
+      { to: "/postings", label: "Jobs" },
+      { to: "/hiring", label: "Hiring Intelligence" },
+      { to: "/discovery", label: "Discovery" },
+      { to: "/scraper", label: "Scraper" },
+      { to: "/research", label: "Research Agent" },
+    ],
+  },
+  {
+    title: "CRM",
+    items: [
+      { to: "/opportunities", label: "Opportunities" },
+      { to: "/tasks", label: "Tasks" },
+      { to: "/activities", label: "Activities" },
+      { to: "/lists", label: "Lists" },
+      { to: "/segments", label: "Segments" },
+    ],
+  },
+  {
+    title: "GTM",
+    items: [
+      { to: "/campaigns", label: "Campaigns" },
+      { to: "/sequences", label: "Sequences" },
+      { to: "/templates", label: "Templates" },
+      { to: "/suppressions", label: "Suppression" },
+      { to: "/workflows", label: "Workflows" },
+      { to: "/monitors", label: "Monitors" },
+    ],
+  },
+  {
+    title: "Data",
+    items: [
+      { to: "/imports", label: "Imports" },
+      { to: "/exports", label: "Exports" },
+      { to: "/sources", label: "Sources" },
+      { to: "/credits", label: "Credits" },
+      { to: "/analytics", label: "Analytics" },
+    ],
+  },
+  {
+    title: "System",
+    items: [
+      { to: "/jobs", label: "Crawls" },
+      { to: "/background", label: "Background jobs" },
+      { to: "/settings", label: "Settings" },
+    ],
+  },
 ];
 
 function ApiStatus() {
@@ -80,13 +130,19 @@ export function Layout() {
           </button>
         </div>
         <nav id="primary-nav" className={`nav${menuOpen ? " nav--open" : ""}`}>
-          {NAV.map((item) => (
-            <NavLink key={item.to} to={item.to} end={item.end} className={({ isActive }) => `nav__link${isActive ? " nav__link--active" : ""}`}>
-              {item.label}
-            </NavLink>
+          {NAV_GROUPS.map((group) => (
+            <div key={group.title} className="nav__group">
+              <div className="nav__heading">{group.title}</div>
+              {group.items.map((item) => (
+                <NavLink key={item.to} to={item.to} end={item.end} className={({ isActive }) => `nav__link${isActive ? " nav__link--active" : ""}`}>
+                  {item.label}
+                </NavLink>
+              ))}
+            </div>
           ))}
         </nav>
         <div className="sidebar__footer">
+          <WorkspaceSwitcher />
           <UserMenu />
           <WorkerIndicator />
           <ApiStatus />
