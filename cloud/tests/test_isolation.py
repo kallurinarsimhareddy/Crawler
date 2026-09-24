@@ -40,6 +40,8 @@ ADAPTER = CLOUD / "worker" / "careercrawler_runner.py"
 #: The adapter's own tests build a real engine with fake adapters, so they may
 #: also name the platform enum. Nothing else.
 ADAPTER_TESTS = CLOUD / "tests" / "test_careercrawler_runner.py"
+#: The platform's (cloud/intel) single sanctioned door into the engine.
+PLATFORM_BRIDGE = CLOUD / "intel" / "jobs" / "careercrawler_bridge.py"
 
 
 def _python_files():
@@ -66,8 +68,13 @@ class TestStaticImports(unittest.TestCase):
     def test_only_the_adapter_imports_the_crawler_and_only_what_it_declares(self) -> None:
         from cloud.worker.careercrawler_runner import ALLOWED_CRAWLER_MODULES
 
+        from cloud.intel.jobs.careercrawler_bridge import ALLOWED_CRAWLER_MODULES as PLATFORM_ALLOWED
+
         allowed = {
             ADAPTER: ALLOWED_CRAWLER_MODULES,
+            # The platform's crawl task reaches the engine through this one bridge,
+            # imported lazily inside the worker only (see test below).
+            PLATFORM_BRIDGE: PLATFORM_ALLOWED,
             ADAPTER_TESTS: ALLOWED_CRAWLER_MODULES | {"crawler.platform_detector"},
             # Proves the crawler's own HTTP sessions go through the egress guard.
             CLOUD / "tests" / "test_egress.py": frozenset({"utils.http"}),
@@ -83,9 +90,10 @@ class TestStaticImports(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_the_allowlist_itself_excludes_production_state(self) -> None:
+        from cloud.intel.jobs.careercrawler_bridge import ALLOWED_CRAWLER_MODULES as PLATFORM_ALLOWED
         from cloud.worker.careercrawler_runner import ALLOWED_CRAWLER_MODULES
 
-        for module in ALLOWED_CRAWLER_MODULES:
+        for module in ALLOWED_CRAWLER_MODULES | PLATFORM_ALLOWED:
             self.assertFalse(
                 any(module == bad or module.startswith(bad + ".") for bad in FORBIDDEN_CRAWLER_MODULES),
                 module,
@@ -112,6 +120,19 @@ class TestRuntimeImports(unittest.TestCase):
 
     def test_importing_the_api_loads_nothing_from_the_crawler(self) -> None:
         self.assertEqual(self._loaded("import cloud.api.main", CRAWLER_PACKAGES | FORBIDDEN_LIBRARIES), "")
+
+    def test_importing_the_platform_worker_and_services_loads_nothing_from_the_crawler(self) -> None:
+        statement = ("import cloud.intel.tasks.worker, cloud.intel.jobs.crawl_task, cloud.intel.jobs.service, "
+                     "cloud.intel.signals.service, cloud.intel.discovery.service, cloud.intel.monitoring.service")
+        self.assertEqual(self._loaded(statement, CRAWLER_PACKAGES | FORBIDDEN_LIBRARIES), "")
+
+    def test_the_platform_bridge_loads_no_production_state(self) -> None:
+        loaded = self._loaded(
+            "import cloud.intel.jobs.careercrawler_bridge as b; "
+            "import crawler.crawler_engine as e; e.CrawlerEngine(); import utils.http",
+            {"store", "sheets", "sqlite3", "googleapiclient", "gspread"},
+        )
+        self.assertEqual(loaded, "")
 
     def test_the_adapter_and_its_engine_load_no_production_state(self) -> None:
         loaded = self._loaded(

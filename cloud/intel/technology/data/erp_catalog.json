@@ -1,0 +1,489 @@
+{
+ "_provenance": "VENDORED (compact) from E:/Crawlers/zoominfo-erp-automation/config/erp_catalog.yaml on 2026-09-24 (untracked file, discovered via the authorized ZoomInfo lookup API 2026-09-08). Only keys, names, vendors, ZoomInfo product ids and aliases are kept. Stored as JSON so the platform needs no YAML dependency.",
+ "erps": [
+  {
+   "key": "SAP_ECC",
+   "canonical_name": "SAP ECC",
+   "vendor": "SAP SE",
+   "zoominfo_product_ids": {
+    "strong": [
+     "122057",
+     "122058"
+    ],
+    "medium": [
+     "29589"
+    ]
+   },
+   "aliases": {
+    "exact": [
+     "SAP ECC",
+     "SAP ECC 6.0",
+     "SAP ERP Central Component",
+     "SAP ERP Central Component 6.0"
+    ],
+    "acceptable": [
+     "SAP EC",
+     "ECC",
+     "ECC 6.0"
+    ],
+    "weak": [
+     "SAP ERP",
+     "mySAP ERP"
+    ],
+    "excluded": [
+     "SAP",
+     "SAP S/4HANA",
+     "S/4HANA",
+     "SAP Business One",
+     "ECC SD"
+    ]
+   }
+  },
+  {
+   "key": "JD_EDWARDS",
+   "canonical_name": "JD Edwards EnterpriseOne",
+   "vendor": "Oracle Corporation",
+   "zoominfo_product_ids": {
+    "strong": [
+     "25115",
+     "119568",
+     "119569"
+    ],
+    "medium": [
+     "119567",
+     "119574"
+    ]
+   },
+   "aliases": {
+    "exact": [
+     "JD Edwards EnterpriseOne",
+     "Oracle JD Edwards EnterpriseOne",
+     "JDE EnterpriseOne"
+    ],
+    "acceptable": [
+     "JD Edwards",
+     "JDE",
+     "Oracle JD Edwards",
+     "Oracle JDE",
+     "JDE 9.1",
+     "JDE 9.2"
+    ],
+    "weak": [
+     "JD E",
+     "OneWorld",
+     "JD Edwards OneWorld"
+    ],
+    "excluded": [
+     "JD Edwards World",
+     "Oracle",
+     "Oracle Cloud"
+    ]
+   }
+  },
+  {
+   "key": "ORACLE_EBS",
+   "canonical_name": "Oracle E-Business Suite",
+   "vendor": "Oracle Corporation",
+   "zoominfo_product_ids": {
+    "strong": [
+     "26285",
+     "119479"
+    ],
+    "medium": [
+     "119404"
+    ]
+   },
+   "aliases": {
+    "exact": [
+     "Oracle E-Business Suite",
+     "Oracle E Business Suite",
+     "Oracle EBS",
+     "Oracle E-Business Suite R12"
+    ],
+    "acceptable": [
+     "EBS R12",
+     "Oracle Applications"
+    ],
+    "weak": [
+     "EBS"
+    ],
+    "excluded": [
+     "Oracle",
+     "Oracle Cloud",
+     "Oracle Fusion",
+     "NetSuite",
+     "Netsuite Website Hosting and CMS"
+    ]
+   }
+  },
+  {
+   "key": "INFOR_VISUAL",
+   "canonical_name": "Infor Visual",
+   "vendor": "Infor ",
+   "zoominfo_product_ids": {
+    "strong": [
+     "115085",
+     "115037"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "Infor Visual",
+     "Infor VISUAL",
+     "Infor ERP VISUAL"
+    ],
+    "acceptable": [
+     "Visual Manufacturing",
+     "Lilly Software Visual"
+    ],
+    "weak": [],
+    "excluded": [
+     "Visual",
+     "Visual Studio",
+     "Infor"
+    ]
+   }
+  },
+  {
+   "key": "INFOR_LN",
+   "canonical_name": "Infor LN",
+   "vendor": "Infor ",
+   "zoominfo_product_ids": {
+    "strong": [
+     "92600"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "Infor LN"
+    ],
+    "acceptable": [
+     "Infor Baan LN",
+     "Infor ERP LN"
+    ],
+    "weak": [
+     "Baan"
+    ],
+    "excluded": [
+     "LN",
+     "Infor"
+    ]
+   }
+  },
+  {
+   "key": "INFOR_SYTELINE",
+   "canonical_name": "Infor SyteLine",
+   "vendor": "Infor ",
+   "zoominfo_product_ids": {
+    "strong": [
+     "115017"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "Infor SyteLine",
+     "SyteLine"
+    ],
+    "acceptable": [
+     "Infor CloudSuite Industrial",
+     "CloudSuite Industrial"
+    ],
+    "weak": [],
+    "excluded": [
+     "Infor"
+    ]
+   }
+  },
+  {
+   "key": "QAD_MFG_PRO",
+   "canonical_name": "QAD MFG/PRO",
+   "vendor": "QAD Inc.",
+   "zoominfo_product_ids": {
+    "strong": [
+     "120960"
+    ],
+    "medium": [
+     "27068",
+     "120962",
+     "120964"
+    ]
+   },
+   "aliases": {
+    "exact": [
+     "QAD MFG/PRO",
+     "QAD MFG/Pro",
+     "MFG/PRO",
+     "QAD Cloud ERP (formerly QAD MFG/Pro)"
+    ],
+    "acceptable": [
+     "QAD Enterprise Applications",
+     "QAD Manufacturing"
+    ],
+    "weak": [
+     "QAD"
+    ],
+    "excluded": [
+     "QAD Adaptive ERP",
+     "QAD QXtend"
+    ]
+   }
+  },
+  {
+   "key": "DYNAMICS_NAV",
+   "canonical_name": "Dynamics NAV",
+   "vendor": "Microsoft Corporation",
+   "zoominfo_product_ids": {
+    "strong": [
+     "130532"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "Dynamics NAV",
+     "Microsoft Dynamics NAV",
+     "MS Dynamics NAV"
+    ],
+    "acceptable": [
+     "Navision",
+     "Microsoft Navision"
+    ],
+    "weak": [],
+    "excluded": [
+     "Microsoft Dynamics",
+     "Dynamics 365",
+     "Business Central",
+     "Dynamics AX",
+     "Dynamics GP",
+     "Dynamics SL",
+     "NAV"
+    ]
+   }
+  },
+  {
+   "key": "SAGE_100",
+   "canonical_name": "Sage 100",
+   "vendor": "Sage Group plc",
+   "zoominfo_product_ids": {
+    "strong": [
+     "92591"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "Sage 100",
+     "Sage 100 ERP"
+    ],
+    "acceptable": [
+     "Sage MAS 90",
+     "Sage MAS 200",
+     "MAS 90",
+     "MAS 200"
+    ],
+    "weak": [
+     "Sage MAS"
+    ],
+    "excluded": [
+     "Sage",
+     "Sage 1000",
+     "Sage 100 Contractor",
+     "Sage 50",
+     "Sage X3"
+    ]
+   }
+  },
+  {
+   "key": "SAGE_300",
+   "canonical_name": "Sage 300",
+   "vendor": "Sage Group plc",
+   "zoominfo_product_ids": {
+    "strong": [
+     "99787"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "Sage 300",
+     "Sage 300 ERP"
+    ],
+    "acceptable": [
+     "Sage Accpac",
+     "Accpac",
+     "Sage Accpac ERP"
+    ],
+    "weak": [],
+    "excluded": [
+     "Sage",
+     "Sage 300 Construction and Real Estate",
+     "Sage 300 CRE"
+    ]
+   }
+  },
+  {
+   "key": "GLOVIA",
+   "canonical_name": "Glovia",
+   "vendor": "Fujitsu Limited",
+   "zoominfo_product_ids": {
+    "strong": [
+     "29625"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "Glovia",
+     "Fujitsu Glovia",
+     "GLOVIA G2",
+     "glovia.com"
+    ],
+    "acceptable": [
+     "Glovia International",
+     "Fujitsu Glovia G2"
+    ],
+    "weak": [],
+    "excluded": [
+     "Fujitsu"
+    ]
+   }
+  },
+  {
+   "key": "GLOBAL_SHOP_SOLUTIONS",
+   "canonical_name": "Global Shop Solutions",
+   "vendor": "Global Shop Solutions, Inc",
+   "zoominfo_product_ids": {
+    "strong": [
+     "29623"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "Global Shop Solutions",
+     "Global Shop One-System ERP",
+     "Global Shop"
+    ],
+    "acceptable": [
+     "One-System ERP"
+    ],
+    "weak": [],
+    "excluded": []
+   }
+  },
+  {
+   "key": "IQMS_DELMIAWORKS",
+   "canonical_name": "IQMS / DELMIAworks",
+   "vendor": "IQMS",
+   "zoominfo_product_ids": {
+    "strong": [
+     "29651"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "IQMS",
+     "IQMS ERP",
+     "DELMIAworks",
+     "DELMIA Works"
+    ],
+    "acceptable": [
+     "IQMS EnterpriseIQ",
+     "EnterpriseIQ"
+    ],
+    "weak": [],
+    "excluded": [
+     "DELMIA",
+     "Dassault Systemes"
+    ]
+   }
+  },
+  {
+   "key": "SYSPRO",
+   "canonical_name": "SYSPRO On-Prem",
+   "vendor": "SYSPRO",
+   "zoominfo_product_ids": {
+    "strong": [
+     "29523"
+    ],
+    "medium": []
+   },
+   "aliases": {
+    "exact": [
+     "SYSPRO",
+     "SYSPRO ERP",
+     "SYSPRO On-Prem",
+     "SYSPRO On-Premise"
+    ],
+    "acceptable": [
+     "SYSPRO 8"
+    ],
+    "weak": [],
+    "excluded": []
+   }
+  },
+  {
+   "key": "MACOLA_10",
+   "canonical_name": "Macola 10",
+   "vendor": null,
+   "zoominfo_product_ids": {
+    "strong": [],
+    "medium": [
+     "29620",
+     "116739"
+    ]
+   },
+   "aliases": {
+    "exact": [
+     "Macola 10"
+    ],
+    "acceptable": [
+     "Macola",
+     "Exact Macola",
+     "Macola ES",
+     "Macola Progression"
+    ],
+    "weak": [
+     "Macola Progression Series ERP"
+    ],
+    "excluded": []
+   }
+  },
+  {
+   "key": "APTEAN_ROSS",
+   "canonical_name": "Aptean Ross",
+   "vendor": "Aptean Inc",
+   "zoominfo_product_ids": {
+    "strong": [
+     "29491"
+    ],
+    "medium": [
+     "121699"
+    ]
+   },
+   "aliases": {
+    "exact": [
+     "Aptean Ross",
+     "Aptean Ross ERP",
+     "Ross ERP"
+    ],
+    "acceptable": [
+     "Ross Systems",
+     "Ross iRenaissance",
+     "iRenaissance"
+    ],
+    "weak": [],
+    "excluded": [
+     "Aptean",
+     "Ross",
+     "Made2Manage",
+     "Intuitive ERP"
+    ]
+   }
+  }
+ ]
+}
