@@ -41,6 +41,7 @@ from cloud.intel.agent.memory import MemoryService, looks_secret
 from cloud.intel.agent.state import WorkingSet
 from cloud.intel.agent.tools import MODES, TOOLS, ToolCall, results_snapshot
 from cloud.intel.ai.base import validate_against_schema
+from cloud.intel.ai.registry import FREE_QUOTA_EXHAUSTED
 from cloud.intel.core.audit import audit
 from cloud.intel.core.context import ConflictError, Ctx, ForbiddenError, NotFoundError, ValidationError, utcnow
 
@@ -189,6 +190,8 @@ class AgentService:
                 if proposed:
                     steps, planner_name = proposed, f"ai:{ai.name}"
                     ai_info["used"].append("research_planning")
+                elif (getattr(ai, "last_error", None) or "").startswith(FREE_QUOTA_EXHAUSTED):
+                    ai_info["reason"] = FREE_QUOTA_EXHAUSTED   # the quota ran out on this very call
             else:
                 ai_info["reason"] = getattr(ai, "reason", "AI provider not configured")
         elif understood.get("ai_follow_up"):

@@ -26,6 +26,15 @@ The provider handed back is wrapped so that every call
 **Fallbacks.** A workspace may list ``fallbacks`` (``[{"provider": "claude"}]``).
 They are used **only** when listed, and only when the primary is unavailable or
 failing transiently — never after a refusal.
+
+**Free-only mode** (``settings.ai.free_only``). Gemini's free tier and nothing else:
+no fallback providers or models, a $0 budget, and every call recorded at $0. Nothing
+here can enable billing or change a usage tier — that is only possible in Google's
+console. When Google reports the free quota used up (429 RESOURCE_EXHAUSTED), the
+workspace is paused until the quota resets (the provider's retry delay, or midnight
+Pacific for a daily quota): calls in the meantime get the rule-based path with the
+reason "Free AI quota exhausted" and no request is made. The pause is held in this
+process; after a restart the first call finds out again at no cost.
 """
 
 from __future__ import annotations
@@ -34,14 +43,15 @@ import hashlib
 import logging
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, Iterator, List, Mapping, Optional
 
-from cloud.intel.ai.base import AIError, AIProvider, AIRefused, AIResult, AIRetryable, AIUnavailable
+from cloud.intel.ai.base import AIError, AIProvider, AIQuotaExhausted, AIRefused, AIResult, AIRetryable, AIUnavailable
 from cloud.intel.ai.rules import RulesProvider
 from cloud.intel.core.context import Ctx
 
-__all__ = ["AIRegistry", "AI_ACTIONS", "FallbackProvider", "PII_PURPOSES", "PROVIDERS", "redact"]
+__all__ = ["AIRegistry", "AI_ACTIONS", "FREE_QUOTA_EXHAUSTED", "FREE_TIER_PROVIDERS", "FallbackProvider", "PII_PURPOSES",
+           "PROVIDERS", "redact"]
 
 log = logging.getLogger(__name__)
 
@@ -62,11 +72,16 @@ _PURPOSE_ALIASES = {"agent_planning": "research_planning", "describe": "describe
 
 PROVIDERS: Dict[str, Dict[str, Any]] = {
     "claude": {"label": "Claude (Anthropic)", "env": ["ANTHROPIC_API_KEY"], "default_model": "claude-opus-5"},
-    "gemini": {"label": "Gemini (Google)", "env": ["GEMINI_API_KEY"], "default_model": "gemini-2.5-pro"},
+    "gemini": {"label": "Gemini (Google)", "env": ["GEMINI_API_KEY"], "default_model": "gemini-3.8-flash"},
     "openai_compatible": {"label": "OpenAI-compatible", "env": ["OPENAI_COMPATIBLE_API_KEY",
                                                                  "OPENAI_COMPATIBLE_BASE_URL"],
                           "default_model": None},
 }
+
+#: What the workspace sees when free-only mode has used up Gemini's free quota.
+FREE_QUOTA_EXHAUSTED = "Free AI quota exhausted"
+#: The only provider with a free tier the platform supports.
+FREE_TIER_PROVIDERS = frozenset({"gemini"})
 
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 _PHONE = re.compile(r"(?<!\w)(?:\+?\d[\d\s().-]{7,}\d)(?!\w)")
@@ -76,6 +91,19 @@ def redact(text: str) -> str:
     """Replace email addresses and phone numbers with placeholders."""
     text = _EMAIL.sub("[email]", text or "")
     return _PHONE.sub("[phone]", text)
+
+
+def _next_pacific_midnight(now: float) -> float:
+    """Gemini's daily quotas reset at midnight Pacific time."""
+    try:
+        from zoneinfo import ZoneInfo
+
+        zone: Any = ZoneInfo("America/Los_Angeles")
+    except Exception:  # noqa: BLE001 - no tz database (e.g. Windows without tzdata): standard time
+        zone = timezone(timedelta(hours=-8))
+    local = datetime.fromtimestamp(now, zone)
+    midnight = (local + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
+    return midnight.timestamp()
 
 
 def _build(name: str, model: Optional[str], secrets: Optional[Mapping[str, str]] = None,
@@ -89,7 +117,8 @@ def _build(name: str, model: Optional[str], secrets: Optional[Mapping[str, str]]
     if name == "gemini":
         from cloud.intel.ai.rest import GeminiProvider
 
-        return GeminiProvider(model=model, api_key=secrets.get("api_key"), prices=prices)
+        return GeminiProvider(model=model, api_key=secrets.get("api_key"), prices=prices,
+                              free_tier=bool(settings.get("free_tier")))
     if name in ("openai_compatible", "openai"):
         from cloud.intel.ai.rest import OpenAICompatibleProvider
 
@@ -102,9 +131,11 @@ class _Tracked(AIProvider):
     """Redacts prompts and records usage (tokens, cost, request id) around a real provider."""
 
     def __init__(self, inner: AIProvider, registry: "AIRegistry", ctx: Ctx, purpose: str,
-                 run_id: Optional[str] = None) -> None:
+                 run_id: Optional[str] = None, *, free_only: bool = False) -> None:
         self.inner, self.registry, self.ctx, self.purpose, self.run_id = inner, registry, ctx, purpose, run_id
         self.name, self.external, self.model = inner.name, inner.external, inner.model
+        self.free_only = free_only
+        self.last_extra: Dict[str, Any] = {}
 
     def _prep(self, text: str) -> str:
         return text if self.purpose in PII_PURPOSES else redact(text)
@@ -113,15 +144,26 @@ class _Tracked(AIProvider):
         started = time.monotonic()
         error: Optional[str] = None
         result: Optional[AIResult] = None
+        self.inner.last_usage = None   # a failed call must not be recorded with the previous call's tokens
         try:
             result = fn()
             return result
+        except AIQuotaExhausted as exc:
+            if not self.free_only:
+                error = f"{type(exc).__name__}: {exc}"
+                raise
+            self.registry.pause_free_quota(self.ctx, exc)
+            error = f"{FREE_QUOTA_EXHAUSTED}: {exc}"
+            raise AIUnavailable(FREE_QUOTA_EXHAUSTED) from exc
         except AIError as exc:
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
             usage = (result.usage if result is not None else None) or getattr(self.inner, "last_usage", None)
+            if self.free_only and usage is not None:
+                usage.estimated_cost_usd = 0.0   # the free tier is free; nothing here can make a paid call
             self.last_usage, self.last_error = usage, error
+            self.last_extra = dict(result.extra) if result is not None else {}
             self.registry.record(self.ctx, self.inner, self.purpose, usage, error,
                                  (time.monotonic() - started) * 1000, run_id=self.run_id)
 
@@ -136,13 +178,24 @@ class _Tracked(AIProvider):
     def stream(self, system: str, prompt: str, *, max_tokens: int = 2000) -> Iterator[str]:
         started = time.monotonic()
         error = None
+        self.inner.last_usage = None
         try:
             yield from self.inner.stream(system, self._prep(prompt), max_tokens=max_tokens)
+        except AIQuotaExhausted as exc:
+            if not self.free_only:
+                error = f"{type(exc).__name__}: {exc}"
+                raise
+            self.registry.pause_free_quota(self.ctx, exc)
+            error = f"{FREE_QUOTA_EXHAUSTED}: {exc}"
+            raise AIUnavailable(FREE_QUOTA_EXHAUSTED) from exc
         except AIError as exc:
             error = f"{type(exc).__name__}: {exc}"
             raise
         finally:
-            self.registry.record(self.ctx, self.inner, self.purpose, getattr(self.inner, "last_usage", None),
+            usage = getattr(self.inner, "last_usage", None)
+            if self.free_only and usage is not None:
+                usage.estimated_cost_usd = 0.0
+            self.registry.record(self.ctx, self.inner, self.purpose, usage,
                                  error, (time.monotonic() - started) * 1000, run_id=self.run_id)
 
     def complete_json(self, system: str, prompt: str, schema: Mapping[str, Any], *,
@@ -205,6 +258,8 @@ class AIRegistry:
         self.platform = platform
         self._factory = factory or _build
         self._cache: Dict[str, AIProvider] = {}
+        #: workspace id -> epoch seconds until which free-only AI is paused (quota used up).
+        self._free_quota_until: Dict[str, float] = {}
 
     @property
     def configured(self) -> str:
@@ -224,7 +279,29 @@ class AIRegistry:
             "fallbacks": list(ai.get("fallbacks") or []),
             "max_budget_usd": ai.get("max_budget_usd"),
             "allowed_actions": list(ai.get("allowed_actions") or AI_ACTIONS),
+            "free_only": bool(ai.get("free_only", False)),
         }
+
+    # --- free-only mode -----------------------------------------------------------------
+
+    def pause_free_quota(self, ctx: Ctx, error: AIQuotaExhausted) -> float:
+        """Stop external calls for the workspace until the free quota resets; returns that time."""
+        now = time.time()
+        if error.daily or not error.retry_after_s:
+            until = _next_pacific_midnight(now) if error.daily else now + 60
+        else:
+            until = now + max(float(error.retry_after_s), 1.0)
+        self._free_quota_until[ctx.workspace_id] = until
+        log.warning("%s for workspace %s; rule-based path until %s", FREE_QUOTA_EXHAUSTED, ctx.workspace_id,
+                    datetime.fromtimestamp(until, timezone.utc).isoformat())
+        return until
+
+    def free_quota_paused_until(self, ctx: Ctx) -> Optional[datetime]:
+        until = self._free_quota_until.get(ctx.workspace_id)
+        if until is None or until <= time.time():
+            self._free_quota_until.pop(ctx.workspace_id, None)
+            return None
+        return datetime.fromtimestamp(until, timezone.utc)
 
     def _secrets(self, ctx: Ctx, name: str) -> Dict[str, Any]:
         """The workspace's own key for ``name`` (decrypted, server-side only), or {}."""
@@ -246,13 +323,16 @@ class AIRegistry:
             return "workspace"
         return "server" if all(os.environ.get(v) for v in PROVIDERS[name]["env"]) else None
 
-    def _named(self, name: str, model: Optional[str], ctx: Optional[Ctx] = None) -> AIProvider:
+    def _named(self, name: str, model: Optional[str], ctx: Optional[Ctx] = None, *,
+               free_only: bool = False) -> AIProvider:
         name = (name or "rules").lower()
         if name == "rules":
             return RulesProvider("AI provider not configured")
         found = self._secrets(ctx, name) if ctx is not None else {"secrets": {}, "settings": {}}
+        if free_only:
+            found = {**found, "settings": {**found["settings"], "free_tier": True}}
         fingerprint = hashlib.sha256(repr(sorted(found["secrets"].items())).encode()).hexdigest()[:12]
-        key = f"{ctx.workspace_id if ctx else '-'}:{name}:{model or ''}:{fingerprint}"
+        key = f"{ctx.workspace_id if ctx else '-'}:{name}:{model or ''}:{fingerprint}:{'free' if free_only else ''}"
         if key not in self._cache:
             try:
                 self._cache[key] = self._factory(name, model, found["secrets"], found["settings"])
@@ -266,7 +346,9 @@ class AIRegistry:
                 return RulesProvider(str(error))
         return self._cache[key]
 
-    def _resolve(self, name: str, model: Optional[str], ctx: Ctx) -> AIProvider:
+    def _resolve(self, name: str, model: Optional[str], ctx: Ctx, *, free_only: bool = False) -> AIProvider:
+        if free_only:
+            return self._named(name, model, ctx, free_only=True)
         try:
             return self._named(name, model, ctx)
         except TypeError:  # a replaced two-argument _named (tests)
@@ -292,11 +374,27 @@ class AIRegistry:
             return RulesProvider(f"the workspace does not allow AI for {action.replace('_', ' ')}")
         if not ctx.ai_external_allowed:
             return RulesProvider("this workspace has not allowed its data to be sent to external AI providers")
+        free_only = config["free_only"]
+        model = config["model"] if config["provider"] else self.platform.config.ai_model
+        model = model or (config["model"] if not config["provider"] else None)
+        if free_only:
+            # Gemini's free tier only: no fallbacks, no paid spend, and no call while the quota is used up.
+            if name not in FREE_TIER_PROVIDERS:
+                return RulesProvider(f"free-only AI mode supports {', '.join(sorted(FREE_TIER_PROVIDERS))} only")
+            paused = self.free_quota_paused_until(ctx)
+            if paused is not None and action != "describe":
+                return RulesProvider(f"{FREE_QUOTA_EXHAUSTED} — using the rule-based planner until "
+                                     f"{paused.strftime('%Y-%m-%d %H:%M UTC')}")
+            if action != "describe" and self.month_spend(ctx) > 0:
+                return RulesProvider("free-only AI mode stopped: a paid AI charge was recorded this month")
+            provider = self._resolve(name, model, ctx, free_only=True)
+            if not provider.external:
+                return provider
+            return _Tracked(provider, self, ctx, action, run_id=run_id, free_only=True)
         budget = config["max_budget_usd"]
         if budget is not None and action != "describe" and self.month_spend(ctx) >= float(budget):
             return RulesProvider(f"this month's AI budget of ${float(budget):g} has been reached")
-        model = config["model"] if config["provider"] else self.platform.config.ai_model
-        provider = self._resolve(name, model or (config["model"] if not config["provider"] else None), ctx)
+        provider = self._resolve(name, model, ctx)
         chain = [provider] + [self._resolve(f.get("provider", ""), f.get("model"), ctx) for f in config["fallbacks"]
                               if isinstance(f, Mapping) and f.get("provider")]
         chain = [p for p in chain if p.external] or [provider]
@@ -311,6 +409,7 @@ class AIRegistry:
         config = self.workspace_config(ctx)
         name = (config["provider"] or self.configured or "rules").lower()
         chosen = self.for_ctx(ctx, "research_planning")
+        paused = self.free_quota_paused_until(ctx)
         return {
             "configured": name != "rules",
             "provider": name,
@@ -322,8 +421,11 @@ class AIRegistry:
             "external_allowed": ctx.ai_external_allowed,
             "active": chosen.external,
             "reason": None if chosen.external else getattr(chosen, "reason", "AI provider not configured"),
-            "fallbacks": config["fallbacks"],
-            "max_budget_usd": config["max_budget_usd"],
+            "fallbacks": [] if config["free_only"] else config["fallbacks"],
+            "max_budget_usd": 0 if config["free_only"] else config["max_budget_usd"],
+            "free_only": config["free_only"],
+            "free_quota_exhausted": config["free_only"] and paused is not None,
+            "free_quota_resets_at": paused.isoformat() if config["free_only"] and paused is not None else None,
             "spent_this_month_usd": self.month_spend(ctx),
             "allowed_actions": config["allowed_actions"],
             "actions": AI_ACTIONS,
@@ -348,7 +450,12 @@ class AIRegistry:
             t["prompt_tokens"] += row["prompt_tokens"] or 0
             t["completion_tokens"] += row["completion_tokens"] or 0
             t["cost_usd"] = round(t["cost_usd"] + float(row["estimated_cost_usd"] or 0), 6)
-        return {"recent": rows, "totals": totals, "spent_this_month_usd": self.month_spend(ctx)}
+        # Free-tier quotas are per Pacific day; show today's calls and tokens against them.
+        day_start = datetime.fromtimestamp(_next_pacific_midnight(time.time()), timezone.utc) - timedelta(days=1)
+        today = self.platform.store.all(ctx, "ai_usage", {"created_at__gte": day_start}, cap=100_000)
+        return {"recent": rows, "totals": totals, "spent_this_month_usd": self.month_spend(ctx),
+                "today_pacific": {"calls": len(today), "failed": sum(1 for r in today if not r["success"]),
+                                  "total_tokens": sum(r["total_tokens"] or 0 for r in today)}}
 
     def record(self, ctx: Ctx, provider: AIProvider, purpose: str, usage: Any, error: Optional[str],
                latency_ms: float, *, run_id: Optional[str] = None) -> None:

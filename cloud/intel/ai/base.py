@@ -33,7 +33,7 @@ from abc import ABC
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterator, List, Mapping, Optional
 
-__all__ = ["AIError", "AIProvider", "AIRefused", "AIResult", "AIRetryable", "AIUnavailable", "AIUsage", "PRICES",
+__all__ = ["AIError", "AIProvider", "AIQuotaExhausted", "AIRefused", "AIResult", "AIRetryable", "AIUnavailable", "AIUsage", "PRICES",
            "estimate_cost", "validate_against_schema"]
 
 #: USD per million tokens (input, output) for models with published prices.
@@ -96,6 +96,17 @@ class AIRefused(AIError):
 
 class AIRetryable(AIError):
     """A transient failure worth retrying later: rate limit, overload, network."""
+
+
+class AIQuotaExhausted(AIRetryable):
+    """The provider's quota is used up (HTTP 429 RESOURCE_EXHAUSTED).
+
+    ``retry_after_s`` is the provider's suggested wait when it gave one; ``daily`` is
+    true when a per-day quota ran out (it resets at the provider's day boundary)."""
+
+    def __init__(self, message: str, *, retry_after_s: Optional[float] = None, daily: bool = False) -> None:
+        super().__init__(message)
+        self.retry_after_s, self.daily = retry_after_s, daily
 
 
 def validate_against_schema(value: Any, schema: Mapping[str, Any], path: str = "$") -> List[str]:

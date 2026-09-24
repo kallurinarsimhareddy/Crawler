@@ -18,6 +18,9 @@ interface AiStatus {
   active: boolean;
   reason: string | null;
   max_budget_usd: number | null;
+  free_only: boolean;
+  free_quota_exhausted: boolean;
+  free_quota_resets_at: string | null;
   spent_this_month_usd: number;
   allowed_actions: string[];
   actions: Record<string, string>;
@@ -32,6 +35,7 @@ interface AiConfig {
     max_budget_usd: number | null;
     allowed_actions: string[];
     fallbacks: { provider: string; model?: string | null }[];
+    free_only?: boolean;
   };
   status: AiStatus;
   platform_default: string;
@@ -44,6 +48,7 @@ interface Usage {
   recent: { id: string; created_at: string; provider: string; model: string; purpose: string; success: boolean; prompt_tokens: number | null; completion_tokens: number | null; estimated_cost_usd: number | null; request_id: string | null }[];
   totals: Record<string, { calls: number; prompt_tokens: number; completion_tokens: number; cost_usd: number }>;
   spent_this_month_usd: number;
+  today_pacific?: { calls: number; failed: number; total_tokens: number };
 }
 
 interface Proactive {
@@ -64,8 +69,11 @@ function StatusBanner({ status }: { status: AiStatus }) {
   if (!status.configured) {
     return <div className="alert alert--info" role="status"><strong>AI provider not configured.</strong>&nbsp;The Control Room plans with deterministic rules. Choose a provider and save a key to use a real model.</div>;
   }
+  if (status.free_quota_exhausted) {
+    return <div className="alert alert--warning" role="status"><strong>Free AI quota exhausted.</strong>&nbsp;The rule-based planner is used until the free quota resets{status.free_quota_resets_at ? ` (${fmt(status.free_quota_resets_at)})` : ""}. No paid call is attempted.</div>;
+  }
   if (status.active) {
-    return <div className="alert alert--info" role="status">AI active: <strong>{status.provider}</strong>{status.model ? ` · ${status.model}` : ""} (key from {status.key_source === "workspace" ? "this workspace" : "the server"}).</div>;
+    return <div className="alert alert--info" role="status">AI active: <strong>{status.provider}</strong>{status.model ? ` · ${status.model}` : ""}{status.free_only ? " · free tier only" : ""} (key from {status.key_source === "workspace" ? "this workspace" : "the server"}).</div>;
   }
   return <div className="alert alert--info" role="status"><strong>AI not in use:</strong>&nbsp;{status.reason ?? "unavailable"}. Rules are used instead.</div>;
 }
@@ -79,6 +87,7 @@ export function AiProviderSettings() {
   const [provider, setProvider] = useState("");
   const [model, setModel] = useState("");
   const [enabled, setEnabled] = useState(true);
+  const [freeOnly, setFreeOnly] = useState(false);
   const [budget, setBudget] = useState("");
   const [actions, setActions] = useState<string[]>([]);
   const [fallbacks, setFallbacks] = useState<{ provider: string; model: string }[]>([]);
@@ -95,6 +104,7 @@ export function AiProviderSettings() {
     setProvider(w.provider ?? "");
     setModel(w.model ?? "");
     setEnabled(w.enabled !== false);
+    setFreeOnly(w.free_only === true);
     setBudget(w.max_budget_usd === null || w.max_budget_usd === undefined ? "" : String(w.max_budget_usd));
     setActions(w.allowed_actions ?? []);
     setFallbacks(w.fallbacks.map((f) => ({ provider: f.provider, model: f.model ?? "" })));
@@ -112,9 +122,10 @@ export function AiProviderSettings() {
         provider: provider || null,
         model: model || null,
         enabled,
-        max_budget_usd: budget === "" ? null : Number(budget),
+        max_budget_usd: freeOnly ? 0 : budget === "" ? null : Number(budget),
         allowed_actions: actions,
-        fallbacks: fallbacks.filter((f) => f.provider).map((f) => ({ provider: f.provider, model: f.model || null })),
+        free_only: freeOnly,
+        fallbacks: freeOnly ? [] : fallbacks.filter((f) => f.provider).map((f) => ({ provider: f.provider, model: f.model || null })),
       });
       config.refresh();
     });
@@ -148,9 +159,12 @@ export function AiProviderSettings() {
         <label className="check">
           <input type="checkbox" checked={enabled} disabled={!admin} onChange={(e) => setEnabled(e.target.checked)} /> AI enabled for this workspace
         </label>
+        <label className="check">
+          <input type="checkbox" checked={freeOnly} disabled={!admin} onChange={(e) => { setFreeOnly(e.target.checked); if (e.target.checked) { setProvider("gemini"); setBudget("0"); setFallbacks([]); } }} /> Free tier only (Gemini): $0 budget, no fallbacks; when the free quota runs out, rules are used
+        </label>
         <label className="field">
           <span className="field__label">Provider</span>
-          <select className="input" value={provider} disabled={!admin} onChange={(e) => setProvider(e.target.value)}>
+          <select className="input" value={provider} disabled={!admin || freeOnly} onChange={(e) => setProvider(e.target.value)}>
             <option value="">Platform default ({config.data.platform_default})</option>
             {config.data.providers.map((p) => <option key={p} value={p}>{p === "rules" ? "rules (no AI)" : status.providers[p]?.label ?? p}</option>)}
           </select>
@@ -161,7 +175,7 @@ export function AiProviderSettings() {
         </label>
         <label className="field">
           <span className="field__label">Monthly budget (USD)</span>
-          <input className="input" type="number" min={0} step="0.01" value={budget} disabled={!admin} onChange={(e) => setBudget(e.target.value)} placeholder="no limit" />
+          <input className="input" type="number" min={0} step="0.01" value={budget} disabled={!admin || freeOnly} onChange={(e) => setBudget(e.target.value)} placeholder="no limit" />
           <span className="field__hint">Spent this month: ${status.spent_this_month_usd.toFixed(4)} (estimated). At the limit, rules are used.</span>
         </label>
       </div>
@@ -186,7 +200,7 @@ export function AiProviderSettings() {
         </div>
       ))}
       <div className="form__actions">
-        <button type="button" className="button button--ghost button--small" disabled={!admin} onClick={() => setFallbacks((l) => [...l, { provider: realProviders.find((p) => p !== provider) ?? "claude", model: "" }])}>Add fallback</button>
+        <button type="button" className="button button--ghost button--small" disabled={!admin || freeOnly} onClick={() => setFallbacks((l) => [...l, { provider: realProviders.find((p) => p !== provider) ?? "claude", model: "" }])}>Add fallback</button>
         <button type="button" className="button button--primary" disabled={!admin || action.busy} onClick={save}>Save AI settings</button>
       </div>
 
@@ -230,6 +244,7 @@ export function AiProviderSettings() {
       <h4>Usage and cost</h4>
       {usage.data ? (
         <>
+          {usage.data.today_pacific && <p className="muted small">Today (Pacific, when free-tier quotas reset): {usage.data.today_pacific.calls} calls ({usage.data.today_pacific.failed} failed), {usage.data.today_pacific.total_tokens} tokens.</p>}
           <DataTable
             rows={Object.entries(usage.data.totals).map(([k, t]) => ({ id: k, model: k, ...t }))}
             empty="No AI calls yet."

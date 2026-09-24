@@ -20,7 +20,8 @@ from unittest import mock
 from cryptography.fernet import Fernet
 
 from cloud.intel.agent import ai_assist
-from cloud.intel.ai.base import AIProvider, AIRefused, AIResult, AIUnavailable, AIUsage, estimate_cost
+from cloud.intel.ai.base import (AIError, AIProvider, AIQuotaExhausted, AIRefused, AIResult, AIRetryable, AIUnavailable,
+                                 AIUsage, estimate_cost)
 from cloud.intel.ai.claude import ClaudeProvider
 from cloud.intel.ai.registry import AIRegistry, FallbackProvider
 from cloud.intel.ai.rest import GeminiProvider, OpenAICompatibleProvider
@@ -236,7 +237,7 @@ class UsageTracking(Base):
                 body = self.body
                 return SimpleNamespace(status_code=200, json=lambda: body, headers={"x-request-id": "hdr-1"}, text="")
 
-        gemini = GeminiProvider(api_key="g-key-12345678", session=Session({
+        gemini = GeminiProvider(api_key="g-key-12345678", model="gemini-2.5-pro", session=Session({
             "candidates": [{"content": {"parts": [{"text": "hello"}]}, "finishReason": "STOP"}],
             "usageMetadata": {"promptTokenCount": 11, "candidatesTokenCount": 3}, "responseId": "gem-1"}),
             prices={"gemini-2.5-pro": (1.25, 10.0)})
@@ -464,6 +465,181 @@ class ApiNoSecretLeak(unittest.TestCase):
         self.assertNotIn(SECRET_KEY_VALUE, json.dumps(result))
         usage = self.owner.get(self.base + "/agent/ai/usage").json()["recent"]
         self.assertEqual([(u["purpose"], u["success"]) for u in usage], [("intent_interpretation", False)])
+
+    def test_free_only_configuration_is_gemini_with_no_fallbacks_and_no_budget(self) -> None:
+        bad = [{"provider": "claude", "free_only": True},
+               {"provider": "gemini", "free_only": True, "fallbacks": [{"provider": "claude"}]},
+               {"provider": "gemini", "free_only": True, "max_budget_usd": 5},
+               {"provider": "gemini", "free_only": "yes"}]
+        for body in bad:
+            self.assertEqual(self.owner.put(self.base + "/agent/ai-config", json=body).status_code, 422, body)
+        ok = self.owner.put(self.base + "/agent/ai-config", json={"provider": "gemini", "model": "gemini-3.8-flash",
+                                                                   "free_only": True})
+        self.assertEqual(ok.status_code, 200, ok.text)
+        self.assertTrue(ok.json()["free_only"])
+        self.assertEqual(ok.json()["max_budget_usd"], 0)
+        status = self.owner.get(self.base + "/agent/ai-config").json()["status"]
+        self.assertTrue(status["free_only"])
+        self.assertEqual((status["fallbacks"], status["max_budget_usd"]), ([], 0))
+
+
+# --------------------------------------------------------------------------------------
+# Gemini free tier: function calling, $0 usage, quota exhaustion -> rules
+# --------------------------------------------------------------------------------------
+
+class GeminiSession:
+    """Answers Gemini REST calls from a script; records each request body."""
+
+    def __init__(self, *responses) -> None:
+        self.responses, self.calls = list(responses), []
+
+    def post(self, url, headers=None, json=None, timeout=None):
+        self.calls.append({"url": url, "headers": headers, "json": json})
+        status, body = self.responses.pop(0)
+        return SimpleNamespace(status_code=status, json=lambda: body, headers={}, text=str(body))
+
+
+INTENT_ARGS = {"technologies": ["SAP"], "industries": ["Manufacturing"], "country": "United States",
+               "hiring_keywords": ["SAP"], "contact_functions": ["it"], "summary": "US manufacturers hiring for SAP"}
+
+
+def gemini_function_call(args=INTENT_ARGS, *, thoughts=40):
+    return 200, {"candidates": [{"content": {"parts": [{"functionCall": {"name": "submit_answer", "args": args}}]},
+                                 "finishReason": "STOP"}],
+                 "usageMetadata": {"promptTokenCount": 300, "candidatesTokenCount": 25, "thoughtsTokenCount": thoughts},
+                 "modelVersion": "gemini-3.8-flash", "responseId": "gem-fc-1"}
+
+
+def gemini_quota(*, daily=True, delay="41s"):
+    quota = "GenerateRequestsPerDayPerProjectPerModel-FreeTier" if daily else "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"
+    return 429, {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", "message": "You exceeded your current quota",
+                           "details": [{"@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                                        "violations": [{"quotaId": quota}]},
+                                       {"@type": "type.googleapis.com/google.rpc.RetryInfo", "retryDelay": delay}]}}
+
+
+class GeminiFunctionCalling(unittest.TestCase):
+    def test_structured_output_is_a_forced_function_call_validated_by_the_platform(self) -> None:
+        session = GeminiSession(gemini_function_call())
+        gemini = GeminiProvider(api_key="g-key-12345678", session=session)
+        result = gemini.structured_generate("s", "p", ai_assist._INTENT_SCHEMA, max_tokens=800)  # noqa: SLF001
+        self.assertEqual(result.data, INTENT_ARGS)
+        self.assertEqual(result.extra["structured_via"], "function_call")
+        body = session.calls[0]["json"]
+        self.assertEqual(gemini.model, "gemini-3.8-flash")
+        self.assertNotIn("responseMimeType", body["generationConfig"], "JSON mode and function calling don't mix")
+        self.assertGreaterEqual(body["generationConfig"]["maxOutputTokens"], 4096, "room for thinking tokens")
+        self.assertEqual(body["toolConfig"]["functionCallingConfig"], {"mode": "ANY",
+                                                                       "allowedFunctionNames": ["submit_answer"]})
+        params = body["tools"][0]["functionDeclarations"][0]["parameters"]
+        self.assertEqual(params["type"], "OBJECT")
+        self.assertNotIn("additionalProperties", params)
+        self.assertEqual(params["properties"]["country"], {"type": "STRING", "nullable": True})
+        self.assertEqual(params["properties"]["contact_functions"]["items"]["enum"], ["it", "hr", "executive"])
+        self.assertEqual((result.usage.prompt_tokens, result.usage.completion_tokens), (300, 65),
+                         "thinking tokens count as output")
+        self.assertIsNone(result.usage.estimated_cost_usd, "no Gemini price is assumed")
+
+    def test_arguments_that_break_the_schema_are_refused(self) -> None:
+        gemini = GeminiProvider(api_key="g-key-12345678", session=GeminiSession(gemini_function_call(
+            {**INTENT_ARGS, "contact_functions": ["sales"]})))
+        with self.assertRaises(AIError):
+            gemini.structured_generate("s", "p", ai_assist._INTENT_SCHEMA)  # noqa: SLF001
+
+    def test_free_tier_calls_cost_nothing_and_quota_errors_are_typed(self) -> None:
+        gemini = GeminiProvider(api_key="g-key-12345678", session=GeminiSession(
+            gemini_function_call(), gemini_quota(daily=True), gemini_quota(daily=False, delay="7s"),
+            (429, {"error": {"status": "UNAVAILABLE"}})), free_tier=True, prices={"gemini-3.8-flash": (1.0, 1.0)})
+        self.assertEqual(gemini.structured_generate("s", "p", ai_assist._INTENT_SCHEMA).usage.estimated_cost_usd, 0.0)  # noqa: SLF001
+        with self.assertRaises(AIQuotaExhausted) as daily:
+            gemini.generate("s", "p")
+        self.assertTrue(daily.exception.daily)
+        with self.assertRaises(AIQuotaExhausted) as minute:
+            gemini.generate("s", "p")
+        self.assertEqual((minute.exception.daily, minute.exception.retry_after_s), (False, 7.0))
+        with self.assertRaises(AIRetryable) as plain:
+            gemini.generate("s", "p")
+        self.assertNotIsInstance(plain.exception, AIQuotaExhausted)
+
+
+class FreeOnlyMode(Base):
+    def setUp(self) -> None:
+        super().setUp()
+        self.session = GeminiSession()
+        self.built: List[Dict[str, Any]] = []
+
+        def factory(name, model, secrets=None, settings=None):
+            self.built.append({"name": name, "model": model, "free_tier": bool((settings or {}).get("free_tier"))})
+            if name != "gemini":
+                return ScriptedProvider(text="PAID FALLBACK")
+            return GeminiProvider(model=model, api_key="g-key-12345678", session=self.session,
+                                  free_tier=bool((settings or {}).get("free_tier")))
+
+        self.registry._factory = factory  # noqa: SLF001
+        self.registry._cache.clear()  # noqa: SLF001
+        # Fallbacks and a budget left over from before free-only was switched on must not matter.
+        self.configure(provider="gemini", model="gemini-3.8-flash", free_only=True, max_budget_usd=0,
+                       fallbacks=[{"provider": "claude"}])
+
+    def context(self) -> Dict[str, Any]:
+        text = "Find US manufacturing companies with SAP hiring."
+        return ai_assist.build_context(self.platform, self.ctx, text=text, mode="auto",
+                                       profile=self.platform.service("agent_memory").profile(self.ctx))
+
+    def test_calls_are_free_tier_tracked_at_zero_cost_with_no_fallback(self) -> None:
+        self.session.responses.append(gemini_function_call())
+        ai = self.registry.for_ctx(self.ctx, "intent_interpretation")
+        self.assertTrue(ai.external)
+        self.assertIsNotNone(ai_assist.interpret_intent(ai, self.context(), {}))
+        self.assertEqual({b["name"] for b in self.built}, {"gemini"}, "no fallback provider is even built")
+        self.assertTrue(all(b["free_tier"] for b in self.built))
+        row = self.store.all(self.ctx, "ai_usage")[0]
+        self.assertEqual((row["success"], row["estimated_cost_usd"], row["prompt_tokens"], row["completion_tokens"]),
+                         (True, 0.0, 300, 65))
+        self.assertTrue(self.registry.status(self.ctx)["active"], "a $0 budget does not block the free tier")
+
+    def test_exhausted_quota_falls_back_to_rules_and_makes_no_more_calls(self) -> None:
+        self.session.responses.append(gemini_quota(daily=True))
+        ai = self.registry.for_ctx(self.ctx, "intent_interpretation")
+        self.assertIsNone(ai_assist.interpret_intent(ai, self.context(), {}))
+        self.assertTrue(ai.last_error.startswith("Free AI quota exhausted"))
+        after = self.registry.for_ctx(self.ctx, "research_planning")
+        self.assertFalse(after.external)
+        self.assertTrue(after.reason.startswith("Free AI quota exhausted"))
+        status = self.registry.status(self.ctx)
+        self.assertTrue(status["free_quota_exhausted"])
+        self.assertTrue(status["reason"].startswith("Free AI quota exhausted"))
+        self.assertEqual(len(self.session.calls), 1, "no paid or repeated call after the quota ran out")
+        row = self.store.all(self.ctx, "ai_usage")[0]
+        self.assertEqual((row["success"], row["estimated_cost_usd"], row["prompt_tokens"]), (False, None, None))
+        self.assertIn("Free AI quota exhausted", row["error"])
+        # The Control Room still plans — with rules, and says why.
+        turn = self.platform.service("agent").ask(self.ctx, "Find US manufacturing companies with SAP hiring")
+        self.assertEqual(turn["run"]["planner"], "rules")
+        self.assertIn("Free AI quota exhausted", json.dumps(turn, default=str))
+        self.assertEqual(len(self.session.calls), 1)
+
+    def test_a_short_rate_limit_pauses_only_for_the_retry_delay(self) -> None:
+        self.session.responses.append(gemini_quota(daily=False, delay="7s"))
+        ai = self.registry.for_ctx(self.ctx, "plan_explanation")
+        with self.assertRaises(AIUnavailable):
+            ai.generate("s", "p")
+        paused = self.registry.free_quota_paused_until(self.ctx)
+        self.assertIsNotNone(paused)
+        with mock.patch("cloud.intel.ai.registry.time.time", return_value=paused.timestamp() + 1):
+            self.assertTrue(self.registry.for_ctx(self.ctx, "plan_explanation").external)
+
+    def test_any_recorded_paid_spend_stops_free_only_mode(self) -> None:
+        self.store.insert(self.ctx.as_system(), "ai_usage", {"provider": "gemini", "model": "gemini-3.8-flash",
+                                                             "purpose": "extraction", "success": True,
+                                                             "estimated_cost_usd": 0.01})
+        chosen = self.registry.for_ctx(self.ctx, "extraction")
+        self.assertFalse(chosen.external)
+        self.assertIn("paid AI charge", chosen.reason)
+
+    def test_free_only_is_gemini_only(self) -> None:
+        self.configure(provider="claude")
+        self.assertIn("supports gemini only", self.registry.for_ctx(self.ctx, "extraction").reason)
 
 
 if __name__ == "__main__":

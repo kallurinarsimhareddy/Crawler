@@ -285,12 +285,27 @@ def set_ai_config(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx
     model = body.get("model")
     if model is not None and (not isinstance(model, str) or len(model) > 120):
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "model must be a model id")
+    free_only = body.get("free_only", False)
+    if not isinstance(free_only, bool):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "free_only must be true or false")
+    if free_only:
+        from cloud.intel.ai.registry import FREE_TIER_PROVIDERS
+
+        if provider not in FREE_TIER_PROVIDERS:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "free-only mode uses Gemini's free tier: "
+                                                                      "provider must be gemini")
+        if fallbacks:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "free-only mode allows no fallback providers "
+                                                                      "or models")
+        if budget not in (None, 0):
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "free-only mode keeps the AI budget at $0")
+        budget = 0
 
     def produce():
         info = platform.store.membership(ctx.user_id, ctx.workspace_id)
         settings = dict(info.get("settings") or {})
         settings["ai"] = {**(settings.get("ai") or {}), "provider": provider, "model": model or None,
-                          "enabled": enabled, "max_budget_usd": budget,
+                          "enabled": enabled, "max_budget_usd": budget, "free_only": free_only,
                           "allowed_actions": actions if actions is not None else sorted(AI_ACTIONS),
                           "fallbacks": [{"provider": f["provider"], "model": f.get("model")} for f in fallbacks]}
         platform.store.update_workspace(ctx, settings=settings)
@@ -357,6 +372,14 @@ def test_ai(body: Dict[str, Any] = Body(default={}), ctx: Ctx = Depends(write_ct
         return {"ok": False, "configured": True, "error": str(error)[:300]}
     usage = getattr(ai, "last_usage", None)
     error = getattr(ai, "last_error", None)   # interpret_intent falls back quietly; the test must say why
+    extra = getattr(ai, "last_extra", None) or {}
+    from cloud.intel.ai.registry import FREE_QUOTA_EXHAUSTED
+
     return jsonable_encoder({"ok": refined is not None, "configured": True, "provider": ai.name, "model": ai.model,
+                             "free_only": bool(getattr(ai, "free_only", False)),
+                             # function_call: the answer arrived as a forced function call and passed the schema
+                             "structured_via": extra.get("structured_via"),
+                             "thinking_tokens": extra.get("thinking_tokens"),
                              "intent": refined, "usage": usage.as_dict() if usage is not None else None,
+                             "free_quota_exhausted": bool(error and error.startswith(FREE_QUOTA_EXHAUSTED)),
                              "error": error[:300] if error else None})
