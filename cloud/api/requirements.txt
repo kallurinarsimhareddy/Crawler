@@ -12,3 +12,5 @@ psycopg-pool>=3.2
 redis>=5.0
 # Result storage over the S3 protocol (Supabase Storage / Cloudflare R2).
 boto3>=1.34
+# FastAPI UploadFile (platform imports, scraper URL files).
+python-multipart>=0.0.9
