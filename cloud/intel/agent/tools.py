@@ -199,7 +199,7 @@ def _run_research(call: ToolCall, name: str, params: Dict[str, Any]) -> Dict[str
 
 @tool("search_companies", risk="read", modes=("research", "prospecting", "hiring", "campaign", "crm", "data"),
       produces=("companies",), schema=_props(
-          country=S, industries=LIST, technologies=LIST, lifecycles=LIST, q=S,
+          country={"type": ["string", "null"]}, industries=LIST, technologies=LIST, lifecycles=LIST, q=S,
           within_current={**B, "description": "narrow the current working set instead of replacing it"},
           limit={**I, "maximum": 50000}))
 def search_companies(call: ToolCall, params: Dict[str, Any]) -> Dict[str, Any]:

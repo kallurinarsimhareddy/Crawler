@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from cloud.intel.agent.memory import expand_aliases
 from cloud.intel.agent.tools import TOOLS
 from cloud.intel.ai.base import validate_against_schema
-from cloud.intel.research.intent import parse_intent
+from cloud.intel.research.intent import TECHNOLOGIES, parse_intent
 
 __all__ = ["understand", "build_steps", "CAMPAIGN_KEYS", "ai_plan"]
 
@@ -54,7 +54,8 @@ _FOLLOW_UP = [
     (re.compile(r"\bhiring\b|\bsignals?\b", re.I), "run_hiring_intelligence"),
 ]
 _RUN_IT = re.compile(r"^\s*(run it|go ahead|approve( it| all)?|yes,? (run|go|do) it|do it|proceed|execute)\W*\s*$", re.I)
-_MEMORY = re.compile(r"^\s*(please\s+)?(remember|from now on|whenever i (say|type|mention)|note that)\b", re.I)
+_MEMORY = re.compile(r"^\s*(please\s+)?(remember|from now on|whenever i (say|type|mention)|note that|"
+                     r"always (exclude|skip|ignore|show|search)|prefer \w+ over|only use|default (to|country))\b", re.I)
 _MONITOR = re.compile(r"\b(monitor|watch|keep an eye on|track)\b.*\b(compan|accounts?|these|them)\b", re.I)
 _REFERS_TO_RESULTS = re.compile(r"\b(them|these|those|the results|this list|remaining|the list|those companies)\b", re.I)
 
@@ -140,16 +141,59 @@ def _crm_query(text: str) -> Optional[List[Dict[str, Any]]]:
 
 
 def _s(tool: str, params: Dict[str, Any], title: str, why: str = "") -> Dict[str, Any]:
-    return {"tool": tool, "params": params, "title": title, "why": why or title}
+    # Unset values are omitted rather than sent as null, so every step validates against its schema.
+    clean = {k: v for k, v in params.items() if v is not None}
+    return {"tool": tool, "params": clean, "title": title, "why": why or title}
+
+
+def _canonical_technologies(values: List[str]) -> List[str]:
+    """Map alias expansions ('JDE', 'Dynamics') to the research vocabulary ('JD Edwards', 'Microsoft Dynamics')."""
+    out: List[str] = []
+    for value in values:
+        lowered = value.lower().strip()
+        match = None
+        for canonical, aliases in TECHNOLOGIES.items():
+            if lowered == canonical.lower() or lowered in aliases or any(
+                    re.search(rf"(?<!\w){re.escape(lowered)}(?!\w)", alias) for alias in aliases):
+                match = canonical
+                break
+        name = match or value.strip()
+        if name and name not in out:
+            out.append(name)
+    return out
 
 
 # --- the research planner ------------------------------------------------------------------
 
+_HIRING_WORDS = re.compile(r"\b(hiring|openings?|open roles?|job postings?|recruiting|vacanc\w+)\b", re.I)
+_USAGE_WORDS = re.compile(r"\b(using|uses|use|running|runs|run on|on)\b", re.I)
+
+
+def _hiring_technologies(text: str, technologies: List[str]) -> List[str]:
+    """Technologies named in a hiring clause ("companies with SAP, Oracle or JDE hiring") are what
+    they are hiring *for*, not what they must already run — unless the clause says "using"."""
+    found: List[str] = []
+    for sentence in re.split(r"[.;\n]", text):
+        if not _HIRING_WORDS.search(sentence) or _USAGE_WORDS.search(sentence):
+            continue
+        lowered = sentence.lower()
+        for tech in technologies:
+            names = (tech.lower(),) + tuple(TECHNOLOGIES.get(tech, ()))
+            if any(re.search(rf"(?<!\w){re.escape(n)}(?!\w)", lowered) for n in names) and tech not in found:
+                found.append(tech)
+    return found
+
+
 def build_steps(intent: Dict[str, Any], text: str, profile: Dict[str, Any], *, has_results: bool) -> List[Dict[str, Any]]:
     steps: List[Dict[str, Any]] = []
     lowered = text.lower()
-    technologies = intent.get("technologies") or []
-    hiring = intent.get("hiring") or {}
+    all_technologies = list(intent.get("technologies") or [])
+    hiring = dict(intent.get("hiring") or {})
+    hiring_techs = _hiring_technologies(text, all_technologies + list(hiring.get("keywords") or []))
+    if hiring_techs:
+        hiring["required"] = True
+        hiring["keywords"] = list(dict.fromkeys(list(hiring.get("keywords") or []) + hiring_techs))
+    technologies = [t for t in all_technologies if t not in hiring_techs]
     count = intent.get("count")
     country = intent.get("country") or _country_from_memory(profile)
     if not has_results or not _REFERS_TO_RESULTS.search(text):
@@ -183,7 +227,7 @@ def build_steps(intent: Dict[str, Any], text: str, profile: Dict[str, Any], *, h
     if intent.get("validate_emails"):
         steps.append(_s("validate_email", {"paid": True}, "Validate available emails",
                         "cache and free checks first; the paid provider only for undecided addresses, after approval"))
-    steps.append(_s("calculate_opportunity_score", {"technologies": technologies,
+    steps.append(_s("calculate_opportunity_score", {"technologies": all_technologies,
                                                     "keywords": hiring.get("keywords") or technologies,
                                                     "signal_types": hiring.get("signal_types", []), "limit": count},
                     "Score and rank opportunities", "explainable opportunity + intent scores with reason codes"))
@@ -276,6 +320,12 @@ def understand(text: str, profile: Dict[str, Any], *, has_results: bool = False)
     if crm is not None:
         return {"kind": "crm_query", "text": raw, "steps": crm, "aliases_applied": applied}
     intent = parse_intent(expanded)
+    if applied:
+        extra = [v for alias in applied for v in alias["expands_to"]]
+        intent["technologies"] = _canonical_technologies(list(intent.get("technologies") or []) + extra)
+        hiring = intent.get("hiring") or {}
+        if hiring.get("keywords"):
+            hiring["keywords"] = _canonical_technologies(list(hiring["keywords"]) + extra)
     steps = build_steps(intent, expanded, profile, has_results=has_results)
     kind = "monitor" if _MONITOR.search(raw) else "research"
     return {"kind": kind, "text": raw, "intent": intent, "steps": steps, "aliases_applied": applied}

@@ -258,7 +258,10 @@ class AgentService:
         emails = 0
         for cid in ws.company_ids[:3000]:
             jobs += self.store.count(ctx, "job_postings", {"company_id": cid, "status": "open"})
-        contact_rows = [c for cid in ws.company_ids[:3000] for c in ws.research.extra(cid).get("contacts") or []]
+        contact_rows = []
+        for cid in ws.company_ids[:3000]:
+            contact_rows += ws.research.extra(cid).get("contacts") or self.store.all(
+                ctx, "contacts", {"company_id": cid, "status": "active"}, cap=300)
         for contact in contact_rows:
             email = (contact.get("email") or "").lower()
             if email and contact.get("email_status") in (None, "UNVERIFIED", "UNKNOWN", "RISKY") and \
@@ -312,7 +315,7 @@ class AgentService:
                 raise ValidationError(f"unknown tool {name!r}")
             if not TOOLS[name].allowed_for(ctx.role) or run["mode"] not in TOOLS[name].modes:
                 raise ForbiddenError(f"{name} is not available here")
-            params = dict(step.get("params") or {})
+            params = {k: v for k, v in dict(step.get("params") or {}).items() if v is not None}
             problems = validate_against_schema(params, TOOLS[name].schema)
             if problems:
                 raise ValidationError(f"{name}: {'; '.join(problems)}")
@@ -357,9 +360,15 @@ class AgentService:
 
     def _dispatch(self, ctx: Ctx, run: Mapping[str, Any], background: Optional[bool]) -> Dict[str, Any]:
         steps = self.store.all(ctx, "agent_steps", {"run_id": run["id"]}, order="position")
-        light = all(s["risk"] in _INLINE_RISKS or s["status"] in ("done", "skipped", "rejected")
-                    or (s["requires_approval"] and s["status"] != "planned") for s in steps)
-        light = light and (run["estimate"].get("counts") or {}).get("companies", 0) <= _INLINE_MAX_COMPANIES
+        approved = {a["step_id"] for a in self.store.all(ctx, "agent_approvals", {"run_id": run["id"],
+                                                                                  "status": "approved"})}
+        # Only steps that will actually execute now decide where the run goes. Steps still
+        # waiting for approval are just marked, so they never force the background queue.
+        to_execute = [s for s in steps if s["status"] not in ("done", "skipped", "rejected")
+                      and (not s["requires_approval"] or s["id"] in approved)]
+        heavy = [s for s in to_execute if s["risk"] in ("background", "config")
+                 or (s["risk"] == "paid" and s["id"] in approved)]
+        light = not heavy and (run["estimate"].get("counts") or {}).get("companies", 0) <= _INLINE_MAX_COMPANIES
         if background is None:
             background = not light
         if not background:
