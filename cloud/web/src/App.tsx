@@ -11,8 +11,11 @@ import { ContactDetail, Contacts, Discovery, HiringIntel, Postings, Provenance }
 import { Credits, Exports, ImportDetail, Imports, Research, ResearchRun, ScrapeRun, Scraper, Settings, Sources } from "./platform/pages/Tools";
 import { Analytics, BackgroundTasks, Dashboard, ListDetail, Opportunities } from "./platform/pages/Work";
 import { ResourcePage } from "./platform/ResourcePage";
-import { ACTIVITIES, CAMPAIGNS, LISTS, MONITORS, SEGMENTS, SEQUENCES, SUPPRESSIONS, TASKS, TEMPLATES, WORKFLOWS } from "./platform/resources";
+import { ACTIVITIES, CAMPAIGNS, LISTS, MONITORS, SEGMENTS, SEQUENCES, SUPPRESSIONS, TASKS, TEMPLATES } from "./platform/resources";
 import { RecordView, RequireWorkspace } from "./platform/Shell";
+import { AutomationBuilder } from "./platform/controlroom/Automation";
+import { ControlRoom } from "./platform/controlroom/ControlRoom";
+import { MemoryPage } from "./platform/controlroom/Memory";
 import { WorkspaceProvider } from "./platform/workspace";
 
 function W({ children }: { children: React.ReactNode }) {
@@ -38,7 +41,9 @@ export function App() {
         <Route path="jobs/:jobId" element={<JobDetail />} />
 
         {/* The platform. Every page below is scoped to the selected workspace. */}
-        <Route index element={<W><Dashboard /></W>} />
+        <Route index element={<W><ControlRoom /></W>} />
+        <Route path="dashboard" element={<W><Dashboard /></W>} />
+        <Route path="ai/memory" element={<W><MemoryPage /></W>} />
         <Route path="companies" element={<W><Companies /></W>} />
         <Route path="companies/:companyId" element={<W><CompanyDetail /></W>} />
         <Route path="contacts" element={<W><Contacts /></W>} />
@@ -61,7 +66,7 @@ export function App() {
         <Route path="lists" element={<W><ResourcePage config={LISTS} /></W>} />
         <Route path="lists/:listId" element={<W><ListDetail /></W>} />
         <Route path="segments" element={<W><ResourcePage config={SEGMENTS} /></W>} />
-        <Route path="workflows" element={<W><ResourcePage config={WORKFLOWS} /></W>} />
+        <Route path="workflows" element={<W><AutomationBuilder /></W>} />
         <Route path="monitors" element={<W><ResourcePage config={MONITORS} /></W>} />
         <Route path="imports" element={<W><Imports /></W>} />
         <Route path="imports/:batchId" element={<W><ImportDetail /></W>} />

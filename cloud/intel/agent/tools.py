@@ -904,6 +904,12 @@ def create_list(call: ToolCall, params: Dict[str, Any]) -> Dict[str, Any]:
     existing = call.ws.facts.get(f"list:{call.step_id}")
     lst = call.store.find(call.ctx, "lists", existing) if existing else None
     if lst is None:
+        # List names are unique per workspace: a list with this name is reused (members are added,
+        # duplicates skipped) rather than failing the approved step.
+        lst = call.store.first(call.ctx, "lists", {"name": params["name"][:200], "entity_type": entity})
+        if lst is not None:
+            call.ws.facts[f"list:{call.step_id}"] = lst["id"]
+    if lst is None:
         lst = crm.create_list(call.ctx, params["name"][:200], entity, description="Created by the AI Control Room")
         call.ws.facts[f"list:{call.step_id}"] = lst["id"]
     added = crm.add_to_list(call.ctx, lst["id"], entity, ids, reason=f"AI control room run {call.run_id}")

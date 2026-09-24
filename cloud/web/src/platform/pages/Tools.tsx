@@ -6,6 +6,7 @@ import { ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
 import { DataTable, Json, KeyValues, PageHeader, Pill, ResourceList, Stat, Tags, fmt, fmtDate, useAction, useLoad } from "../ui";
 import { useWorkspace, useWs } from "../workspace";
+import { AiProviderSettings, ProactiveSettings } from "../controlroom/AiSettings";
 
 // --- Research agent ------------------------------------------------------------
 
@@ -505,6 +506,8 @@ export function Settings() {
         </label>
         {ai.data && <Json value={ai.data} />}
       </div>
+      <AiProviderSettings />
+      <ProactiveSettings />
       <div className="card pad">
         <h3>Provider connections</h3>
         <p className="muted small">Secrets are write-only and encrypted at rest; they are never shown again or sent to the browser.</p>

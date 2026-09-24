@@ -1,62 +1,52 @@
 import { useEffect, useState } from "react";
-import { NavLink, Outlet, useLocation } from "react-router-dom";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
 import { api } from "../api/client";
 import { useAuth } from "../auth/AuthProvider";
 import { usePolling } from "../hooks/usePolling";
 import { WorkerPill, useWorkerStatus } from "./WorkerStatus";
 import { WorkspaceSwitcher } from "../platform/Shell";
+import { requestAskFocus } from "../platform/controlroom/types";
 
+// The main group follows the product's primary navigation order; everything else
+// stays one click away under "More".
 const NAV_GROUPS: { title: string; items: { to: string; label: string; end?: boolean }[] }[] = [
   {
-    title: "Intelligence",
+    title: "Workspace",
     items: [
-      { to: "/", label: "Dashboard", end: true },
+      { to: "/", label: "AI Control Room", end: true },
+      { to: "/dashboard", label: "Dashboard" },
       { to: "/companies", label: "Companies" },
       { to: "/contacts", label: "Contacts" },
       { to: "/postings", label: "Jobs" },
+      { to: "/opportunities", label: "Opportunities" },
       { to: "/hiring", label: "Hiring Intelligence" },
       { to: "/discovery", label: "Discovery" },
       { to: "/scraper", label: "Scraper" },
       { to: "/research", label: "Research Agent" },
-    ],
-  },
-  {
-    title: "CRM",
-    items: [
-      { to: "/opportunities", label: "Opportunities" },
-      { to: "/tasks", label: "Tasks" },
-      { to: "/activities", label: "Activities" },
-      { to: "/lists", label: "Lists" },
-      { to: "/segments", label: "Segments" },
-    ],
-  },
-  {
-    title: "GTM",
-    items: [
       { to: "/campaigns", label: "Campaigns" },
       { to: "/sequences", label: "Sequences" },
-      { to: "/templates", label: "Templates" },
-      { to: "/suppressions", label: "Suppression" },
-      { to: "/workflows", label: "Workflows" },
-      { to: "/monitors", label: "Monitors" },
-    ],
-  },
-  {
-    title: "Data",
-    items: [
+      { to: "/lists", label: "Lists" },
       { to: "/imports", label: "Imports" },
       { to: "/exports", label: "Exports" },
       { to: "/sources", label: "Sources" },
-      { to: "/credits", label: "Credits" },
       { to: "/analytics", label: "Analytics" },
+      { to: "/settings", label: "Settings" },
     ],
   },
   {
-    title: "System",
+    title: "More",
     items: [
+      { to: "/workflows", label: "Automation builder" },
+      { to: "/ai/memory", label: "AI memory" },
+      { to: "/tasks", label: "Tasks" },
+      { to: "/activities", label: "Activities" },
+      { to: "/segments", label: "Segments" },
+      { to: "/templates", label: "Templates" },
+      { to: "/suppressions", label: "Suppression" },
+      { to: "/monitors", label: "Monitors" },
+      { to: "/credits", label: "Credits" },
       { to: "/jobs", label: "Crawls" },
       { to: "/background", label: "Background jobs" },
-      { to: "/settings", label: "Settings" },
     ],
   },
 ];
@@ -102,7 +92,26 @@ function WorkerIndicator() {
 export function Layout() {
   const [menuOpen, setMenuOpen] = useState(false);
   const location = useLocation();
+  const navigate = useNavigate();
   useEffect(() => setMenuOpen(false), [location.pathname]);
+
+  const ask = () => {
+    if (location.pathname !== "/") navigate("/");
+    window.setTimeout(() => requestAskFocus(), 50);
+  };
+
+  // Ctrl+K / Cmd+K opens the Control Room prompt from anywhere.
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
+        event.preventDefault();
+        if (location.pathname !== "/") navigate("/");
+        window.setTimeout(() => requestAskFocus(), 50);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [location.pathname, navigate]);
 
   const staging = import.meta.env.VITE_DEPLOY_ENV === "staging";
   return (
@@ -129,6 +138,10 @@ export function Layout() {
             <span aria-hidden="true">{menuOpen ? "✕" : "☰"}</span>
           </button>
         </div>
+        <button type="button" className="button button--primary cr-askbtn" onClick={ask} title="Ask CareerCrawler AI (Ctrl+K)">
+          <span aria-hidden="true">✦</span> Ask CareerCrawler AI
+          <kbd className="cr-kbd" aria-hidden="true">Ctrl K</kbd>
+        </button>
         <nav id="primary-nav" className={`nav${menuOpen ? " nav--open" : ""}`}>
           {NAV_GROUPS.map((group) => (
             <div key={group.title} className="nav__group">

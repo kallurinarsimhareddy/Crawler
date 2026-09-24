@@ -240,6 +240,14 @@ class Orchestration(AgentTestCase):
         audit = self.store.all(self.ctx, "audit_log", {"action": "agent.approve"})
         self.assertEqual(len(audit), 1)
 
+    def test_approving_a_list_twice_reuses_the_named_list(self) -> None:
+        for _ in range(2):
+            run = self.agent.run(self.ctx, self.agent.ask(self.ctx, ACCEPTANCE)["run"]["id"], background=False)
+            approval = next(a for a in self.agent.approvals(self.ctx, run["id"]) if a["impact"]["tool"] == "create_list")
+            run = self.agent.decide(self.ctx, approval["id"], approve=True, background=False)
+            self.assertNotEqual(run["status"], "failed")
+        self.assertEqual(self.store.count(self.ctx, "lists", {"entity_type": "companies"}), 1)
+
     def test_viewer_cannot_use_the_control_room(self) -> None:
         viewer = self.member("viewer")
         with self.assertRaises(ForbiddenError):

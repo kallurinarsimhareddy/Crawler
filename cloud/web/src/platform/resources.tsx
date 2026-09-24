@@ -144,25 +144,7 @@ export const SEGMENTS: ResourceConfig = {
   createLabel: "New segment",
 };
 
-export const WORKFLOWS: ResourceConfig = {
-  title: "Workflows",
-  subtitle: "Trigger → conditions → actions. New workflows start disabled; runs are idempotent and audited.",
-  path: "/workflows",
-  columns: [
-    { key: "name", label: "Workflow" },
-    { key: "trigger", label: "Trigger", render: (r) => <Pill value={r.trigger} /> },
-    { key: "enabled", label: "Enabled" },
-    { key: "actions", label: "Actions", render: (r) => (Array.isArray(r.actions) ? r.actions.length : 0) },
-  ],
-  filters: [{ key: "trigger", label: "Trigger", options: ["new_company", "hiring_spike", "technology_detected", "leadership_change", "new_contact", "email_validated", "job_posted", "long_open_job", "company_matched", "research_completed"] }],
-  create: [
-    { key: "name", label: "Name", required: true },
-    { key: "trigger", label: "Trigger", type: "select", required: true, options: ["new_company", "hiring_spike", "technology_detected", "leadership_change", "new_contact", "email_validated", "job_posted", "long_open_job", "company_matched", "research_completed"] },
-    { key: "conditions", label: "Conditions (JSON)", type: "json", placeholder: '[{"field": "company.industry", "op": "eq", "value": "Manufacturing"}]' },
-    { key: "actions", label: "Actions (JSON)", type: "json", placeholder: '[{"type": "create_task", "title": "Review {{company.name}}"}]' },
-  ],
-  createLabel: "New workflow",
-};
+// Workflows are edited in the visual automation builder (controlroom/Automation.tsx).
 
 export const MONITORS: ResourceConfig = {
   title: "Monitors",
