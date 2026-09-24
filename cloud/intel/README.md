@@ -202,9 +202,41 @@ run-worker.bat                                                      # CareerClou
 cd cloud\web; npm run dev                                           # http://localhost:5173
 ```
 
-No Postgres/Redis at all: set `CAREERCLOUD_STORAGE=memory` and
-`CAREERCLOUD_QUEUE=inline` in `cloud\api\.env`; platform tasks then run in the
-API process.
+### Persistence
+
+**PostgreSQL is the persistence layer.** Locally that is the embedded server
+started by `python -m cloud.devtools.localpg start` (data in
+`cloud\.localdev\postgres`, git-ignored, 127.0.0.1 only), selected with:
+
+```ini
+CAREERCLOUD_STORAGE=postgres
+CAREERCLOUD_DATABASE_URL=localdev
+```
+
+Every platform record — companies, contacts, opportunities, jobs, signals,
+lists, campaigns, workflows, activities, research runs, AI Control Room plans,
+approvals, results and memory, credits and the audit trail — and CareerCloud's
+own crawl jobs live in that database and survive API restarts. The API's
+storage setting decides for both, so they are always in the same place.
+
+Smallest local setup (no Redis): the two lines above plus
+`CAREERCLOUD_QUEUE=inline` in `cloud\api\.env`; platform tasks then run inside
+the API process. The embedded server keeps running in the background between
+API restarts; stop it with `python -m cloud.devtools.localpg stop`.
+
+**Boot check.** At startup the API and the platform worker verify that every
+migration in `cloud\db\migrations` is applied (with matching checksums) and
+that all platform tables exist with row-level security. A database that is
+missing any of them stops the process with the exact fix, e.g.
+`migrations not applied: 0004_ai_control_room … run python -m cloud.devtools.localpg start`.
+
+**In-memory fallback.** `CAREERCLOUD_STORAGE=memory` keeps everything in the
+API process for tests and quick UI work; the data disappears on restart and the
+API logs a warning saying so. It is never chosen silently: the platform worker,
+run with nothing configured, asks for PostgreSQL instead.
+
+None of this touches the production CareerCrawler's SQLite (`state\crawler.db`):
+the database layer accepts only `postgresql://` URLs.
 
 ## Tests
 

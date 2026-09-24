@@ -181,7 +181,8 @@ def create_app(
     if platform is None:
         from cloud.intel.bootstrap import build_platform
 
-        platform = build_platform(role="api")
+        # Same storage, database and queue as the API's own settings: one place for all data.
+        platform = build_platform(role="api", settings=settings)
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
