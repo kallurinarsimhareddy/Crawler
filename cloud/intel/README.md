@@ -186,6 +186,37 @@ everything is implemented behind its interface and tested offline; each paid or
 authenticated provider needs its credential before it can be verified, and is
 reported honestly as `not_configured` until then.
 
+### AI providers (Claude, Gemini, OpenAI-compatible)
+
+Adapters live in `ai/` behind one interface — `generate`, `structured_generate`,
+`stream`, `health_check`, with per-call usage (tokens, request id, estimated
+cost). The AI Control Room uses the configured model for intent interpretation,
+research planning, plan explanation, result summarisation and follow-up
+understanding; with no provider it plans with the deterministic rules and says
+"AI provider not configured".
+
+**Keys** — either saved per workspace in Settings → AI (encrypted with
+`CAREERCLOUD_PLATFORM_SECRETS_KEY`, never shown again), or set on the server:
+
+| Provider | Server environment variables | Default model |
+|---|---|---|
+| Claude | `ANTHROPIC_API_KEY` | `claude-opus-5` |
+| Gemini | `GEMINI_API_KEY` | `gemini-2.5-pro` |
+| OpenAI-compatible | `OPENAI_COMPATIBLE_API_KEY`, `OPENAI_COMPATIBLE_BASE_URL` (https), `OPENAI_COMPATIBLE_MODEL` | — |
+
+`CAREERCLOUD_AI_PROVIDER` / `CAREERCLOUD_AI_MODEL` set a server default; each
+workspace can override provider, model, enabled, monthly budget
+(`max_budget_usd`), allowed AI actions and explicit fallbacks in Settings → AI.
+External AI is used only when the workspace's data policy ("Allow external AI
+providers") is on. Claude needs `pip install -r cloud/intel/requirements-ai.txt`.
+
+**Safety** — the model only proposes tool calls; the server validates tool,
+mode, role, schema, credits and approvals. There is no code/SQL/shell tool.
+Prompts carry CRM data as structured fields inside an `<untrusted_data>` block;
+free text (descriptions, job text, scraped pages) is never sent. Every call is
+recorded in `ai_usage` (provider, model, purpose, tokens, estimated cost,
+request id). The only explicit live check is Settings → AI → Test connection.
+
 ## Running it
 
 ```powershell

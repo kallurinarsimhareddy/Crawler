@@ -59,6 +59,21 @@ def _catalog() -> Dict[str, Dict[str, Any]]:
         "provider": "emaillistverify", "kind": "email_validation", "label": "EmailListVerify",
         "access_method": "api", "requires": ["api_key"], "paid": True,
         "requirement": "an EmailListVerify API key (apps.emaillistverify.com) with purchased credits"}
+    # AI model providers: the key is stored encrypted per workspace and used server-side only;
+    # without one, the server's environment variable (if any) is used.
+    catalog["claude"] = {
+        "provider": "claude", "kind": "ai", "label": "Claude (Anthropic)", "access_method": "api",
+        "requires": ["api_key"], "paid": True,
+        "requirement": "an Anthropic API key (or ANTHROPIC_API_KEY on the server)"}
+    catalog["gemini"] = {
+        "provider": "gemini", "kind": "ai", "label": "Gemini (Google)", "access_method": "api",
+        "requires": ["api_key"], "paid": True,
+        "requirement": "a Gemini API key (or GEMINI_API_KEY on the server)"}
+    catalog["openai_compatible"] = {
+        "provider": "openai_compatible", "kind": "ai", "label": "OpenAI-compatible", "access_method": "api",
+        "requires": ["api_key"], "paid": True,
+        "requirement": ("an API key for an OpenAI-compatible /chat/completions endpoint; set base_url and model in "
+                        "the connection settings (https only), or OPENAI_COMPATIBLE_* on the server")}
     return catalog
 
 
@@ -242,6 +257,13 @@ class ProviderRegistry:
 
                 result = EmailListVerifyProvider(self.get_secrets(ctx, provider).get("api_key", ""),
                                                  session=session).health(live=True)
+            elif info["kind"] == "ai":
+                # Configuration only: an AI call costs tokens, so the live test is the separate,
+                # explicit "Test connection" action in AI settings (POST /agent/ai/test).
+                has_key = bool(self.get_secrets(ctx, provider).get("api_key"))
+                result = {"status": "configured_unverified" if has_key else "not_configured",
+                          "detail": "key saved; use Test connection in AI settings for a live check" if has_key
+                          else "no key saved"}
             else:
                 result = {"status": "error", "detail": "no verification available"}
         except Exception as error:  # noqa: BLE001 - verification failures are results

@@ -931,6 +931,26 @@ entity("saved_requests", "sv", {
     "config": _j(),
 }, **_M4)
 
+# ---------------------------------------------------------------------------
+# Real AI providers (migration 0005)
+# ---------------------------------------------------------------------------
+
+entity("ai_usage", "ai", {
+    "provider": _t(60, required=True, index=True),
+    "model": _t(120, required=True),
+    "purpose": _t(60, required=True, index=True),
+    "success": Col("bool", required=True, default=True),
+    "error": _t(1000),
+    "prompt_tokens": Col("int", minimum=0),
+    "completion_tokens": Col("int", minimum=0),
+    "total_tokens": Col("int", minimum=0),
+    "estimated_cost_usd": Col("float", minimum=0),
+    "request_id": _t(200),
+    "latency_ms": Col("float", minimum=0),
+    "run_id": _t(40, index=True),
+}, migration="0005", append_only=True, system_write=True,
+   description="One row per external AI call: provider, model, tokens, estimated cost and request id.")
+
 
 def entities() -> Iterable[EntitySpec]:
     return ENTITIES.values()

@@ -36,7 +36,7 @@ import re
 import time
 from typing import Any, Dict, List, Mapping, Optional, Sequence
 
-from cloud.intel.agent import planner
+from cloud.intel.agent import ai_assist, planner
 from cloud.intel.agent.memory import MemoryService, looks_secret
 from cloud.intel.agent.state import WorkingSet
 from cloud.intel.agent.tools import MODES, TOOLS, ToolCall, results_snapshot
@@ -109,6 +109,16 @@ class AgentService:
         understood = planner.understand(text, profile, has_results=has_results)
         if session.get("last_run_id") and planner._RUN_IT.match(text):
             understood = {"kind": "run_it", "text": text, "steps": [], "aliases_applied": []}
+        elif has_results and understood["kind"] == "research":
+            # The rules did not recognise a follow-up; the model may, as validated tool calls on the results.
+            ai = self.platform.service("ai").for_ctx(ctx, "follow_up_understanding")
+            if ai.external:
+                context = ai_assist.build_context(self.platform, ctx, text=text, profile=profile, mode=mode,
+                                                  working_set=session.get("working_set"))
+                steps = ai_assist.follow_up(ai, context)
+                if steps:
+                    understood = {"kind": "follow_up", "text": text, "steps": steps, "aliases_applied": [],
+                                  "ai_follow_up": ai.name}
 
         if understood["kind"] == "memory":
             row = self.memory.remember(ctx, text)
@@ -156,11 +166,34 @@ class AgentService:
         allowed = {name for name, t in TOOLS.items() if mode in t.modes}
         steps = list(understood["steps"])
         planner_name = "rules"
-        ai = self.platform.service("ai").for_ctx(ctx, "agent_planning")
-        if ai.external and understood["kind"] in ("research", "monitor"):
-            proposed = planner.ai_plan(ai, text, profile, sorted(allowed))
-            if proposed:
-                steps, planner_name = proposed, f"ai:{ai.name}"
+        registry = self.platform.service("ai")
+        ai_info: Dict[str, Any] = {"used": [], "reason": None}
+        if understood["kind"] in ("research", "monitor", "crm_query"):
+            if understood.get("intent") is None:
+                from cloud.intel.research.intent import parse_intent
+
+                understood["intent"] = parse_intent(text)
+            context = ai_assist.build_context(self.platform, ctx, text=text, profile=profile, mode=mode,
+                                              working_set=session.get("working_set"), intent=understood.get("intent"))
+            interpreter = registry.for_ctx(ctx, "intent_interpretation")
+            if interpreter.external and understood.get("intent") is not None:
+                refined = ai_assist.interpret_intent(interpreter, context, understood["intent"])
+                if refined is not None:
+                    understood["intent"] = refined
+                    has_results = bool((session.get("working_set") or {}).get("companies"))
+                    steps = planner.build_steps(refined, text, profile, has_results=has_results)
+                    ai_info["used"].append("intent_interpretation")
+            ai = registry.for_ctx(ctx, "research_planning")
+            if ai.external:
+                proposed = ai_assist.plan_steps(ai, context)
+                if proposed:
+                    steps, planner_name = proposed, f"ai:{ai.name}"
+                    ai_info["used"].append("research_planning")
+            else:
+                ai_info["reason"] = getattr(ai, "reason", "AI provider not configured")
+        elif understood.get("ai_follow_up"):
+            planner_name = f"ai:{understood['ai_follow_up']}"
+            ai_info["used"].append("follow_up_understanding")
         notes = []
         kept = []
         for step in steps:
@@ -186,16 +219,23 @@ class AgentService:
             "planner": planner_name,
             "intent": {"kind": understood["kind"], "parsed": understood.get("intent") or {},
                        "aliases_applied": understood.get("aliases_applied") or [], "notes": notes,
-                       "requested_by": ctx.user_id, "role": ctx.role},
+                       "requested_by": ctx.user_id, "role": ctx.role, "ai": ai_info},
             "progress": {"lines": [], "message": "Planned — review the plan, then run"}})
         base = session.get("working_set") if understood["kind"] in ("follow_up",) or (
             understood["kind"] == "research" and planner._REFERS_TO_RESULTS.search(text)) else None
         estimate = self._materialise_steps(ctx, run, kept, base)
+        explainer = registry.for_ctx(ctx, "plan_explanation", run_id=run["id"])
+        if explainer.external:
+            explanation = ai_assist.explain_plan(explainer, text, self._plan_view(ctx, run["id"]), estimate)
+            if explanation:
+                estimate["ai_explanation"] = explanation
+                ai_info["used"].append("plan_explanation")
         run = self.store.update(ctx, "agent_runs", run["id"], {
             "estimate": estimate, "plan": self._plan_view(ctx, run["id"]),
-            "result": {"state": base or {}}})
+            "intent": {**run["intent"], "ai": ai_info}, "result": {"state": base or {}}})
         audit(self.store, ctx, "agent.plan", entity_type="agent_runs", entity_id=run["id"], summary=text[:500],
-              changes={"planner": planner_name, "steps": [s["tool"] for s in kept], "estimate": estimate.get("credits")})
+              changes={"planner": planner_name, "steps": [s["tool"] for s in kept], "estimate": estimate.get("credits"),
+                       "ai_used": ai_info["used"]})
         return run
 
     def _materialise_steps(self, ctx: Ctx, run: Mapping[str, Any], steps: List[Dict[str, Any]],
@@ -569,6 +609,11 @@ class AgentService:
             lines.append(f"Estimated: {est.get('expected', '')}")
             if est.get("explain"):
                 lines += [f"  {e}" for e in est["explain"] if e]
+            if est.get("ai_explanation"):
+                lines.append(f"In plain words: {est['ai_explanation']}")
+            ai = (run.get("intent") or {}).get("ai") or {}
+            if not ai.get("used") and ai.get("reason"):
+                lines.append(f"(Planned with rules — {ai['reason']}.)")
             return "\n".join(lines)
         for line in (run.get("progress") or {}).get("lines") or []:
             lines.append(("✓ " if line.get("ok", True) else "⏳ ") + line["text"])
@@ -749,10 +794,21 @@ def _synthesise(platform: Any, ctx: Ctx, run_id: str, ws: WorkingSet, lines: Lis
     if pending:
         text += f" {pending} action(s) still need approval."
     status = "failed" if failed else ("awaiting_approval" if pending else "completed")
+    ai_summary = None
+    if snapshot and not failed:
+        try:
+            ai = platform.service("ai").for_ctx(ctx, "result_summarization", run_id=run_id)
+            if ai.external:
+                ai_summary = ai_assist.summarize_results(ai, store.get(ctx, "agent_runs", run_id)["request"],
+                                                         snapshot, counts)
+        except Exception:  # noqa: BLE001 - a summary is optional; the rules summary always exists
+            log.exception("AI result summary failed")
+    if ai_summary:
+        text += f"\nAI summary: {ai_summary}"
     run = store.update(ctx, "agent_runs", run_id, {
         "status": status, "summary": text[:20000],
         "result": {"state": ws.dump(), "counts": counts, "credits_used": credits,
-                   "exports": ws.facts.get("exports", [])},
+                   "exports": ws.facts.get("exports", []), "ai_summary": ai_summary},
         "progress": {"lines": lines, "message": "Completed" if status == "completed" else text[:500], "counts": counts}})
     session_id = run.get("session_id")
     if session_id:

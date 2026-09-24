@@ -238,36 +238,123 @@ def delete_saved(saved_id: str, ctx: Ctx = Depends(write_ctx), platform: Platfor
 
 # --- per-workspace AI provider --------------------------------------------------------------------
 
+_AI_PROVIDERS = {"rules", "claude", "gemini", "openai_compatible"}
+_SECRET_FIELDS = ("api_key", "key", "secret", "token", "password")
+
+
 @router.get("/ai-config")
 def ai_config(ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    """Provider, model, enabled, budget, fallbacks, allowed actions and live status. Never a key value."""
     registry = platform.service("ai")
-    return {"workspace": registry.workspace_config(ctx), "platform_default": registry.configured,
-            "in_use": registry.for_ctx(ctx, "describe").describe(),
-            "external_allowed": ctx.ai_external_allowed,
-            "providers": ["rules", "claude", "gemini", "openai_compatible"]}
+    return jsonable_encoder({"workspace": registry.workspace_config(ctx), "status": registry.status(ctx),
+                             "platform_default": registry.configured,
+                             "in_use": registry.for_ctx(ctx, "describe").describe(),
+                             "external_allowed": ctx.ai_external_allowed,
+                             "providers": sorted(_AI_PROVIDERS)})
 
 
 @router.put("/ai-config")
 def set_ai_config(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx), platform: Platform = Depends(get_platform)):
-    """Workspace provider/model and explicit fallbacks. Keys are never accepted here — they stay server-side."""
+    """Workspace AI configuration. Keys are never accepted here: save them with POST /agent/ai/key."""
+    from cloud.intel.ai.registry import AI_ACTIONS
+
     if not ctx.can_admin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "workspace admin rights required")
-    allowed = {"rules", "claude", "gemini", "openai_compatible"}
+    if any(k in body for k in _SECRET_FIELDS):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "API keys are never accepted here; use POST /agent/ai/key")
     provider = body.get("provider")
-    if provider is not None and provider not in allowed:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"provider must be one of {sorted(allowed)}")
+    if provider is not None and provider not in _AI_PROVIDERS:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"provider must be one of {sorted(_AI_PROVIDERS)}")
     fallbacks = body.get("fallbacks") or []
-    if not isinstance(fallbacks, list) or any(not isinstance(f, dict) or f.get("provider") not in allowed for f in fallbacks):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "fallbacks must be a list of {provider, model}")
-    if any(k in body for k in ("api_key", "key", "secret", "token")):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "API keys are configured on the server, never here")
+    if not isinstance(fallbacks, list) or any(not isinstance(f, dict) or f.get("provider") not in _AI_PROVIDERS
+                                              or f.get("provider") == "rules" for f in fallbacks):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "fallbacks must be a list of {provider, model} "
+                                                                  "naming real providers")
+    if provider and any(f["provider"] == provider for f in fallbacks):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "a fallback must differ from the primary provider")
+    budget = body.get("max_budget_usd")
+    if budget is not None and (not isinstance(budget, (int, float)) or isinstance(budget, bool) or budget < 0
+                               or budget > 100_000):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "max_budget_usd must be a number between 0 and 100000")
+    actions = body.get("allowed_actions")
+    if actions is not None and (not isinstance(actions, list) or any(a not in AI_ACTIONS for a in actions)):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"allowed_actions must be a subset of {sorted(AI_ACTIONS)}")
+    enabled = body.get("enabled", True)
+    if not isinstance(enabled, bool):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "enabled must be true or false")
+    model = body.get("model")
+    if model is not None and (not isinstance(model, str) or len(model) > 120):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "model must be a model id")
 
     def produce():
         info = platform.store.membership(ctx.user_id, ctx.workspace_id)
         settings = dict(info.get("settings") or {})
-        settings["ai"] = {**(settings.get("ai") or {}), "provider": provider, "model": body.get("model"),
+        settings["ai"] = {**(settings.get("ai") or {}), "provider": provider, "model": model or None,
+                          "enabled": enabled, "max_budget_usd": budget,
+                          "allowed_actions": actions if actions is not None else sorted(AI_ACTIONS),
                           "fallbacks": [{"provider": f["provider"], "model": f.get("model")} for f in fallbacks]}
         platform.store.update_workspace(ctx, settings=settings)
         audit(platform.store, ctx, "agent.ai_config", changes=settings["ai"])
         return platform.service("ai").workspace_config(ctx)
     return _guard(produce)
+
+
+@router.post("/ai/key")
+def save_ai_key(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx), platform: Platform = Depends(get_platform)):
+    """Save a workspace AI key (admin). Stored encrypted; the response never contains it — only a hint."""
+    provider = body.get("provider")
+    if provider not in _AI_PROVIDERS - {"rules"}:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "provider must be claude, gemini or openai_compatible")
+    key = body.get("api_key")
+    if not isinstance(key, str) or len(key.strip()) < 8:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "api_key is required")
+    settings = {k: body[k] for k in ("base_url", "model") if isinstance(body.get(k), str)}
+    if settings.get("base_url") and not (settings["base_url"].startswith("https://")
+                                         or settings["base_url"].startswith("http://localhost")):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "base_url must be https")
+
+    def produce():
+        row = platform.service("providers").set_credentials(ctx, provider, {"api_key": key.strip()}, settings=settings)
+        return {"provider": provider, "status": row.get("status"), "secret_hint": row.get("secret_hint"),
+                "key_present": True}
+    return _guard(produce)
+
+
+@router.delete("/ai/key/{provider}", status_code=status.HTTP_204_NO_CONTENT)
+def clear_ai_key(provider: str, ctx: Ctx = Depends(write_ctx), platform: Platform = Depends(get_platform)):
+    if provider not in _AI_PROVIDERS - {"rules"}:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown AI provider")
+    _guard(lambda: platform.service("providers").clear_credentials(ctx, provider))
+
+
+@router.get("/ai/usage")
+def ai_usage(limit: int = 100, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    """Per-call token and cost records, totals per provider/model, and this month's spend."""
+    return jsonable_encoder(platform.service("ai").usage(ctx, limit=min(limit, 500)))
+
+
+@router.post("/ai/test")
+def test_ai(body: Dict[str, Any] = Body(default={}), ctx: Ctx = Depends(write_ctx),
+            platform: Platform = Depends(get_platform)):
+    """Admin-only, explicit: one tiny real request to the configured provider (the only live check)."""
+    if not ctx.can_admin:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "workspace admin rights required")
+    registry = platform.service("ai")
+    ai = registry.for_ctx(ctx, "intent_interpretation")
+    if not ai.external:
+        return {"ok": False, "configured": False, "reason": getattr(ai, "reason", "AI provider not configured")}
+    from cloud.intel.agent import ai_assist, planner
+    from cloud.intel.ai.base import AIError
+
+    text = str(body.get("text") or "Find US manufacturing companies with SAP hiring.")[:300]
+    profile = platform.service("agent_memory").profile(ctx)
+    understood = planner.understand(text, profile)
+    context = ai_assist.build_context(platform, ctx, text=text, profile=profile, mode="auto",
+                                      intent=understood.get("intent"))
+    try:
+        refined = ai_assist.interpret_intent(ai, context, understood.get("intent") or {})
+    except AIError as error:
+        return {"ok": False, "configured": True, "error": str(error)[:300]}
+    usage = getattr(ai, "last_usage", None)
+    return jsonable_encoder({"ok": refined is not None, "configured": True, "provider": ai.name, "model": ai.model,
+                             "intent": refined, "usage": usage.as_dict() if usage is not None else None})
