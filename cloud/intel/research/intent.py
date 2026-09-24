@@ -152,10 +152,10 @@ def _hiring_clauses(text: str) -> List[Tuple[int, int]]:
     for match in re.finditer(r"hiring|job postings?|open roles?|openings|recruiting for", text):
         window_start = max(0, match.start() - 40)
         before = text[window_start:match.start()]
-        cuts = [m.end() for m in re.finditer(r"[,.;]|with|that|which|find", before)]
+        cuts = [m.end() for m in re.finditer(r"[,.;]|\bwith\b|\bthat\b|\bwhich\b|\bfind\b", before)]
         start = window_start + (cuts[-1] if cuts else 0)
         after = text[match.end():match.end() + 40]
-        stop = re.search(r"[,.;]|and|then", after)
+        stop = re.search(r"[,.;]|\band\b|\bthen\b", after)
         end = match.end() + (stop.start() if stop else len(after))
         spans.append((start, end))
     return spans
@@ -239,7 +239,7 @@ def parse_intent(question: str) -> Dict[str, Any]:
         "rank": wants("rank", "prioritize", "prioritise", "score", "top "),
         "assign_campaign": wants("campaign"),
         "create_list": create_list,
-        "create_opportunities": bool(re.search(r"(create|open|add|make)[^.;,]{0,30}(opportunit|deals?|pipeline)", text)),
+        "create_opportunities": bool(re.search(r"\b(create|open|add|make)\b[^.;,]{0,30}\b(opportunit|deals?\b|pipeline)", text)),
         "export": wants("export", "download", "spreadsheet", "csv", "xlsx", "excel"),
         "export_format": export_format,
         "question": raw,
