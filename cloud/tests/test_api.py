@@ -64,8 +64,12 @@ class TestHealth(_ApiTest):
         paths = self.client.get("/openapi.json").json()["paths"]
         # Phase 5B added identity, per-company progress, timeline and results.
         # Phase 5D added the authenticated operational status endpoint.
+        # The platform (cloud/intel) adds its own routes, all namespaced under
+        # /api/v1/workspaces or a workspace (/api/v1/w/{workspace_id}/...).
+        platform = {p for p in paths if p == "/api/v1/workspaces" or p.startswith("/api/v1/w/{workspace_id}")}
+        self.assertTrue(platform)
         self.assertEqual(
-            set(paths),
+            set(paths) - platform,
             {
                 "/api/v1/health",
                 "/api/v1/status",

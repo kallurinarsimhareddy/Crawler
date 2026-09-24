@@ -251,8 +251,14 @@ class TestMigrations(PostgresTestCase):
                 }
         finally:
             drop_database(url)
-        self.assertEqual(tables, {"jobs", "crawl_targets", "job_events", "job_results", "schema_migrations", "deployment"})
-        self.assertEqual(rls, {"jobs", "crawl_targets", "job_events", "job_results", "deployment"})
+        from cloud.intel.store.spec import ENTITIES
+
+        core = {"jobs", "crawl_targets", "job_events", "job_results", "deployment"}
+        # Migration 0003 adds the platform: workspaces, membership and one table per entity spec.
+        platform = {"workspaces", "workspace_members"} | {spec.table for spec in ENTITIES.values()}
+        self.assertEqual(tables, core | platform | {"schema_migrations"})
+        # Every table but the migration bookkeeping has row-level security.
+        self.assertEqual(rls, core | platform)
 
 
 if __name__ == "__main__":

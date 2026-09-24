@@ -110,6 +110,7 @@ def create_app(
     queue: Optional[JobQueue] = None,
     storage: Optional[ObjectStorage] = None,
     token_verifier: Optional[TokenVerifier] = None,
+    platform: Optional[object] = None,
 ) -> FastAPI:
     """Build an API instance.
 
@@ -122,6 +123,8 @@ def create_app(
         queue: Enqueue created jobs here for an out-of-process worker.
         storage: Where result files are read from (and, inline, written to).
         token_verifier: Overrides what ``settings.auth_mode`` selects.
+        platform: The CareerCrawler platform (``cloud.intel``). Defaults to one
+            built from the environment, sharing this API's database settings.
     """
     settings = settings or load_settings()
     if settings.deployed:
@@ -174,6 +177,12 @@ def create_app(
     if settings.deployed:
         _verify_stamps(settings, queue, storage)
 
+    owns_platform = platform is None
+    if platform is None:
+        from cloud.intel.bootstrap import build_platform
+
+        platform = build_platform(role="api")
+
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         try:
@@ -181,6 +190,8 @@ def create_app(
         finally:
             dispatcher.shutdown()
             repository.close()
+            if owns_platform:
+                platform.close()
 
     app = FastAPI(
         title="CareerCloud API",
@@ -218,11 +229,15 @@ def create_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
-        allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "Authorization"],
+        allow_methods=["GET", "POST", "PATCH", "DELETE"],
+        allow_headers=["Content-Type", "Authorization", "Idempotency-Key"],
         expose_headers=["Content-Disposition"],
     )
     app.include_router(router)
+
+    from cloud.intel.api import mount as mount_platform
+
+    mount_platform(app, platform)
     return app
 
 

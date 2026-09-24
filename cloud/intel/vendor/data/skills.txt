@@ -1,0 +1,190 @@
+# VENDORED from cl-crawl-job-board-crawler linkedin_jobs_mvp/config/skills.txt on 2026-09-24
+# Skill phrase → canonical label catalog used by skills_extract.
+#
+# Format: search_phrase|Canonical Label[|boundary]
+#   - search_phrase is matched case-insensitively against job description text.
+#   - Lines with a third "boundary" column require a whole-word match
+#     (avoids "r" matching inside "for", "go" inside "google", etc.).
+#   - Order matters: list longer phrases before their shorter substrings so
+#     "apache spark" wins over a bare "spark".
+#   - Blank lines and lines starting with "#" are ignored.
+
+# AI / ML
+generative ai|Generative AI
+large language model|LLM
+machine learning|Machine Learning
+deep learning|Deep Learning
+natural language processing|NLP
+computer vision|Computer Vision
+artificial intelligence|AI
+data engineering|Data Engineering
+data science|Data Science
+business intelligence|Business Intelligence
+
+# BI / Analytics
+power bi|Power BI
+tableau|Tableau
+
+# Data platforms
+apache spark|Apache Spark
+apache kafka|Apache Kafka
+apache airflow|Apache Airflow
+apache hive|Apache Hive
+hadoop|Hadoop
+snowflake|Snowflake
+databricks|Databricks
+
+# Infra / DevOps
+terraform|Terraform
+kubernetes|Kubernetes
+docker|Docker
+microservices|Microservices
+rest api|REST API
+graphql|GraphQL
+
+# Web frameworks
+node.js|Node.js
+node js|Node.js
+react.js|React
+react native|React Native
+angular|Angular
+vue.js|Vue.js
+next.js|Next.js
+spring boot|Spring Boot
+spring framework|Spring
+asp.net|ASP.NET
+.net core|.NET Core
+.net|.NET
+
+# Languages (multi-char, no boundary needed)
+c#|C#
+c++|C++
+golang|Go
+ruby on rails|Ruby on Rails
+
+# Databases
+postgresql|PostgreSQL
+mysql|MySQL
+sql server|SQL Server
+mongodb|MongoDB
+redis|Redis
+elasticsearch|Elasticsearch
+
+# Cloud
+aws|AWS|boundary
+amazon web services|AWS
+azure|Azure
+google cloud|GCP
+gcp|GCP|boundary
+
+# DevOps tooling
+devops|DevOps
+ci/cd|CI/CD
+jenkins|Jenkins
+gitlab|GitLab
+github actions|GitHub Actions
+
+# Process / methodology
+agile|Agile
+scrum|Scrum
+jira|Jira
+
+# Testing
+selenium|Selenium
+pytest|pytest
+junit|JUnit
+
+# Languages
+typescript|TypeScript
+javascript|JavaScript
+python|Python
+java|Java
+scala|Scala
+kotlin|Kotlin
+swift|Swift
+php|PHP|boundary
+perl|Perl
+r language|R
+linux|Linux
+unix|Unix
+bash|Bash
+shell scripting|Shell Scripting
+
+# Data wrangling
+etl|ETL|boundary
+sql|SQL|boundary
+nosql|NoSQL
+
+# Frontend
+html|HTML|boundary
+css|CSS|boundary
+sass|SASS
+tailwind|Tailwind CSS
+bootstrap|Bootstrap
+figma|Figma
+
+# Enterprise / SaaS
+salesforce|Salesforce
+servicenow|ServiceNow
+sap|SAP|boundary
+oracle|Oracle
+informatica|Informatica
+talend|Talend
+dbt|dbt|boundary
+looker|Looker
+excel|Excel
+
+# Python / DS stacks
+pandas|pandas
+numpy|NumPy
+scikit-learn|scikit-learn
+pytorch|PyTorch
+tensorflow|TensorFlow
+opencv|OpenCV
+
+# Messaging / observability
+rabbitmq|RabbitMQ
+activemq|ActiveMQ
+splunk|Splunk
+datadog|Datadog
+prometheus|Prometheus
+grafana|Grafana
+
+# Config mgmt / web servers
+ansible|Ansible
+puppet|Puppet
+chef|Chef
+helm|Helm
+istio|Istio
+nginx|Nginx
+apache|Apache
+tomcat|Tomcat
+
+# Web frameworks (python / java)
+flask|Flask
+django|Django
+fastapi|FastAPI
+hibernate|Hibernate
+maven|Maven
+gradle|Gradle
+
+# VCS
+git|Git|boundary
+svn|SVN
+
+# Browser automation
+cypress|Cypress
+playwright|Playwright
+
+# Short aliases — must come AFTER the apache <thing> entries above
+spark|Apache Spark
+airflow|Apache Airflow
+hive|Apache Hive
+kafka|Apache Kafka
+react|React
+vue|Vue.js
+node|Node.js
+go|Go|boundary
+rust|Rust
+ruby|Ruby
+rails|Ruby on Rails
