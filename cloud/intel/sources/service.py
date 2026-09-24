@@ -79,8 +79,11 @@ class SourceService:
                             latency_ms=(time.monotonic() - started) * 1000)
         stats: Optional[Dict[str, Any]] = None
         if ingest and rows:
+            # A search scoped to a known company (e.g. its ATS board) links every posting to
+            # it; board payloads name the board token, not a resolvable domain.
+            company_id = query.extra.get("company_id") or None
             stats = self.platform.service("jobs").ingest_postings(ctx, rows, source_kind="external_source",
-                                                                  source_name=source)
+                                                                  source_name=source, company_id=company_id)
         audit(self.store, ctx, "source.search", summary=f"{source}: {len(rows)} posting(s)",
               changes={"query": query.as_dict(), "count": len(rows)})
         return {"source": source, "count": len(rows), "rows": rows[:200], "ingest": stats}
