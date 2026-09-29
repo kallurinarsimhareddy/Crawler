@@ -3,8 +3,8 @@
 // -> All / Companies / Jobs / Pages / Errors / Evidence / CRM -> CSV, XLSX, JSON, NDJSON.
 
 import { useEffect, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { ErrorBanner, Loading } from "../../components/Feedback";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { EmptyState, ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
 import { DataTable, PageHeader, Pill, ResourceList, Stat, Tabs, fmt, fmtDate, useAction, useLoad } from "../ui";
 import { useWs } from "../workspace";
@@ -164,7 +164,7 @@ function SchemaEditor({ schema, onChange }: { schema: Schema; onChange: (s: Sche
   );
 }
 
-function OptionsPanel({ options, onChange }: { options: Options; onChange: (o: Options) => void }) {
+function OptionsPanel({ options, onChange, bare = false }: { options: Options; onChange: (o: Options) => void; bare?: boolean }) {
   const num = (key: keyof Options, text: string, min: number, max: number) => (
     <label className="field">
       <span className="field__label">{text}</span>
@@ -177,9 +177,8 @@ function OptionsPanel({ options, onChange }: { options: Options; onChange: (o: O
       <span>{text}</span>
     </label>
   );
-  return (
-    <details className="scraper-advanced">
-      <summary>Advanced options</summary>
+  const body = (
+    <>
       <div className="field-row">
         {num("max_pages", "Max pages per URL", 1, 500)}
         {num("max_records", "Max records", 1, 100000)}
@@ -192,6 +191,13 @@ function OptionsPanel({ options, onChange }: { options: Options; onChange: (o: O
         {box("browser", "Browser rendering fallback (JavaScript pages)")}
         {box("use_ai", "AI extraction when rules can't find a field (free tier, $0)")}
       </div>
+    </>
+  );
+  if (bare) return body;
+  return (
+    <details className="scraper-advanced">
+      <summary>Advanced options</summary>
+      {body}
     </details>
   );
 }
@@ -224,15 +230,28 @@ function toOptionsPayload(o: Options) {
   return { ...o, max_runtime_minutes: o.max_runtime_minutes };
 }
 
+type Step = "input" | "schema" | "filters" | "limits" | "review";
+
+const STEPS: { key: Step; label: string }[] = [
+  { key: "input", label: "1 · Input" },
+  { key: "schema", label: "2 · Schema" },
+  { key: "filters", label: "3 · Filters" },
+  { key: "limits", label: "4 · Limits" },
+  { key: "review", label: "5 · Review" },
+];
+
 export function Scraper() {
   const client = useWs();
   const navigate = useNavigate();
-  const [urls, setUrls] = useState("");
+  const [params] = useSearchParams();
+  const [urls, setUrls] = useState(() => params.get("urls") ?? "");
   const [file, setFile] = useState<File | null>(null);
   const [column, setColumn] = useState("");
   const [instruction, setInstruction] = useState(EXAMPLES[0]);
   const [options, setOptions] = useState<Options>(DEFAULT_OPTIONS);
   const [plan, setPlan] = useState<Plan | null>(null);
+  const [stale, setStale] = useState(false);
+  const [step, setStep] = useState<Step>("input");
   const [schema, setSchema] = useState<Schema | null>(null);
   const [templateId, setTemplateId] = useState<string | null>(null);
   const [confirm, setConfirm] = useState(false);
@@ -242,8 +261,10 @@ export function Scraper() {
   const urlCount = urls.split(/\n/).filter((line) => line.trim()).length;
   const ready = instruction.trim() && (urlCount > 0 || file);
 
+  // Changing the input keeps the plan on screen but marks it out of date: the run
+  // always uses a plan that matches what you see.
   const invalidate = () => {
-    setPlan(null);
+    if (plan) setStale(true);
     setConfirm(false);
   };
 
@@ -267,9 +288,12 @@ export function Scraper() {
   const preview = () =>
     action.run(async () => {
       const result = file ? await client.upload<Plan>("/scraper/plan", [file], formFields(Boolean(schema))) : await client.post<Plan>("/scraper/plan", body(Boolean(schema)));
+      const first = plan === null;
       setPlan(result);
       setSchema(result.schema);
+      setStale(false);
       setConfirm(false);
+      if (first) setStep("schema");
     });
 
   const run = () =>
@@ -288,98 +312,197 @@ export function Scraper() {
     invalidate();
   };
 
-  return (
-    <div className="page">
-      <PageHeader
-        title="AI Scraper"
-        subtitle="Paste URLs or upload a CSV/TXT/XLSX, say what to extract, review the schema and estimate, and run. Structured data, official job-board APIs and page links are read first; AI (Gemini free tier, $0) only fills what they can't. Pages behind a login, CAPTCHA or firewall are reported, never bypassed."
-      />
-      <div className="card form scraper-form">
-        <Templates onPick={pickTemplate} reloadKey={tplKey} />
+  const setInstructionText = (text: string) => {
+    setInstruction(text);
+    setSchema(null);
+    setTemplateId(null);
+    invalidate();
+  };
+
+  const inputs = (
+    <>
+      <label className="field field--wide">
+        <span className="field__label">What do you want to collect?</span>
+        <textarea className="input textarea scraper-ask" rows={2} value={instruction} onChange={(e) => setInstructionText(e.target.value)} placeholder="Get company name, website and job titles…" />
+      </label>
+      <div className="chips">
+        {EXAMPLES.map((example) => (
+          <button key={example} type="button" className="chip chip--button" onClick={() => setInstructionText(example)}>
+            {example}
+          </button>
+        ))}
+      </div>
+      <div className="scraper-sources">
         <label className="field field--wide">
-          <span className="field__label">1 · URLs</span>
-          <textarea className="input textarea mono" rows={5} value={urls} onChange={(e) => { setUrls(e.target.value); invalidate(); }} placeholder={"https://example1.com\nhttps://example2.com\nhttps://example3.com"} />
+          <span className="field__label">From these URLs</span>
+          <textarea className="input textarea mono" rows={4} value={urls} onChange={(e) => { setUrls(e.target.value); invalidate(); }} placeholder={"https://example1.com\nhttps://example2.com\nhttps://example3.com"} />
           <span className="field__hint">{urlCount ? `${urlCount} line${urlCount === 1 ? "" : "s"}` : "One per line"}</span>
         </label>
-        <div className="field-row">
+        <div className="scraper-upload">
           <label className="field">
             <span className="field__label">…or upload CSV / TXT / XLSX</span>
             <input type="file" accept=".csv,.xlsx,.txt,.tsv" onChange={(e) => { setFile(e.target.files?.[0] ?? null); invalidate(); }} />
           </label>
           <label className="field">
             <span className="field__label">URL column (optional)</span>
-            <input className="input" value={column} onChange={(e) => setColumn(e.target.value)} placeholder="Detected automatically" />
+            <input className="input" value={column} onChange={(e) => { setColumn(e.target.value); invalidate(); }} placeholder="Detected automatically" />
           </label>
         </div>
-        <label className="field field--wide">
-          <span className="field__label">2 · What should I extract?</span>
-          <textarea className="input textarea" rows={2} value={instruction} onChange={(e) => { setInstruction(e.target.value); setSchema(null); setTemplateId(null); invalidate(); }} placeholder="Get company name, website and job titles…" />
-        </label>
-        <div className="chips">
-          {EXAMPLES.map((example) => (
-            <button key={example} type="button" className="chip chip--button" onClick={() => { setInstruction(example); setSchema(null); setTemplateId(null); invalidate(); }}>
-              {example}
+      </div>
+      <details className="scraper-advanced">
+        <summary>Start from a template</summary>
+        <Templates onPick={pickTemplate} reloadKey={tplKey} />
+      </details>
+    </>
+  );
+
+  const estimate = plan && (
+    <div className="scraper-estimate" aria-live="polite">
+      <span><strong className="tabular">{fmt(plan.inputs.accepted)}</strong> URLs</span>
+      <span>~<strong className="tabular">{fmt(plan.estimate.requests_typical)}</strong> requests <span className="muted">(max {fmt(plan.estimate.requests_max)})</span></span>
+      <span><strong className="tabular">{fmt(plan.estimate.ai_calls_max)}</strong> AI calls max</span>
+      <span>AI cost <strong>{plan.estimate.estimated_cost_usd === null ? "?" : `$${plan.estimate.estimated_cost_usd.toFixed(2)}`}</strong></span>
+    </div>
+  );
+
+  return (
+    <div className="page">
+      <PageHeader
+        title="AI Scraper"
+        subtitle="Say what to collect and where from. Structured data, official job-board APIs and page links are read first; AI (Gemini free tier, $0) only fills what they can't. Pages behind a login, CAPTCHA or firewall are reported, never bypassed."
+      />
+
+      {!plan ? (
+        <section className="card form scraper-landing" aria-label="What do you want to collect?">
+          {inputs}
+          {action.error && <ErrorBanner error={action.error} />}
+          <div className="form__actions scraper-landing__actions">
+            <span className="muted small">Next: review the fields, filters, limits and cost before anything runs.</span>
+            <button type="button" className="button button--primary button--large" disabled={action.busy || !ready} onClick={() => void preview()}>
+              {action.busy ? "Planning…" : "Preview Extraction Plan"}
             </button>
-          ))}
-        </div>
-        <OptionsPanel options={options} onChange={(o) => { setOptions(o); invalidate(); }} />
-        {action.error && <ErrorBanner error={action.error} />}
-        <div className="form__actions">
-          <button type="button" className="button button--ghost" disabled={action.busy || !ready} onClick={() => void preview()}>
-            {plan ? "Re-check plan" : "3 · Preview schema & estimate"}
-          </button>
-        </div>
-        {plan && schema && (
-          <div className="scraper-plan">
-            <h3 className="section-title">Schema</h3>
-            <FieldChips schema={schema} />
-            <SchemaEditor schema={schema} onChange={(s) => { setSchema(s); setConfirm(false); }} />
-            {plan.schema.criteria && Object.keys(plan.schema.criteria).length > 0 && (
-              <p className="small muted">Research criteria (shown, never used to drop rows): {JSON.stringify(plan.schema.criteria)}</p>
-            )}
-            <h3 className="section-title">Sources</h3>
-            <DataTable
-              rows={plan.sources.slice(0, 20).map((s, i) => ({ ...s, id: String(i) }) as unknown as Row)}
-              columns={[
-                { key: "row", label: "Row" },
-                { key: "url", label: "URL", className: "mono small" },
-                { key: "label", label: "Detected source" },
-              ]}
-            />
-            {plan.inputs.rejected.length > 0 && <p className="small">{plan.inputs.rejected.length} inputs will be skipped: {plan.inputs.rejected.slice(0, 5).map((r) => `row ${r.row} (${r.reason})`).join(", ")}</p>}
-            <h3 className="section-title">5 · Work & cost estimate</h3>
-            <div className="stats">
-              <Stat label="URLs" value={fmt(plan.inputs.accepted)} />
-              <Stat label="Pages (max)" value={fmt(plan.estimate.pages_max)} />
-              <Stat label="Requests" value={`~${fmt(plan.estimate.requests_typical)}`} hint={`max ${fmt(plan.estimate.requests_max)}`} />
-              <Stat label="AI calls (max)" value={fmt(plan.estimate.ai_calls_max)} />
-              <Stat label="Estimated AI cost" value={plan.estimate.estimated_cost_usd === null ? "?" : `$${plan.estimate.estimated_cost_usd.toFixed(2)}`} hint={plan.estimate.cost_note} />
+          </div>
+        </section>
+      ) : (
+        <section className="card scraper-wizard" aria-label="Extraction plan">
+          <Tabs tabs={STEPS} active={step} onChange={(k) => setStep(k as Step)} />
+          {stale && (
+            <div className="alert alert--info">
+              <span>The input changed since this plan was made.</span>
+              <button type="button" className="button button--ghost button--small" disabled={action.busy || !ready} onClick={() => void preview()}>Re-check plan</button>
             </div>
-            <p className="small muted">
-              Limits: {plan.limits.max_pages} pages per URL · {fmt(plan.limits.max_records)} records · {Math.round(plan.limits.max_runtime_s / 60)} min · browser {plan.browser.requested ? (plan.browser.available ? "on" : "requested, unavailable on this server") : "off"}
-            </p>
-            {plan.requires_confirmation && (
-              <label className="checkbox scraper-confirm">
-                <input type="checkbox" checked={confirm} onChange={(e) => setConfirm(e.target.checked)} />
-                <span>High-volume run ({plan.confirmation_reasons.join("; ")}). I confirm.</span>
-              </label>
+          )}
+          <div className="scraper-step">
+            {step === "input" && inputs}
+            {step === "schema" && schema && (
+              <>
+                <FieldChips schema={schema} />
+                <SchemaEditor schema={schema} onChange={(s) => { setSchema(s); setConfirm(false); }} />
+              </>
             )}
-            <div className="form__actions">
-              <input className="input input--small" placeholder="Template name" value={templateName} onChange={(e) => setTemplateName(e.target.value)} />
-              <button type="button" className="button button--ghost" disabled={action.busy || !templateName.trim()} onClick={() => void action.run(async () => { await client.post("/scraper/templates", { name: templateName, instruction, schema, options: toOptionsPayload(options) }); setTemplateName(""); setTplKey((k) => k + 1); })}>
-                Save as template
-              </button>
-              <button type="button" className="button button--primary button--large" disabled={action.busy || (plan.requires_confirmation && !confirm)} onClick={() => void run()}>
-                {action.busy ? "Starting…" : "6 · Run scraper"}
-              </button>
+            {step === "filters" && schema && (
+              <>
+                {(schema.filters ?? []).length === 0 ? (
+                  <EmptyState
+                    icon="filter"
+                    title="No filters — every row is kept"
+                    description='Filters come from your instruction. Add a condition such as "posted in the last 30 days" or "titles containing SAP" on the Input step and re-check the plan.'
+                    action={<button type="button" className="button button--ghost button--small" onClick={() => setStep("input")}>Edit the instruction</button>}
+                  />
+                ) : (
+                  <>
+                    <p className="small muted">Rows that fail a filter are kept out of the results (and counted), never silently changed.</p>
+                    <div className="chips">
+                      {(schema.filters ?? []).map((f, i) => (
+                        <span key={`${f.field}${f.op}${i}`} className="chip chip--warn">
+                          {label(f.field)} {f.op === "within_days" ? `within ${String(f.value)} days` : `contains ${(f.value as string[]).join(" / ")}`}
+                          <button type="button" className="chip__x" aria-label={`Remove filter on ${label(f.field)}`} onClick={() => { setSchema({ ...schema, filters: (schema.filters ?? []).filter((_, j) => j !== i) }); setConfirm(false); }}>×</button>
+                        </span>
+                      ))}
+                    </div>
+                  </>
+                )}
+                {schema.criteria && Object.keys(schema.criteria).length > 0 && (
+                  <p className="small muted">Research criteria (shown, never used to drop rows): {JSON.stringify(schema.criteria)}</p>
+                )}
+              </>
+            )}
+            {step === "limits" && (
+              <>
+                <p className="small muted">Every run is bounded. Changing a limit re-checks the estimate before the run.</p>
+                <OptionsPanel bare options={options} onChange={(o) => { setOptions(o); invalidate(); }} />
+                <p className="small muted">
+                  Browser rendering: {plan.browser.requested ? (plan.browser.available ? "on" : "requested, unavailable on this server") : "off"}
+                  {plan.browser.note ? ` — ${plan.browser.note}` : ""}
+                </p>
+              </>
+            )}
+            {step === "review" && (
+              <>
+                <h3 className="section-title">Sources</h3>
+                <DataTable
+                  rows={plan.sources.slice(0, 20).map((s, i) => ({ ...s, id: String(i) }) as unknown as Row)}
+                  columns={[
+                    { key: "row", label: "Row" },
+                    { key: "url", label: "URL", className: "mono small" },
+                    { key: "label", label: "Detected source" },
+                  ]}
+                />
+                {plan.inputs.rejected.length > 0 && <p className="small">{plan.inputs.rejected.length} inputs will be skipped: {plan.inputs.rejected.slice(0, 5).map((r) => `row ${r.row} (${r.reason})`).join(", ")}</p>}
+                <h3 className="section-title">Work & cost estimate</h3>
+                <div className="stats">
+                  <Stat label="URLs" value={fmt(plan.inputs.accepted)} />
+                  <Stat label="Pages (max)" value={fmt(plan.estimate.pages_max)} />
+                  <Stat label="Requests" value={`~${fmt(plan.estimate.requests_typical)}`} hint={`max ${fmt(plan.estimate.requests_max)}`} />
+                  <Stat label="AI calls (max)" value={fmt(plan.estimate.ai_calls_max)} />
+                  <Stat label="Estimated AI cost" value={plan.estimate.estimated_cost_usd === null ? "?" : `$${plan.estimate.estimated_cost_usd.toFixed(2)}`} hint={plan.estimate.cost_note} />
+                </div>
+                <p className="small muted">
+                  Limits: {plan.limits.max_pages} pages per URL · {fmt(plan.limits.max_records)} records · {Math.round(plan.limits.max_runtime_s / 60)} min
+                </p>
+                {plan.requires_confirmation && (
+                  <label className="checkbox scraper-confirm">
+                    <input type="checkbox" checked={confirm} onChange={(e) => setConfirm(e.target.checked)} />
+                    <span>High-volume run ({plan.confirmation_reasons.join("; ")}). I confirm.</span>
+                  </label>
+                )}
+                <div className="form__actions">
+                  <input className="input input--small" placeholder="Template name" value={templateName} onChange={(e) => setTemplateName(e.target.value)} />
+                  <button type="button" className="button button--ghost" disabled={action.busy || !templateName.trim()} onClick={() => void action.run(async () => { await client.post("/scraper/templates", { name: templateName, instruction, schema, options: toOptionsPayload(options) }); setTemplateName(""); setTplKey((k) => k + 1); })}>
+                    Save as template
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
+          {action.error && <ErrorBanner error={action.error} />}
+          <div className="scraper-footer">
+            {estimate}
+            <div className="actions">
+              {step !== "review" && (
+                <button type="button" className="button button--ghost" onClick={() => setStep(STEPS[STEPS.findIndex((s) => s.key === step) + 1].key)}>
+                  Next
+                </button>
+              )}
+              {stale ? (
+                <button type="button" className="button button--primary" disabled={action.busy || !ready} onClick={() => void preview()}>
+                  {action.busy ? "Planning…" : "Re-check plan"}
+                </button>
+              ) : (
+                <button type="button" className="button button--primary button--large" disabled={action.busy || (plan.requires_confirmation && !confirm)} onClick={() => void run()} title={plan.requires_confirmation && !confirm ? "Confirm the high-volume run on the Review step" : undefined}>
+                  {action.busy ? "Starting…" : "Run Scraper"}
+                </button>
+              )}
             </div>
           </div>
-        )}
-      </div>
-      <h2 className="section-title">Run history</h2>
+        </section>
+      )}
+
+      <h2 className="section-title">Recent runs</h2>
       <ResourceList
         load={(q, s) => client.list("/scraper/runs", q, s)}
         link={(r) => `/scraper/${r.id}`}
+        empty={{ title: "No scraper runs yet", description: "Runs appear here with their status, record counts and downloads.", icon: "scraper" }}
         columns={[
           { key: "instruction", label: "Instruction" },
           { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
@@ -682,7 +805,6 @@ export function ScrapeRun() {
   const isActive = ACTIVE.includes(status);
   return (
     <div className="page">
-      <Link to="/scraper" className="back">← AI Scraper</Link>
       <PageHeader
         title="Scrape run"
         subtitle={String(data.instruction)}

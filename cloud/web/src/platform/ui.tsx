@@ -1,9 +1,11 @@
 // Shared building blocks for the platform pages: data loading, tables, tabs,
 // key/value panels, status pills and a generic filterable resource list.
 
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
-import { EmptyState, ErrorBanner, Loading } from "../components/Feedback";
+import { EmptyState, ErrorBanner, Loading, type EmptyProps } from "../components/Feedback";
+import { Breadcrumbs, useCrumbs } from "../shell/Breadcrumbs";
+import { Icon } from "../shell/Icon";
 import type { PageOf, Query, Row } from "./api";
 
 // --- data ------------------------------------------------------------------
@@ -135,14 +137,41 @@ export function Score({ value }: { value: unknown }) {
 
 // --- layout ----------------------------------------------------------------
 
-export function PageHeader({ title, subtitle, actions }: { title: string; subtitle?: ReactNode; actions?: ReactNode }) {
-  return (
-    <div className="page__header">
-      <div className="title-row">
-        <h1>{title}</h1>
-        {actions && <div className="actions">{actions}</div>}
+/** Set by a section page: a page shown inside one of its tabs keeps its actions but not its own title. */
+export const EmbeddedContext = createContext(false);
+
+/** The sticky page header: breadcrumbs, title, one clear primary action, and contextual tabs. */
+export function PageHeader({ title, subtitle, actions, tabs, crumbTitle }: {
+  title: string;
+  subtitle?: ReactNode;
+  actions?: ReactNode;
+  tabs?: ReactNode;
+  /** The breadcrumb label for this page when it differs from the title. */
+  crumbTitle?: string;
+}) {
+  const embedded = useContext(EmbeddedContext);
+  const crumbs = useCrumbs(crumbTitle ?? title);
+  if (embedded) {
+    // Inside a section tab the section header already says what this is; keep only the actions.
+    if (!actions) return null;
+    return (
+      <div className="subbar">
+        <span />
+        <div className="actions">{actions}</div>
       </div>
-      {subtitle && <p className="muted">{subtitle}</p>}
+    );
+  }
+  return (
+    <div className={`page__header${tabs ? " page__header--tabs" : ""}`}>
+      <Breadcrumbs crumbs={crumbs} />
+      <div className="page__titlebar">
+        <div className="min-w-0">
+          <h1>{title}</h1>
+          {subtitle && <p className="muted page__subtitle">{subtitle}</p>}
+        </div>
+        {actions && <div className="actions page__actions">{actions}</div>}
+      </div>
+      {tabs}
     </div>
   );
 }
@@ -217,13 +246,19 @@ export interface Column<T = Row> {
   className?: string;
 }
 
-export function DataTable<T extends Row>({ rows, columns, link, empty = "Nothing here yet." }: {
+export type Empty = string | EmptyProps;
+
+function emptyProps(empty: Empty): EmptyProps {
+  return typeof empty === "string" ? { title: empty } : empty;
+}
+
+export function DataTable<T extends Row>({ rows, columns, link, empty = { title: "No records yet", description: "Records appear here as soon as they are added, imported or found." } }: {
   rows: T[];
   columns: Column<T>[];
   link?: (row: T) => string;
-  empty?: string;
+  empty?: Empty;
 }) {
-  if (rows.length === 0) return <EmptyState title={empty} />;
+  if (rows.length === 0) return <EmptyState {...emptyProps(empty)} />;
   return (
     <div className="table-wrap">
       <table className="table">
@@ -266,16 +301,85 @@ export interface FilterDef {
   placeholder?: string;
 }
 
+/** Search on the left; the filters stay behind a "Filters" button until you want them. */
+export function FilterBar({ search, onSearch, filters, values, onChange, onSubmit, extra, defaultOpen = false }: {
+  search: string;
+  onSearch: (value: string) => void;
+  filters: FilterDef[];
+  values: Record<string, string>;
+  onChange: (values: Record<string, string>) => void;
+  onSubmit: () => void;
+  extra?: ReactNode;
+  defaultOpen?: boolean;
+}) {
+  const active = Object.values(values).filter(Boolean).length;
+  const [open, setOpen] = useState(defaultOpen || active > 0);
+  return (
+    <form
+      className="filterbar"
+      onSubmit={(event) => {
+        event.preventDefault();
+        onSubmit();
+      }}
+    >
+      <div className="filterbar__row">
+        <label className="filterbar__search">
+          <Icon name="search" size={16} />
+          <span className="sr-only">Search</span>
+          <input className="input" placeholder="Search…" value={search} onChange={(e) => onSearch(e.target.value)} />
+        </label>
+        {filters.length > 0 && (
+          <button type="button" className={`button button--ghost button--small${open || active ? " button--on" : ""}`} aria-expanded={open} onClick={() => setOpen((o) => !o)}>
+            <Icon name="filter" size={14} /> Filters{active ? <span className="tab__count">{active}</span> : null}
+          </button>
+        )}
+        {active > 0 && (
+          <button type="button" className="button button--ghost button--small" onClick={() => onChange({})}>
+            Clear
+          </button>
+        )}
+        <span className="filterbar__spacer" />
+        {extra}
+        <button className="button button--ghost button--small" type="submit">
+          Search
+        </button>
+      </div>
+      {open && filters.length > 0 && (
+        <div className="filterbar__panel">
+          {filters.map((f) => (
+            <label key={f.key} className="filterbar__field">
+              <span className="field__label">{f.label}</span>
+              {f.options ? (
+                <select className="input input--small" value={values[f.key] ?? ""} onChange={(e) => onChange({ ...values, [f.key]: e.target.value })}>
+                  <option value="">Any</option>
+                  {f.options.map((o) => (
+                    <option key={o} value={o}>
+                      {o.replace(/_/g, " ")}
+                    </option>
+                  ))}
+                </select>
+              ) : (
+                <input className="input input--small" placeholder={f.placeholder ?? f.label} value={values[f.key] ?? ""} onChange={(e) => onChange({ ...values, [f.key]: e.target.value })} />
+              )}
+            </label>
+          ))}
+        </div>
+      )}
+    </form>
+  );
+}
+
 /** A searchable, filterable, paged list of any platform resource. */
-export function ResourceList<T extends Row>({ load, columns, link, filters = [], pageSize = 25, empty, reloadKey = "", extraQuery = {} }: {
+export function ResourceList<T extends Row>({ load, columns, link, filters = [], pageSize = 25, empty, reloadKey = "", extraQuery = {}, filtersOpen = false }: {
   load: (query: Query, signal: AbortSignal) => Promise<PageOf<T>>;
   columns: Column<T>[];
   link?: (row: T) => string;
   filters?: FilterDef[];
   pageSize?: number;
-  empty?: string;
+  empty?: Empty;
   reloadKey?: string;
   extraQuery?: Query;
+  filtersOpen?: boolean;
 }) {
   const [q, setQ] = useState("");
   const [search, setSearch] = useState("");
@@ -289,51 +393,31 @@ export function ResourceList<T extends Row>({ load, columns, link, filters = [],
 
   return (
     <div className="card">
-      <form
-        className="toolbar"
-        onSubmit={(event) => {
-          event.preventDefault();
-          setSearch(q.trim());
-        }}
-      >
-        <input className="input toolbar__search" placeholder="Search…" value={q} onChange={(e) => setQ(e.target.value)} />
-        {filters.map((f) =>
-          f.options ? (
-            <select
-              key={f.key}
-              className="input toolbar__filter"
-              aria-label={f.label}
-              value={values[f.key] ?? ""}
-              onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))}
-            >
-              <option value="">{f.label}: any</option>
-              {f.options.map((o) => (
-                <option key={o} value={o}>
-                  {o.replace(/_/g, " ")}
-                </option>
-              ))}
-            </select>
-          ) : (
-            <input
-              key={f.key}
-              className="input toolbar__filter"
-              placeholder={f.placeholder ?? f.label}
-              aria-label={f.label}
-              value={values[f.key] ?? ""}
-              onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))}
-            />
-          ),
-        )}
-        <button className="button button--ghost button--small" type="submit">
-          Search
-        </button>
-      </form>
+      <FilterBar search={q} onSearch={setQ} filters={filters} values={values} onChange={setValues} onSubmit={() => setSearch(q.trim())} defaultOpen={filtersOpen} />
       {error && <ErrorBanner error={error} onRetry={refresh} />}
       {loading && !data ? (
         <Loading />
       ) : data ? (
         <>
-          <DataTable rows={data.items} columns={columns} link={link} empty={empty} />
+          <DataTable
+            rows={data.items}
+            columns={columns}
+            link={link}
+            empty={
+              search || Object.values(values).some(Boolean)
+                ? {
+                    title: "No matches",
+                    description: "Nothing matches this search and these filters.",
+                    icon: "search",
+                    action: (
+                      <button type="button" className="button button--ghost button--small" onClick={() => { setQ(""); setSearch(""); setValues({}); }}>
+                        Clear search and filters
+                      </button>
+                    ),
+                  }
+                : empty
+            }
+          />
           <div className="pager">
             <span className="muted small tabular">
               {data.total === 0 ? "0 results" : `${data.offset + 1}–${data.offset + data.items.length} of ${data.total.toLocaleString()}`}

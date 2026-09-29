@@ -58,12 +58,12 @@ export function Dashboard() {
             <Stat label="Companies" value={num(data, "companies", "total").toLocaleString()} hint={`${num(data, "companies", "discovered")} discovered`} />
             <Stat label="Contacts" value={num(data, "contacts", "total").toLocaleString()} hint={`${num(data, "contacts", "verified_emails")} verified emails`} />
             <Stat label="Open jobs" value={num(data, "jobs", "open").toLocaleString()} hint={`${num(data, "jobs", "relevant")} relevant`} />
-            <Stat label="Hiring signals" value={num(data, "hiring_signals", "total").toLocaleString()} />
-            <Stat label="Opportunities" value={num(data, "opportunities", "open").toLocaleString()} hint={num(data, "opportunities", "pipeline_value") ? `$${num(data, "opportunities", "pipeline_value").toLocaleString()} pipeline` : undefined} />
+            <Stat label="Hiring signals" value={num(data, "signals", "total").toLocaleString()} hint={`${num(data, "signals", "active")} active`} />
+            <Stat label="Opportunities" value={num(data, "pipeline", "by_status", "open").toLocaleString()} hint={num(data, "pipeline", "open_pipeline_value") ? `$${num(data, "pipeline", "open_pipeline_value").toLocaleString()} pipeline` : undefined} />
           </div>
           <div className="grid-2">
-            <div className="card pad"><h3>Hiring signals by type</h3><Bars data={section(data, "hiring_signals")} /></div>
-            <div className="card pad"><h3>Pipeline by stage</h3><Bars data={section(data, "opportunities")} /></div>
+            <div className="card pad"><h3>Hiring signals by type</h3><Bars data={section(data, "signals")} /></div>
+            <div className="card pad"><h3>Pipeline by status</h3><Bars data={section(data, "pipeline")} /></div>
             <div className="card pad"><h3>Email validation</h3><Bars data={section(data, "validation")} /></div>
             <div className="card pad"><h3>Credits used by provider</h3><Bars data={section(data, "credits")} /></div>
           </div>
@@ -119,7 +119,7 @@ export function Opportunities() {
   return (
     <div className="page">
       <PageHeader
-        title="Opportunities"
+        title="Deals"
         subtitle="Scored, evidence-backed opportunities from hiring signals and manual work."
         actions={
           <>

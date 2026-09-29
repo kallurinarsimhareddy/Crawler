@@ -1,10 +1,11 @@
-import { useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { ErrorBanner, Loading } from "../../components/Feedback";
+import { useState, type FormEvent } from "react";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { EmptyState, ErrorBanner, Loading } from "../../components/Feedback";
+import { useAssistant } from "../../shell/Assistant";
 import type { PageOf, Row } from "../api";
 import { CreateForm } from "../ResourcePage";
 import { OPPORTUNITY_COLUMNS } from "../resources";
-import { DataTable, Json, KeyValues, PageHeader, Pill, ResourceList, Score, Stat, Tabs, Tags, fmt, fmtDate, useAction, useLoad } from "../ui";
+import { DataTable, Json, KeyValues, PageHeader, Pill, ResourceList, Score, Stat, Tabs, Tags, fmt, fmtDate, useAction, useLoad, type Empty } from "../ui";
 import { useWs } from "../workspace";
 
 const COMPANY_FIELDS = [
@@ -21,17 +22,20 @@ const COMPANY_FIELDS = [
 export function Companies() {
   const client = useWs();
   const navigate = useNavigate();
-  const [creating, setCreating] = useState(false);
+  const [params, setParams] = useSearchParams();
+  const creating = params.get("create") === "1";
+  const setCreating = (open: boolean) => {
+    const next = new URLSearchParams(params);
+    if (open) next.set("create", "1");
+    else next.delete("create");
+    setParams(next, { replace: true });
+  };
   return (
     <div className="page">
       <PageHeader
         title="Companies"
         subtitle="The company master: every record deduplicated, scored and traceable to its sources."
-        actions={
-          <button className="button button--primary" onClick={() => setCreating((c) => !c)}>
-            {creating ? "Close" : "Add company"}
-          </button>
-        }
+        actions={creating ? <button className="button button--ghost button--small" onClick={() => setCreating(false)}>Close form</button> : undefined}
       />
       {creating && (
         <CreateForm
@@ -63,13 +67,24 @@ export function Companies() {
           { key: "technologies", label: "Technology", placeholder: "technology (exact)" },
           { key: "country", label: "Country", placeholder: "country" },
         ]}
-        empty="No companies yet. Import files, run discovery, or add one."
+        empty={{
+          title: "No companies yet",
+          description: "Import company files, discover companies from websites, or add one by hand. Every record is deduplicated and scored.",
+          icon: "building",
+          action: (
+            <span className="actions">
+              <button className="button button--primary" onClick={() => setCreating(true)}>+ Add Company</button>
+              <Link className="button button--ghost" to="/imports">Import</Link>
+              <Link className="button button--ghost" to="/prospecting?tab=discover">Discover companies</Link>
+            </span>
+          ),
+        }}
       />
     </div>
   );
 }
 
-function SubList({ path, columns, link, empty }: { path: string; columns: Parameters<typeof DataTable>[0]["columns"]; link?: (r: Row) => string; empty: string }) {
+function SubList({ path, columns, link, empty }: { path: string; columns: Parameters<typeof DataTable>[0]["columns"]; link?: (r: Row) => string; empty: Empty }) {
   const client = useWs();
   const { data, error, loading, refresh } = useLoad((signal) => client.list(path, { limit: 100 }, signal), client.base + path);
   if (error) return <ErrorBanner error={error} onRetry={refresh} />;
@@ -81,6 +96,7 @@ export function CompanyDetail() {
   const { companyId = "" } = useParams();
   const client = useWs();
   const [tab, setTab] = useState("overview");
+  const assistant = useAssistant();
   const { data: company, error, loading, refresh } = useLoad((signal) => client.get<Row>(`/companies/${companyId}`, undefined, signal), client.base + companyId);
   const scores = useLoad((signal) => client.get<Record<string, unknown>>(`/companies/${companyId}/scores`, undefined, signal).catch(() => null), client.base + companyId + "scores");
   const action = useAction();
@@ -92,7 +108,6 @@ export function CompanyDetail() {
 
   return (
     <div className="page">
-      <Link to="/companies" className="back">← Companies</Link>
       <PageHeader
         title={String(c.name)}
         subtitle={
@@ -128,12 +143,15 @@ export function CompanyDetail() {
         onChange={setTab}
         tabs={[
           { key: "overview", label: "Overview" },
+          { key: "contacts", label: "People" },
           { key: "jobs", label: "Jobs" },
-          { key: "contacts", label: "Contacts" },
-          { key: "technology", label: "Technology" },
-          { key: "signals", label: "Hiring signals" },
+          { key: "technology", label: "Technologies" },
+          { key: "signals", label: "Hiring Signals" },
           { key: "activities", label: "Activities" },
-          { key: "opportunities", label: "Opportunities" },
+          { key: "notes", label: "Notes" },
+          { key: "campaigns", label: "Campaigns" },
+          { key: "research", label: "Research" },
+          { key: "opportunities", label: "Deals" },
           { key: "sources", label: "Sources" },
         ]}
       />
@@ -211,6 +229,42 @@ export function CompanyDetail() {
           />
         )}
         {tab === "activities" && <Timeline companyId={companyId} />}
+        {tab === "notes" && <CompanyNotes companyId={companyId} />}
+        {tab === "campaigns" && (
+          <>
+            <p className="muted small">Campaign involvement is tracked through this company's deals that belong to a campaign.</p>
+            <SubList
+              path={`/opportunities?company_id=${companyId}`}
+              link={(r) => `/opportunities/${r.id}`}
+              empty={{
+                title: "Not in a campaign yet",
+                description: "Add this account to a campaign to start targeted outreach. Every send waits for approval.",
+                icon: "megaphone",
+                action: <button className="button button--primary button--small" onClick={() => assistant.show(`Create a campaign for ${String(c.name)}`)}>Create a campaign with AI</button>,
+              }}
+              columns={[
+                { key: "name", label: "Deal" },
+                { key: "campaign_id", label: "Campaign", className: "mono small" },
+                { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
+                { key: "created_at", label: "Created", render: (r) => fmtDate(r.created_at) },
+              ]}
+            />
+          </>
+        )}
+        {tab === "research" && (
+          <EmptyState
+            icon="bot"
+            title={`Research ${String(c.name)}`}
+            description="Ask the research agent about this company — hiring plans, technology, leaders and buying signals — or scrape its website for structured data."
+            action={
+              <span className="actions">
+                <button className="button button--primary" onClick={() => assistant.show(`Research ${String(c.name)}${c.domain ? ` (${String(c.domain)})` : ""}: hiring, technologies, IT leaders and buying signals.`)}>Research with AI</button>
+                {c.website || c.domain ? <Link className="button button--ghost" to={`/scraper?urls=${encodeURIComponent(String(c.website ?? `https://${String(c.domain)}`))}`}>Scrape the website</Link> : null}
+                <Link className="button button--ghost" to="/research">Research agent</Link>
+              </span>
+            }
+          />
+        )}
         {tab === "opportunities" && (
           <SubList path={`/opportunities?company_id=${companyId}`} columns={OPPORTUNITY_COLUMNS as never} link={(r) => `/opportunities/${r.id}`} empty="No opportunities." />
         )}
@@ -230,6 +284,40 @@ export function CompanyDetail() {
         )}
       </div>
     </div>
+  );
+}
+
+function CompanyNotes({ companyId }: { companyId: string }) {
+  const client = useWs();
+  const [text, setText] = useState("");
+  const [reload, setReload] = useState(0);
+  const action = useAction();
+  const submit = (e: FormEvent) => {
+    e.preventDefault();
+    void action.run(async () => {
+      await client.post("/activities", { kind: "note", summary: text.trim(), company_id: companyId });
+      setText("");
+      setReload((n) => n + 1);
+    });
+  };
+  return (
+    <>
+      <form className="note-form" onSubmit={submit}>
+        <label htmlFor="note" className="sr-only">Add a note</label>
+        <textarea id="note" className="input textarea" rows={2} value={text} onChange={(e) => setText(e.target.value)} placeholder="Add a note about this company…" />
+        <button className="button button--primary" type="submit" disabled={action.busy || !text.trim()}>{action.busy ? "Saving…" : "Add note"}</button>
+      </form>
+      {action.error && <ErrorBanner error={action.error} />}
+      <SubList
+        key={reload}
+        path={`/activities?company_id=${companyId}&kind=note`}
+        empty={{ title: "No notes yet", description: "Notes you add here are saved to this company's activity timeline.", icon: "note" }}
+        columns={[
+          { key: "summary", label: "Note" },
+          { key: "occurred_at", label: "Added", render: (r) => fmtDate(r.occurred_at ?? r.created_at) },
+        ]}
+      />
+    </>
   );
 }
 
@@ -272,7 +360,7 @@ function Timeline({ companyId }: { companyId: string }) {
   if (error) return <ErrorBanner error={error} />;
   if (loading && !data) return <Loading />;
   const items = (Array.isArray(data) ? data : data?.items ?? []) as Row[];
-  if (items.length === 0) return <p className="muted">Nothing on the timeline yet.</p>;
+  if (items.length === 0) return <EmptyState icon="activity" title="Nothing on the timeline yet" description="Imports, calls, emails, stage changes and signals for this company appear here in order." />;
   return (
     <ol className="timeline">
       {items.map((item, i) => (

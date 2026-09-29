@@ -1,7 +1,7 @@
 // Contacts, job postings, hiring intelligence and company discovery.
 
 import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
 import { CreateForm } from "../ResourcePage";
@@ -10,14 +10,21 @@ import { useWs } from "../workspace";
 
 export function Contacts() {
   const client = useWs();
-  const [creating, setCreating] = useState(false);
+  const [params, setParams] = useSearchParams();
+  const creating = params.get("create") === "1";
+  const setCreating = (open: boolean) => {
+    const next = new URLSearchParams(params);
+    if (open) next.set("create", "1");
+    else next.delete("create");
+    setParams(next, { replace: true });
+  };
   const [reload, setReload] = useState(0);
   return (
     <div className="page">
       <PageHeader
         title="Contacts"
         subtitle="People at target companies, with the source and validation status of every email."
-        actions={<button className="button button--primary" onClick={() => setCreating((c) => !c)}>{creating ? "Close" : "Add contact"}</button>}
+        actions={creating ? <button className="button button--ghost button--small" onClick={() => setCreating(false)}>Close form</button> : undefined}
       />
       {creating && (
         <CreateForm
@@ -37,6 +44,17 @@ export function Contacts() {
         reloadKey={String(reload)}
         load={(query, signal) => client.list("/contacts", query, signal)}
         link={(r) => `/contacts/${r.id}`}
+        empty={{
+          title: "No contacts yet",
+          description: "Add people at your target companies, import a contact file, or find contacts for a company from its page.",
+          icon: "users",
+          action: (
+            <span className="actions">
+              <button className="button button--primary" onClick={() => setCreating(true)}>+ Add Contact</button>
+              <Link className="button button--ghost" to="/imports">Import</Link>
+            </span>
+          ),
+        }}
         columns={[
           { key: "full_name", label: "Name" },
           { key: "title", label: "Title" },
@@ -155,7 +173,7 @@ export function Postings() {
 
 const SIGNAL_TYPES = ["NEW_ROLE", "MULTIPLE_RELEVANT_ROLES", "HIRING_SPIKE", "HIRING_VELOCITY", "LONG_OPEN_ROLE", "HARD_TO_FILL", "SPECIALIZED_TECHNOLOGY", "PROJECT_IMPLEMENTATION", "EXPANSION_HIRING", "BACKFILL_REPLACEMENT", "LEADERSHIP_HIRING"];
 
-export function HiringIntel() {
+export function HiringIntel({ title = "Hiring intelligence" }: { title?: string }) {
   const client = useWs();
   const action = useAction();
   const counts = useLoad((signal) => client.get<Record<string, unknown>>("/analytics/dashboard", undefined, signal).catch(() => null), client.base + "dash");
@@ -163,7 +181,7 @@ export function HiringIntel() {
   return (
     <div className="page">
       <PageHeader
-        title="Hiring intelligence"
+        title={title}
         subtitle="Eleven evidence-backed signals. Backfill is only claimed when the posting says so."
         actions={<button className="button button--primary" disabled={action.busy} onClick={() => action.run(() => client.post("/signals/run", {}))}>Detect signals now</button>}
       />

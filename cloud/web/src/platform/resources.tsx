@@ -26,6 +26,7 @@ export const TASKS: ResourceConfig = {
     { key: "description", label: "Description", type: "textarea" },
   ],
   createLabel: "New task",
+  emptyHint: "Create follow-ups for companies, contacts and deals so nothing slips.",
 };
 
 export const ACTIVITIES: ResourceConfig = {
@@ -46,6 +47,7 @@ export const ACTIVITIES: ResourceConfig = {
     { key: "contact_id", label: "Contact id" },
   ],
   createLabel: "Log activity",
+  emptyHint: "Log calls, meetings, emails and notes to build a timeline for every account.",
 };
 
 export const CAMPAIGNS: ResourceConfig = {
@@ -70,6 +72,7 @@ export const CAMPAIGNS: ResourceConfig = {
     { key: "target_titles", label: "Target titles", type: "tags" },
   ],
   createLabel: "New campaign",
+  emptyHint: "Group target accounts around a message, then add sequences and templates.",
 };
 
 export const SEQUENCES: ResourceConfig = {
@@ -88,6 +91,7 @@ export const SEQUENCES: ResourceConfig = {
     { key: "description", label: "Description", type: "textarea" },
   ],
   createLabel: "New sequence",
+  emptyHint: "Build multi-step outreach; every enrollment waits for your approval.",
 };
 
 export const TEMPLATES: ResourceConfig = {
@@ -105,6 +109,7 @@ export const TEMPLATES: ResourceConfig = {
     { key: "body", label: "Body", type: "textarea", required: true },
   ],
   createLabel: "New template",
+  emptyHint: "Write reusable emails with {{company.name}} and {{contact.first_name}} variables.",
 };
 
 export const LISTS: ResourceConfig = {
@@ -124,6 +129,7 @@ export const LISTS: ResourceConfig = {
     { key: "description", label: "Description", type: "textarea" },
   ],
   createLabel: "New list",
+  emptyHint: "Save companies, contacts or jobs into a list to research, enrich or target them.",
   link: (r) => `/lists/${r.id}`,
 };
 
@@ -142,6 +148,7 @@ export const SEGMENTS: ResourceConfig = {
     { key: "filters", label: "Filters (JSON)", type: "json", placeholder: '{"industry": "Manufacturing", "account_score__gte": 60}' },
   ],
   createLabel: "New segment",
+  emptyHint: "Save a filter once; the segment stays current as your data changes.",
 };
 
 // Workflows are edited in the visual automation builder (controlroom/Automation.tsx).
@@ -164,6 +171,7 @@ export const MONITORS: ResourceConfig = {
     { key: "frequency", label: "Frequency", type: "select", options: ["daily", "weekly", "monthly"], required: true },
   ],
   createLabel: "New monitor",
+  emptyHint: "Track changes across companies, lists or searches.",
 };
 
 export const SUPPRESSIONS: ResourceConfig = {
@@ -182,6 +190,7 @@ export const SUPPRESSIONS: ResourceConfig = {
     { key: "reason", label: "Reason", type: "select", options: ["manual", "unsubscribe", "bounce", "complaint", "legal", "customer"], required: true },
   ],
   createLabel: "Suppress",
+  emptyHint: "Add emails or domains that must never be contacted.",
 };
 
 export const OPPORTUNITY_COLUMNS = [

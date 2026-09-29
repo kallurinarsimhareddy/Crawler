@@ -13,7 +13,7 @@ import { AiProviderSettings, ProactiveSettings } from "../controlroom/AiSettings
 const EXAMPLE =
   "Find US manufacturing companies using RPG or AS400, match them against my internal data, remove companies already in my CRM, find companies with new ERP hiring, identify missing IT/HR/VP contacts using my authorized sources, validate the emails, rank the opportunities, assign the correct staffing campaign, and export the results.";
 
-export function Research() {
+export function Research({ part = "both" }: { part?: "form" | "history" | "both" }) {
   const client = useWs();
   const navigate = useNavigate();
   const [question, setQuestion] = useState("");
@@ -21,6 +21,7 @@ export function Research() {
   return (
     <div className="page">
       <PageHeader title="Research agent" subtitle="Ask in plain language. The agent plans, shows the plan and its credit cost, and only runs after you approve. CRM changes are proposed, never applied silently." />
+      {part !== "history" && (
       <form
         className="card form"
         onSubmit={(e) => {
@@ -41,7 +42,10 @@ export function Research() {
           <button className="button button--ghost" type="button" onClick={() => setQuestion(EXAMPLE)}>Use example</button>
         </div>
       </form>
+      )}
+      {part !== "form" && (
       <ResourceList
+        empty={{ title: "No research yet", description: "Ask a question above and the agent plans it; every plan and its results are kept here.", icon: "bot" }}
         load={(q, s) => client.list("/research/runs", q, s)}
         link={(r) => `/research/${r.id}`}
         columns={[
@@ -52,6 +56,7 @@ export function Research() {
           { key: "created_at", label: "Created", render: (r) => fmtDate(r.created_at) },
         ]}
       />
+      )}
     </div>
   );
 }

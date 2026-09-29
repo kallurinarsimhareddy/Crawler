@@ -9,7 +9,7 @@ import { useWorkspace, useWs } from "../workspace";
 import { ResearchCanvas } from "./Canvas";
 import { ASK_EVENT, type AgentRun, type AskResponse, type ModeInfo, type Session } from "./types";
 
-const EXAMPLES = [
+export const EXAMPLES = [
   "Find US manufacturing companies using SAP with new hiring activity.",
   "Find 500 companies using RPG/AS400, remove companies already in our CRM, find missing IT leaders, validate available emails, and prepare an outreach list.",
   "Monitor these 1,000 companies and tell me when hiring increases.",
@@ -21,7 +21,7 @@ const FOLLOW_UPS = ["Remove companies already in our CRM", "Find missing IT lead
 
 const SESSION_KEY = "careercrawler.agent.session";
 
-function remembered(ws: string): string | null {
+export function remembered(ws: string): string | null {
   try {
     return window.localStorage.getItem(`${SESSION_KEY}.${ws}`);
   } catch {
@@ -29,7 +29,7 @@ function remembered(ws: string): string | null {
   }
 }
 
-function remember(ws: string, id: string | null): void {
+export function remember(ws: string, id: string | null): void {
   try {
     if (id) window.localStorage.setItem(`${SESSION_KEY}.${ws}`, id);
     else window.localStorage.removeItem(`${SESSION_KEY}.${ws}`);

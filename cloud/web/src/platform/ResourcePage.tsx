@@ -3,9 +3,10 @@
 // segments, templates, workflows, monitors, suppressions, exports…
 
 import { useState, type FormEvent } from "react";
+import { useSearchParams } from "react-router-dom";
 import { ErrorBanner } from "../components/Feedback";
-import { newIdempotencyKey, type Row } from "./api";
-import { PageHeader, ResourceList, useAction, type Column, type FilterDef } from "./ui";
+import { newIdempotencyKey, type Query, type Row } from "./api";
+import { PageHeader, ResourceList, useAction, type Column, type Empty, type FilterDef } from "./ui";
 import { useWs } from "./workspace";
 
 export interface FieldDef {
@@ -27,7 +28,10 @@ export interface ResourceConfig {
   create?: FieldDef[];
   createLabel?: string;
   link?: (row: Row) => string;
-  empty?: string;
+  /** The empty state: what the page is for and what to do next. */
+  empty?: Empty;
+  /** One sentence for the empty state (defaults to the subtitle). */
+  emptyHint?: string;
 }
 
 function coerce(field: FieldDef, raw: string | boolean): unknown {
@@ -116,9 +120,11 @@ export function CreateForm({ fields, path, label = "Create", onCreated }: { fiel
   );
 }
 
-export function ResourcePage({ config }: { config: ResourceConfig }) {
+/** A config-driven list page. `query` fixes a filter (e.g. drafts only) when the page is a section tab. */
+export function ResourcePage({ config, query, emptyTitle }: { config: ResourceConfig; query?: Query; emptyTitle?: string }) {
   const client = useWs();
-  const [showCreate, setShowCreate] = useState(false);
+  const [params] = useSearchParams();
+  const [showCreate, setShowCreate] = useState(() => params.get("create") === "1");
   const [reload, setReload] = useState(0);
   return (
     <div className="page">
@@ -128,7 +134,7 @@ export function ResourcePage({ config }: { config: ResourceConfig }) {
         actions={
           config.create && (
             <button className="button button--primary" onClick={() => setShowCreate((s) => !s)}>
-              {showCreate ? "Close" : config.createLabel ?? "New"}
+              {showCreate ? "Close" : `+ ${config.createLabel ?? "New"}`}
             </button>
           )
         }
@@ -148,7 +154,18 @@ export function ResourcePage({ config }: { config: ResourceConfig }) {
         columns={config.columns}
         filters={config.filters}
         link={config.link}
-        empty={config.empty}
+        extraQuery={query}
+        empty={
+          config.empty ?? {
+            title: emptyTitle ?? `No ${config.title.toLowerCase()} yet`,
+            description: config.emptyHint ?? config.subtitle,
+            action: config.create ? (
+              <button className="button button--primary" onClick={() => setShowCreate(true)}>
+                {config.createLabel ?? "Create"}
+              </button>
+            ) : undefined,
+          }
+        }
         reloadKey={`${client.base}:${reload}`}
       />
     </div>

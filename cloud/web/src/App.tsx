@@ -7,13 +7,15 @@ import { Jobs } from "./pages/Jobs";
 import { Login } from "./pages/Login";
 import { NewCrawl } from "./pages/NewCrawl";
 import { ResetPassword } from "./pages/ResetPassword";
-import { Companies, CompanyDetail } from "./platform/pages/Companies";
-import { ContactDetail, Contacts, Discovery, HiringIntel, Postings, Provenance } from "./platform/pages/Intel";
-import { Credits, Exports, ImportDetail, Imports, Research, ResearchRun, Settings, Sources } from "./platform/pages/Tools";
+import { CompanyDetail } from "./platform/pages/Companies";
+import { ContactDetail, Discovery, HiringIntel, Postings, Provenance } from "./platform/pages/Intel";
+import { Home } from "./platform/pages/Home";
+import { AnalyticsSection, CampaignsSection, CompaniesSection, ContactsSection, HiringSection, ProspectingSection, ResearchSection, SequencesSection, SettingsSection } from "./platform/pages/Sections";
+import { Credits, Exports, ImportDetail, Imports, ResearchRun, Sources } from "./platform/pages/Tools";
 import { ScrapeRun, Scraper } from "./platform/pages/Scraper";
-import { Analytics, BackgroundTasks, Dashboard, ListDetail, Opportunities } from "./platform/pages/Work";
+import { BackgroundTasks, Dashboard, ListDetail, Opportunities } from "./platform/pages/Work";
 import { ResourcePage } from "./platform/ResourcePage";
-import { ACTIVITIES, CAMPAIGNS, LISTS, MONITORS, SEGMENTS, SEQUENCES, SUPPRESSIONS, TASKS, TEMPLATES } from "./platform/resources";
+import { ACTIVITIES, LISTS, MONITORS, SEGMENTS, SUPPRESSIONS, TASKS, TEMPLATES } from "./platform/resources";
 import { RecordView, RequireWorkspace } from "./platform/Shell";
 import { AutomationBuilder } from "./platform/controlroom/Automation";
 import { ControlRoom } from "./platform/controlroom/ControlRoom";
@@ -44,26 +46,29 @@ export function App() {
         <Route path="jobs/:jobId" element={<JobDetail />} />
 
         {/* The platform. Every page below is scoped to the selected workspace. */}
-        <Route index element={<W><ControlRoom /></W>} />
+        <Route index element={<W><Home /></W>} />
+        <Route path="ai" element={<W><ControlRoom /></W>} />
         <Route path="dashboard" element={<W><Dashboard /></W>} />
         <Route path="ai/memory" element={<W><MemoryPage /></W>} />
-        <Route path="companies" element={<W><Companies /></W>} />
+        <Route path="companies" element={<W><CompaniesSection /></W>} />
         <Route path="companies/:companyId" element={<W><CompanyDetail /></W>} />
-        <Route path="contacts" element={<W><Contacts /></W>} />
+        <Route path="contacts" element={<W><ContactsSection /></W>} />
         <Route path="contacts/:contactId" element={<W><ContactDetail /></W>} />
         <Route path="postings" element={<W><Postings /></W>} />
         <Route path="opportunities" element={<W><Opportunities /></W>} />
         <Route path="opportunities/:id" element={<W><RecordView path="/opportunities" back="/opportunities" backLabel="Opportunities" /></W>} />
         <Route path="tasks" element={<W><ResourcePage config={TASKS} /></W>} />
         <Route path="activities" element={<W><ResourcePage config={ACTIVITIES} /></W>} />
-        <Route path="hiring" element={<W><HiringIntel /></W>} />
+        <Route path="hiring" element={<W><HiringSection /></W>} />
+        <Route path="signals" element={<W><HiringIntel title="Signals" /></W>} />
+        <Route path="prospecting" element={<W><ProspectingSection /></W>} />
         <Route path="discovery" element={<W><Discovery /></W>} />
         <Route path="scraper" element={<W><Scraper /></W>} />
         <Route path="scraper/:runId" element={<W><ScrapeRun /></W>} />
-        <Route path="research" element={<W><Research /></W>} />
+        <Route path="research" element={<W><ResearchSection /></W>} />
         <Route path="research/:runId" element={<W><ResearchRun /></W>} />
-        <Route path="campaigns" element={<W><ResourcePage config={CAMPAIGNS} /></W>} />
-        <Route path="sequences" element={<W><ResourcePage config={SEQUENCES} /></W>} />
+        <Route path="campaigns" element={<W><CampaignsSection /></W>} />
+        <Route path="sequences" element={<W><SequencesSection /></W>} />
         <Route path="templates" element={<W><ResourcePage config={TEMPLATES} /></W>} />
         <Route path="suppressions" element={<W><ResourcePage config={SUPPRESSIONS} /></W>} />
         <Route path="lists" element={<W><ResourcePage config={LISTS} /></W>} />
@@ -76,19 +81,24 @@ export function App() {
         <Route path="exports" element={<W><Exports /></W>} />
         <Route path="sources" element={<W><Sources /></W>} />
         <Route path="credits" element={<W><Credits /></W>} />
-        <Route path="analytics" element={<W><Analytics /></W>} />
+        <Route path="analytics" element={<W><AnalyticsSection /></W>} />
         <Route path="background" element={<W><BackgroundTasks /></W>} />
         <Route path="provenance/:entity/:entityId" element={<W><Provenance /></W>} />
-        <Route path="settings" element={<W><Settings /></W>} />
+        <Route path="settings" element={<W><SettingsSection /></W>} />
         <Route
           path="*"
           element={
             <div className="page">
-              <EmptyState title="Page not found">
-                <Link to="/" className="button button--primary">
-                  Back to dashboard
-                </Link>
-              </EmptyState>
+              <EmptyState
+                icon="search"
+                title="Page not found"
+                description="This page does not exist or has moved. Use Ctrl+K to search for a page, company or contact."
+                action={
+                  <Link to="/" className="button button--primary">
+                    Go to Home
+                  </Link>
+                }
+              />
             </div>
           }
         />
