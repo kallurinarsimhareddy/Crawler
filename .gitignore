@@ -52,3 +52,7 @@ state/
 
 # SANA GTM startup manager logs
 logs/
+
+# SANA GTM Windows installer build output
+deploy/windows/installer/build/
+deploy/windows/installer/dist/

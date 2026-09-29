@@ -15,9 +15,13 @@
   then restarts whatever dies. A process that is already running is adopted,
   never duplicated.
 
-  A quick tunnel gets a NEW public URL whenever cloudflared restarts. The
-  supervisor records the URL and reports when it no longer matches the URL the
-  frontend was built with; it never rebuilds or redeploys the frontend.
+  A quick tunnel gets a NEW public URL whenever cloudflared restarts (so after
+  every reboot). That is handled separately from starting the services: every 5
+  minutes the supervisor runs sync-frontend.ps1 -Mode sync -Auto, which compares
+  the tunnel URL with the URL the LIVE frontend calls and, only when they differ
+  and all its guards pass (stable tunnel, lock, per-day and per-URL limits),
+  rebuilds and redeploys the frontend once. Create logs\sana-gtm\frontend-autosync.off
+  to turn that off.
 
   Logs: <repo>\logs\sana-gtm\. No password, key or token is ever logged: the
   env files are read only by the API, the worker and healthcheck.py.
@@ -36,6 +40,9 @@ $ApiEnv      = Join-Path $Root "cloud\api\.env.sana-cloud"
 $WorkerEnv   = Join-Path $Root "cloud\worker\.env.sana-cloud"
 $WebEnv      = Join-Path $Root "cloud\web\.env.staging.local"
 $HealthPy    = Join-Path $PSScriptRoot "healthcheck.py"
+$SyncPs1     = Join-Path $PSScriptRoot "sync-frontend.ps1"
+$Launcher    = Join-Path $PSScriptRoot "launch_hidden.py"
+$Pythonw     = Join-Path $Root "cloud\.venv\Scripts\pythonw.exe"
 $Cloudflared = "C:\Program Files (x86)\cloudflared\cloudflared.exe"
 $TaskName    = "SANA GTM Auto Start"
 $ApiPort     = 8100
@@ -132,31 +139,46 @@ function Find-TunnelUrl([string[]]$Files) {
     return ""
 }
 
+# Every process the supervisor starts goes through launch_hidden.py: CREATE_NO_WINDOW,
+# stdin NUL, stdout/stderr to log files. Start-Process -WindowStyle Hidden is NOT used:
+# it creates a normal console and hides it afterwards, and Windows 11 hands that console
+# to Windows Terminal, which shows it anyway.
+function Start-Hidden([string]$FilePath, [string[]]$Arguments, [string]$StdOut = "", [string]$StdErr = "") {
+    $la = @($Launcher, "--cwd", $Root)
+    if ($StdOut) { $la += @("--stdout", $StdOut) }
+    if ($StdErr) { $la += @("--stderr", $StdErr) }
+    $out = & $Python @la -- $FilePath @Arguments 2>&1
+    $procId = 0
+    if (-not [int]::TryParse(([string]($out | Select-Object -Last 1)).Trim(), [ref]$procId)) {
+        throw "launch_hidden.py failed for ${FilePath}: $out"
+    }
+    return $procId
+}
+
 # --- starting services ------------------------------------------------------------------------
 
 function Start-Api {
     Rotate (Join-Path $LogDir "api.out.log"); Rotate (Join-Path $LogDir "api.err.log")
-    $argList = "-m uvicorn cloud.api.main:app --host 127.0.0.1 --port $ApiPort --env-file `"$ApiEnv`" --proxy-headers"
-    $p = Start-Process -FilePath $Python -ArgumentList $argList -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $LogDir "api.out.log") -RedirectStandardError (Join-Path $LogDir "api.err.log")
-    Write-Log "API started (pid $($p.Id))"
+    $procId = Start-Hidden $Python @("-m", "uvicorn", "cloud.api.main:app", "--host", "127.0.0.1", "--port", "$ApiPort",
+        "--env-file", $ApiEnv, "--proxy-headers") (Join-Path $LogDir "api.out.log") (Join-Path $LogDir "api.err.log")
+    Write-Log "API started (pid $procId, no window)"
 }
 
 function Start-Worker {
     Rotate (Join-Path $LogDir "worker.out.log"); Rotate (Join-Path $LogDir "worker.err.log")
-    $argList = "-m cloud.intel.tasks.worker --env-file `"$WorkerEnv`""
-    $p = Start-Process -FilePath $Python -ArgumentList $argList -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
-        -RedirectStandardOutput (Join-Path $LogDir "worker.out.log") -RedirectStandardError (Join-Path $LogDir "worker.err.log")
-    Write-Log "Worker started (pid $($p.Id))"
+    # The same command run-sanagtm-worker.bat runs, without the .bat / cmd.exe in between.
+    $procId = Start-Hidden $Python @("-m", "cloud.intel.tasks.worker", "--env-file", $WorkerEnv) `
+        (Join-Path $LogDir "worker.out.log") (Join-Path $LogDir "worker.err.log")
+    Write-Log "Worker started (pid $procId, no window)"
 }
 
 function Start-Tunnel {
     $log = Join-Path $LogDir "tunnel.log"
     Rotate $log; Rotate (Join-Path $LogDir "tunnel.out.log")
     $old = Get-TunnelUrl
-    $p = Start-Process -FilePath $Cloudflared -ArgumentList "tunnel --no-autoupdate --url http://127.0.0.1:$ApiPort" `
-        -WindowStyle Hidden -PassThru -RedirectStandardOutput (Join-Path $LogDir "tunnel.out.log") -RedirectStandardError $log
-    Write-Log "Tunnel started (pid $($p.Id)); waiting for its public URL"
+    $procId = Start-Hidden $Cloudflared @("tunnel", "--no-autoupdate", "--url", "http://127.0.0.1:$ApiPort") `
+        (Join-Path $LogDir "tunnel.out.log") $log
+    Write-Log "Tunnel started (pid $procId, no window); waiting for its public URL"
     $url = ""
     for ($i = 0; $i -lt 30 -and -not $url; $i++) {
         Start-Sleep -Seconds 2
@@ -167,9 +189,8 @@ function Start-Tunnel {
     Write-Log "Tunnel URL: $url"
     $frontend = Get-FrontendApiUrl
     if ($frontend -and $frontend -ne $url) {
-        Write-Log ("Tunnel URL CHANGED (was $old). The deployed frontend calls $frontend and cannot reach the API " +
-                   "until cloud\web\.env.staging.local is updated and the frontend is rebuilt and redeployed. " +
-                   "Not done automatically.") "WARN"
+        Write-Log ("Tunnel URL CHANGED (was $old). The frontend was built for $frontend; " +
+                   "sync-frontend.ps1 (see frontend-sync.log) updates it once the new tunnel is stable.") "WARN"
     }
 }
 
@@ -189,6 +210,14 @@ function Initialize-TunnelUrl {
             return
         }
     }
+}
+
+# Frontend URL sync runs as its own hidden process (a rebuild + deploy takes minutes);
+# sync-frontend.ps1 holds the guards and exits at once when nothing changed.
+function Start-FrontendSync {
+    if (@(Get-Procs "powershell.exe" @("sync-frontend\.ps1")).Count -gt 0) { return }
+    Start-Hidden "powershell.exe" @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+        "-File", $SyncPs1, "-Mode", "sync", "-Auto") | Out-Null
 }
 
 # --- the supervisor ----------------------------------------------------------------------------
@@ -223,10 +252,14 @@ function Invoke-Supervisor {
             tunnel = @{ fails = 0; restarts = 0; next = [datetime]::MinValue; started = [datetime]::MinValue }
         }
         $lastDeep = [datetime]::MinValue
+        $lastSync = [datetime]::MinValue
         $firstPass = $true
 
         while (-not (Test-Path $StopFlag)) {
-            $now = Get-Date
+          $now = Get-Date
+          # One bad pass (WMI not ready right after boot, a file lock, ...) must not end
+          # the supervisor: log it and try again on the next pass.
+          try {
 
             # 2. API -- one instance; restart if it dies or stops answering.
             $api = @(Get-ApiProcs)
@@ -305,6 +338,13 @@ function Invoke-Supervisor {
                         $ws.fails = 0
                     }
                 } else { $ws.fails = 0 }
+                if ($tunnel.Count -gt 0) {
+                    $logged = Find-TunnelUrl @((Join-Path $LogDir "tunnel.log"))
+                    if ($logged -and $logged -ne (Get-TunnelUrl) -and (Test-Http "$logged/api/v1/health" 15)) {
+                        Set-Content -Path $UrlFile -Value $logged -Encoding ASCII
+                        Write-Log "Tunnel URL (from tunnel.log): $logged"
+                    }
+                }
                 $url = Get-TunnelUrl
                 $ts = $state.tunnel
                 if ($url -and $tunnel.Count -gt 0) {
@@ -321,10 +361,26 @@ function Invoke-Supervisor {
                 }
             }
 
+            # 6. Frontend URL sync (part B, separate from keeping the services up).
+            if ((Get-TunnelUrl) -and ($now - $lastSync).TotalMinutes -ge 5 -and ($now - $state.tunnel.started).TotalSeconds -ge 60) {
+                $lastSync = $now
+                Start-FrontendSync
+            }
+
+            # Services that stayed up for 10 minutes get their restart back-off reset.
+            foreach ($k in @("worker", "tunnel")) {
+                if (($now - $state[$k].started).TotalMinutes -gt 10) { $state[$k].restarts = 0 }
+            }
             $firstPass = $false
-            for ($i = 0; $i -lt 6 -and -not (Test-Path $StopFlag); $i++) { Start-Sleep -Seconds 5 }
+          } catch {
+            Write-Log ("Supervisor pass failed: {0} (line {1}); continuing" -f $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber) "ERROR"
+          }
+          for ($i = 0; $i -lt 6 -and -not (Test-Path $StopFlag); $i++) { Start-Sleep -Seconds 5 }
         }
         Write-Log "Stop requested; supervisor exiting"
+    } catch {
+        Write-Log ("Supervisor crashed: {0} (line {1})" -f $_.Exception.Message, $_.InvocationInfo.ScriptLineNumber) "ERROR"
+        throw
     } finally {
         $mutex.ReleaseMutex()
         $mutex.Dispose()
@@ -373,8 +429,7 @@ function Start-Supervisor {
             Start-ScheduledTask -TaskName $TaskName
             Write-Log "Started the scheduled task '$TaskName'."
         } else {
-            Start-Process -FilePath "powershell.exe" -WindowStyle Hidden -ArgumentList `
-                "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Action run"
+            Start-Hidden "powershell.exe" (Get-SupervisorArgs) | Out-Null
             Write-Log "Started the supervisor (task not installed)."
         }
     }
@@ -397,22 +452,31 @@ function Stop-All {
     Write-Log "SANA GTM stopped."
 }
 
+function Get-SupervisorArgs {
+    @("-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", $PSCommandPath, "-Action", "run")
+}
+
 function Install-Task {
     $user = "$env:USERDOMAIN\$env:USERNAME"
-    $action = New-ScheduledTaskAction -Execute "powershell.exe" -WorkingDirectory $Root -Argument `
-        "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`" -Action run"
+    # Task Scheduler cannot start a console program without a console window, so the task
+    # runs pythonw.exe (a GUI program: no console at all), which starts
+    #   powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File sana-gtm.ps1 -Action run
+    # with CREATE_NO_WINDOW and waits for it (so the task shows Running while the supervisor runs).
+    $psArgs = (Get-SupervisorArgs | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join " "
+    $action = New-ScheduledTaskAction -Execute $Pythonw -WorkingDirectory $Root -Argument `
+        "`"$Launcher`" --cwd `"$Root`" --stdout `"$(Join-Path $LogDir 'supervisor.out.log')`" --stderr `"$(Join-Path $LogDir 'supervisor.err.log')`" --wait -- powershell.exe $psArgs"
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
     $trigger.Delay = "PT30S"   # let the network come up after logon
-    # A second trigger re-fires every 5 minutes (while this user is logged on): if the
-    # supervisor ever exits it is back within 5 minutes. A running supervisor makes the
-    # repeat a no-op (IgnoreNew + the single-instance mutex).
-    $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 5)
+    # A second trigger re-fires every minute (while this user is logged on): if the
+    # supervisor ever exits it is back within a minute. While the supervisor runs the
+    # repeat does nothing (IgnoreNew: no process is even started).
+    $watchdog = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 1)
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable `
         -ExecutionTimeLimit ([TimeSpan]::Zero) -RestartCount 999 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
     $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
     Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($trigger, $watchdog) -Settings $settings -Principal $principal `
         -Description "Starts and supervises the SANA GTM API, worker and Cloudflare quick tunnel on this PC ($Root)." -Force | Out-Null
-    Write-Log "Installed scheduled task '$TaskName' (at logon of $user, 30 s delay, re-checked every 5 minutes)."
+    Write-Log "Installed scheduled task '$TaskName' (at logon of $user, 30 s delay, watchdog every minute, no console window)."
 }
 
 function Uninstall-Task {

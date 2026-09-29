@@ -890,16 +890,27 @@ The worker's maintenance (every 30 s) re-queues tasks whose lease expired, so a
 scraper run interrupted by a crash or reboot resumes when the worker starts again.
 
 **Automatic start on this PC.** `install-sana-gtm-autostart.bat` registers the
-scheduled task **SANA GTM Auto Start** (at logon, plus a 5-minute watchdog). It
-runs `deploy\windows\sana-gtm\sana-gtm.ps1 -Action run`, a hidden supervisor that
+scheduled task **SANA GTM Auto Start** (at logon, plus a 1-minute watchdog). It
+runs `deploy\windows\sana-gtm\sana-gtm.ps1 -Action run`, a supervisor that
 waits for the database, starts the API (waits for `/api/v1/health`), the worker and
 the quick tunnel, adopts processes that are already running, and restarts whatever
 stops. `start-sana-gtm.bat`, `stop-sana-gtm.bat` and `status-sana-gtm.bat`
 (PostgreSQL / API / Worker / Tunnel ONLINE/OFFLINE, Overall READY/NOT READY) wrap
 it; logs are in `logs\sana-gtm\`. The database is the hosted Supabase one: it is
-checked, never started. A restarted quick tunnel has a **new URL** -- the supervisor
-logs it and status shows the mismatch; the frontend is never redeployed
-automatically.
+checked, never started. A restarted quick tunnel has a **new URL**;
+`sync-frontend.ps1` (run by the supervisor every 5 minutes, with guards) rebuilds and
+redeploys the frontend for it.
+
+Nothing it starts opens a window. The task runs `pythonw.exe launch_hidden.py --wait --
+powershell.exe ... -WindowStyle Hidden -File sana-gtm.ps1 -Action run`, and the
+supervisor starts python (API, worker), cloudflared and the frontend build/deploy
+through `launch_hidden.py` as well: `CREATE_NO_WINDOW`, stdin NUL, output to
+`logs\sana-gtm\*.log`. `-WindowStyle Hidden` / `Start-Process -WindowStyle Hidden`
+alone are not enough on Windows 11: they create a normal console and hide it
+afterwards, and the console is handed to Windows Terminal, which shows it. The
+`run-sanagtm-*.bat` files are for starting things by hand only.
+`verify-sana-gtm.ps1 [-KillTests]` checks all of this, including that no SANA GTM
+process has a console window (`console_window.py`).
 
 ## Running the worker on another host
 
