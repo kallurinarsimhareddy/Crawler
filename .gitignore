@@ -49,3 +49,6 @@ state/
 *.db
 *.db-wal
 *.db-shm
+
+# SANA GTM startup manager logs
+logs/

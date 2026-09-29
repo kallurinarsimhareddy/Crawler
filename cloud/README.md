@@ -889,6 +889,18 @@ reliable confirmation and reset emails.
 The worker's maintenance (every 30 s) re-queues tasks whose lease expired, so a
 scraper run interrupted by a crash or reboot resumes when the worker starts again.
 
+**Automatic start on this PC.** `install-sana-gtm-autostart.bat` registers the
+scheduled task **SANA GTM Auto Start** (at logon, plus a 5-minute watchdog). It
+runs `deploy\windows\sana-gtm\sana-gtm.ps1 -Action run`, a hidden supervisor that
+waits for the database, starts the API (waits for `/api/v1/health`), the worker and
+the quick tunnel, adopts processes that are already running, and restarts whatever
+stops. `start-sana-gtm.bat`, `stop-sana-gtm.bat` and `status-sana-gtm.bat`
+(PostgreSQL / API / Worker / Tunnel ONLINE/OFFLINE, Overall READY/NOT READY) wrap
+it; logs are in `logs\sana-gtm\`. The database is the hosted Supabase one: it is
+checked, never started. A restarted quick tunnel has a **new URL** -- the supervisor
+logs it and status shows the mismatch; the frontend is never redeployed
+automatically.
+
 ## Running the worker on another host
 
 The worker is deliberately provider-neutral. It is a plain Python process whose
