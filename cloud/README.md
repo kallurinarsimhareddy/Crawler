@@ -826,6 +826,53 @@ cloud\.venv\Scripts\python -m cloud.ops.staging_e2e --api https://api-staging.<d
 Also check the dashboard manually: sign in, create a job, watch live progress,
 use the job list and detail pages, cancel a job, and download results.
 
+## SANA GTM staging (sanagtm.pages.dev)
+
+The public SANA GTM frontend is the Cloudflare Pages project **`sanagtm`**
+(direct upload, production branch `main`) at <https://sanagtm.pages.dev>. The
+older project `sanagtm-legacy` still serves `careercrawler-staging.pages.dev`.
+
+```
+browser ── https://sanagtm.pages.dev (static build, strict CSP, noindex)
+   │  email/password sign-in ──► Supabase Auth, staging project zqbbcaehvpstunxphxxj
+   │  Bearer <Supabase access token>
+   ▼
+https://<random>.trycloudflare.com  (Cloudflare quick tunnel)
+   ▼
+this machine: API on 127.0.0.1:8100 — CAREERCLOUD_AUTH_MODE=supabase, CORS https://sanagtm.pages.dev,
+              database sanagtm_staging on the embedded PostgreSQL (separate from development data)
+```
+
+- `cloud/api/.env.sana-staging` (git-ignored) holds the API settings. It runs
+  with `CAREERCLOUD_ENV=development`, like the CareerCloud staging API: the full
+  `staging` checks require Upstash Redis, a TLS database, S3 storage and the
+  resource registry, which this arrangement does not use. Dev sign-in is off
+  (`/auth/dev-session` is 404 in Supabase mode); only verified Supabase ES256
+  tokens are accepted.
+- `cloud/web/.env.staging.local` (git-ignored) holds the build's public values:
+  `VITE_AUTH_MODE=supabase`, the Supabase URL and anon key, and `VITE_API_URL`.
+
+Start it:
+
+```powershell
+run-sanagtm-staging.bat                                              # API on 127.0.0.1:8100
+& "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel --no-autoupdate --url http://127.0.0.1:8100
+```
+
+A quick tunnel gets a **new URL every time it starts**. When it changes, set
+`VITE_API_URL` in `cloud/web/.env.staging.local` and redeploy:
+
+```powershell
+cd cloud\web; npm run build:staging
+npx wrangler pages deploy dist --project-name sanagtm --branch main
+```
+
+A stable API hostname needs a domain on the Cloudflare account and a named tunnel
+(then `VITE_API_URL` never changes). In Supabase → Authentication → URL
+configuration, set the Site URL to `https://sanagtm.pages.dev` and add
+`https://sanagtm.pages.dev/**` to the redirect URLs, so confirmation and reset
+emails link back to SANA GTM (password sign-in itself does not depend on it).
+
 ## Running the worker on another host
 
 The worker is deliberately provider-neutral. It is a plain Python process whose
