@@ -425,6 +425,22 @@ def _has_id(url: str) -> bool:
     return bool(segments) and bool(_ID_SEGMENT.search(segments[-1]))
 
 
+#: A class token that names the employer itself (``company``, ``listing-company-name``,
+#: ``employer``…), not something *about* it (``listing-company-category``, ``company-logo``).
+_COMPANY_TOKEN = re.compile(r"(?:^|[-_])(?:company|employer|organi[sz]ation|hiring-?org)(?:[-_]name)?$", re.I)
+
+
+def _company_in_card(card: Any) -> Optional[str]:
+    """Text of the most specific element in a job card whose class token names the company."""
+    found: List[str] = []
+    for tag in card.find_all(True):
+        if any(_COMPANY_TOKEN.search(token) for token in (tag.get("class") or [])):
+            text = _clean(tag.get_text(" "), 300)
+            if text:
+                found.append(text)
+    return min(found, key=len) if found else None
+
+
 def _link_job(anchor: Any, href: str, page_url: str) -> Optional[Dict[str, FieldValue]]:
     text = _clean(anchor.get_text(" "), 300) or ""
     heading = anchor.find(["h1", "h2", "h3", "h4", "h5", "h6"]) or None
@@ -447,7 +463,7 @@ def _link_job(anchor: Any, href: str, page_url: str) -> Optional[Dict[str, Field
     }
     scope = anchor if title_el is not None else card
     if card is not None:
-        company = _by_class(card, "company", "employer", "organization", "organisation")
+        company = _company_in_card(card)
         if company and company != title:
             company = company[len(title):].strip(" ,-–—|:") if company.startswith(title) else company
             if company and len(company) <= 150:

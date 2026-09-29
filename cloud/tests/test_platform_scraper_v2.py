@@ -1226,3 +1226,48 @@ class PythonOrgRegressionTests(unittest.TestCase):
         page, f = self.run_board(empty)
         calls = f.http._session.calls
         self.assertFalse(any(("/type" in u or "howto" in u or "/location/" in u) for u in calls), calls)
+
+
+CATEGORY_ITEM = """<li><h2 class="listing-company"><span class="listing-company-name">
+  <a href="/jobs/{id}/">{title}</a><br/>{company}</span>
+  <span class="listing-location"><a href="/jobs/location/{loc_slug}/">{loc}</a></span></h2>
+  <span class="listing-job-type"><a href="/jobs/type/back-end/">Back end</a></span>
+  <span class="listing-posted">Posted: <time datetime="2026-09-2{day}T08:00:00+00:00">2{day} September 2026</time></span>
+  <span class="listing-company-category"><a href="/jobs/category/developer-engineer/">Developer / Engineer</a></span></li>"""
+DECORATED_DETAIL = """<html><head><title>Job: {title} at {company} | Python.org</title>
+<meta property="og:title" content="Job: {title} at {company}"></head><body>
+<nav><a href="/jobs/">Jobs</a></nav><main><h1 class="listing-company"><span class="company-name">{title}</span></h1>
+<p>We need 5+ years of experience with Python and Django. {company} is hiring.</p></main></body></html>"""
+
+
+class LiveFindingsRegressionTests(unittest.TestCase):
+    """Found by the final live python.org run: a card's category element was read as the
+    company, and a detail page's decorated og:title replaced the clean listing title."""
+
+    def test_company_and_title_survive_detail_merge(self) -> None:
+        jobs = [{"id": 8139, "title": "Senior Staff Engineer", "company": "Kraken", "loc": "Remote (UK / EU)",
+                 "loc_slug": "remote-uk-eu", "day": 8},
+                {"id": 8137, "title": "Django Developer", "company": "Widget Ltd", "loc": "Birmingham, UK",
+                 "loc_slug": "birmingham-uk", "day": 7}]
+        listing_html = PYORG.replace("{items}", "".join(CATEGORY_ITEM.format(**j) for j in jobs)).replace("{next}", "")
+        pages = {"https://www.python.org/jobs/": (200, listing_html),
+                 "https://www.python.org/jobs/8139/": (200, DECORATED_DETAIL.format(title="Senior Staff Engineer",
+                                                                                   company="Kraken"))}
+        page, _ = crawl("https://www.python.org/jobs/", "Find all job titles, job URLs, company name and description.",
+                        pages, follow_details=True, max_detail_pages=1)
+        rows = values(page)
+        self.assertEqual([r["company_name"] for r in rows], ["Kraken", "Widget Ltd"], "never the category")
+        self.assertEqual(rows[0]["job_title"], "Senior Staff Engineer", "the listing title is kept")
+        first = page.records[0]
+        self.assertEqual(first["job_title"].source_url, "https://www.python.org/jobs/")
+        self.assertIn("Job: Senior Staff Engineer at Kraken", [a.value for a in first["job_title"].alternatives])
+        self.assertIn("5+ years", first["description"].value, "detail data still merges")
+        self.assertEqual(first["description"].source_url, "https://www.python.org/jobs/8139/")
+
+    def test_a_structured_detail_title_may_still_win(self) -> None:
+        from cloud.intel.scraper.detail import merge_job
+
+        listing = {"job_title": FieldValue("ERP Lead", "link", 0.7, "a", "https://l")}
+        merged = merge_job(listing, {"job_title": FieldValue("ERP Lead (SAP)", "json-ld", 0.95, "ld", "https://d")})
+        self.assertEqual(merged["job_title"].value, "ERP Lead (SAP)")
+        self.assertEqual([a.value for a in merged["job_title"].alternatives], ["ERP Lead"])

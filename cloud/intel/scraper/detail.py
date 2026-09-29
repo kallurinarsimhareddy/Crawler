@@ -143,9 +143,20 @@ def extract_detail(html: str, url: str) -> Dict[str, FieldValue]:
 
 
 def merge_job(listing: Dict[str, FieldValue], detail: Dict[str, FieldValue]) -> Dict[str, FieldValue]:
-    """Listing + detail, field by field, by evidence precedence (conflicts kept)."""
+    """Listing + detail, field by field, by evidence precedence (conflicts kept).
+
+    The job title is the exception: a listing already names the posting, and a detail
+    page's ``og:title`` / ``<h1>`` is often decorated ("Job: X at Y | Site"). Only a
+    structured ``JobPosting.title`` may replace it; any other detail title is kept as an
+    alternative."""
     merged: Dict[str, FieldValue] = dict(listing)
     for name, fv in detail.items():
+        if name == "job_title" and "job_title" in merged and fv.method != "json-ld":
+            current = merged["job_title"]
+            if fv.value != current.value and all(a.value != fv.value for a in current.alternatives):
+                current.alternatives.append(FieldValue(fv.value, fv.method, fv.confidence, fv.evidence,
+                                                       fv.source_url, fv.browser))
+            continue
         merged[name] = merge_value(merged.get(name), fv)
     return merged
 
