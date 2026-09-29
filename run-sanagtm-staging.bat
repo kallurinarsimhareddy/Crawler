@@ -34,7 +34,12 @@ if "%BASE_URL%"=="" (
     echo  [X] The embedded PostgreSQL did not start.
     goto :fail
 )
-set "CAREERCLOUD_DATABASE_URL=%BASE_URL:/postgres=/sanagtm_staging%"
+REM localpg prints ...@127.0.0.1:<port>/postgres; swap only that trailing database name.
+if not "%BASE_URL:~-9%"=="/postgres" (
+    echo  [X] Unexpected embedded PostgreSQL URL.
+    goto :fail
+)
+set "CAREERCLOUD_DATABASE_URL=%BASE_URL:~0,-9%/sanagtm_staging"
 
 echo  Starting the SANA GTM staging API on http://127.0.0.1:8100 ... (Ctrl+C to stop)
 "%PYTHON%" -m uvicorn cloud.api.main:app --host 127.0.0.1 --port 8100 --env-file "%ENV_FILE%" --proxy-headers
