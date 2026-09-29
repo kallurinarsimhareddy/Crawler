@@ -439,6 +439,42 @@ class AIExtractionTests(unittest.TestCase):
         self.assertIn("Free AI quota exhausted", budget.note)
         self.assertIn("rules only", budget.note)
 
+    def test_ai_success_is_not_reported_as_a_failure(self) -> None:
+        ai = FakeAI({"industry": {"value": "Energy equipment", "evidence": "hydraulic valves for the energy sector"}})
+        budget = AIBudget(ai, 5)
+        page = scrape_one("https://www.acme-mfg.com/", instruction_to_schema("Get company name and industry"),
+                          pages_fetcher(), budget)
+        self.assertEqual(values(page)[0]["industry"], "Energy equipment")
+        self.assertTrue(page.ai_used)
+        self.assertEqual((budget.calls, budget.failures), (1, 0))
+        self.assertIsNone(budget.summary)
+        self.assertFalse(any("AI" in p for p in page.problems))
+
+    def test_ai_failure_is_noted_on_the_page_and_the_run(self) -> None:
+        from cloud.intel.ai.base import AIRetryable
+
+        ai = FakeAI(AIRetryable("AI provider returned 503"))
+        budget = AIBudget(ai, 5)
+        page = scrape_one("https://www.acme-mfg.com/", instruction_to_schema("Get company name and industry"),
+                          pages_fetcher(), budget)
+        self.assertIn("AI extraction skipped: AI provider returned 503", page.problems)
+        self.assertEqual(values(page)[0], {"company_name": "Acme Manufacturing"}, "rules still work, nothing invented")
+        self.assertFalse(page.ai_used)
+        self.assertEqual((len(ai.prompts), budget.calls, budget.failures), (1, 1, 1), "not retried")
+        self.assertEqual(budget.summary, "1 AI call failed (last: AI provider returned 503); "
+                                         "the fields asked for were left empty")
+        self.assertIsNotNone(budget.provider, "a transient failure does not switch AI off for later pages")
+
+    def test_ai_failure_summary_keeps_the_stop_reason(self) -> None:
+        from cloud.intel.ai.base import AIRetryable
+
+        budget = AIBudget(FakeAI(AIRetryable("AI provider returned 503"), AIUnavailable("Free AI quota exhausted")), 5)
+        schema = instruction_to_schema("Get company name and industry")
+        for url in ("https://www.acme-mfg.com/", "https://beta.example/"):
+            scrape_one(url, schema, pages_fetcher(), budget)
+        self.assertIn("Free AI quota exhausted", budget.summary)
+        self.assertIn("1 AI call failed (last: AI provider returned 503)", budget.summary)
+
     def test_ai_call_limit(self) -> None:
         ai = FakeAI(*[{"industry": None}] * 5)
         budget = AIBudget(ai, 1)
@@ -719,6 +755,66 @@ class GeminiQuotaRunTests(unittest.TestCase):
         self.assertEqual([r["industry"] for r in payload["records"]], [None, None], "nothing invented")
         usage = store.all(ctx.as_system(), "ai_usage")
         self.assertTrue(all((u["estimated_cost_usd"] or 0) == 0 for u in usage))
+
+
+class GeminiFailureRunTests(unittest.TestCase):
+    """A run in free-only Gemini mode through the real provider layer: one call that
+    Gemini answers with 503 (the live-test case) and one that succeeds."""
+
+    def run_with(self, *responses):
+        from cloud.intel.ai.rest import GeminiProvider
+        from cloud.tests.test_platform_ai_providers import GeminiSession
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        store = MemoryStore()
+        user = str(uuid.uuid4())
+        ws = store.create_workspace(user, "W", f"w-{uuid.uuid4().hex[:8]}")
+        ctx = Ctx(ws["id"], user, "owner", ai_external_allowed=True)
+        store.update_workspace(ctx, ai_external_allowed=True,
+                               settings={"ai": {"provider": "gemini", "model": "gemini-3.8-flash", "free_only": True,
+                                                "max_budget_usd": 0}})
+        platform = Platform(store, storage=LocalFileStorage(Path(scratch.name)),
+                            config=PlatformConfig(extra={"fetcher_factory": lambda: fetcher_for(PAGES)}))
+        session = GeminiSession(*responses)
+        registry = platform.service("ai")
+        registry._factory = lambda name, model, secrets=None, settings=None: GeminiProvider(  # noqa: SLF001
+            model=model, api_key="g-key-12345678", session=session, free_tier=True)
+        registry._cache.clear()  # noqa: SLF001
+        run = platform.service("scraper").start(ctx, ["https://www.acme-mfg.com/"], "Get company name and industry",
+                                                max_ai_calls=1)
+        self.assertEqual(run_task_inline(platform, ctx.workspace_id, run["task_id"])["status"], "completed")
+        run = store.get(ctx, "scrape_runs", run["id"])
+        result = store.all(ctx, "scrape_results", {"run_id": run["id"]})[0]
+        return store, ctx, session, run, result
+
+    def test_a_failed_gemini_call_shows_at_run_and_page_level(self) -> None:
+        store, ctx, session, run, result = self.run_with((503, {"error": {"code": 503, "status": "UNAVAILABLE",
+                                                                          "message": "The model is overloaded."}}))
+        self.assertEqual(len(session.calls), 1, "Gemini is not retried")
+        page_note = next(p for p in result["problems"] if p.startswith("AI extraction skipped:"))
+        self.assertIn("503", page_note)
+        for note in (run["stats"]["ai_note"], run["stats"]["progress"]["ai_note"]):
+            self.assertIn("1 AI call failed", note)
+            self.assertIn("503", note)
+        self.assertEqual((run["stats"]["ai_failures"], run["stats"]["progress"]["ai_failures"]), (1, 1))
+        self.assertEqual(result["data"]["records"][0]["industry"], None, "nothing invented")
+        usage = store.all(ctx.as_system(), "ai_usage")
+        self.assertEqual([u["success"] for u in usage], [False])
+        self.assertTrue(all((u["estimated_cost_usd"] or 0) == 0 for u in usage), "$0")
+
+    def test_a_successful_gemini_call_reports_no_failure(self) -> None:
+        from cloud.tests.test_platform_ai_providers import gemini_function_call
+
+        answer = {"industry": {"value": "Energy equipment", "evidence": "hydraulic valves for the energy sector"}}
+        store, ctx, session, run, result = self.run_with(gemini_function_call(answer))
+        self.assertEqual(len(session.calls), 1)
+        self.assertIsNone(run["stats"]["ai_note"])
+        self.assertEqual(run["stats"]["ai_failures"], 0)
+        self.assertFalse(any(p.startswith("AI extraction skipped") for p in result["problems"]))
+        self.assertEqual(result["data"]["records"][0]["industry"], "Energy equipment")
+        self.assertTrue(result["data"]["ai_used"])
+        self.assertTrue(all((u["estimated_cost_usd"] or 0) == 0 for u in store.all(ctx.as_system(), "ai_usage")))
 
 
 class ScraperApiTests(unittest.TestCase):

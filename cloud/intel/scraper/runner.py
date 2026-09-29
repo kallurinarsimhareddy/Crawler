@@ -46,13 +46,27 @@ MAX_FOLLOW = 2
 
 class AIBudget:
     """The run's AI: at most ``max_calls`` calls, switched off for the rest of the run
-    as soon as the provider is unavailable (free quota used up, not allowed…)."""
+    as soon as the provider is unavailable (free quota used up, not allowed…).
+
+    A call that fails (e.g. the provider answers 503) is noted on its page and also
+    counted here, so the run's summary says AI did not help; the call is not retried."""
 
     def __init__(self, provider: Any, max_calls: int, note: Optional[str] = None) -> None:
         self.provider = provider
         self.max_calls = max_calls
         self.calls = 0
         self.note = note
+        self.failures = 0
+        self.last_failure: Optional[str] = None
+
+    @property
+    def summary(self) -> Optional[str]:
+        """What the run reports about AI: why it stopped, and any failed calls."""
+        parts = [self.note] if self.note else []
+        if self.failures:
+            parts.append(f"{self.failures} AI call{'s' if self.failures > 1 else ''} failed "
+                         f"(last: {self.last_failure}); the fields asked for were left empty")
+        return "; ".join(parts) or None
 
     @property
     def available(self) -> bool:
@@ -78,6 +92,8 @@ class AIBudget:
             self.note = f"{error} — the rest of the run used rules only"
             problems.append(f"AI not used: {error}")
         except AIError as error:
+            self.failures += 1
+            self.last_failure = str(error)[:200]
             problems.append(f"AI extraction skipped: {str(error)[:200]}")
         return False
 
@@ -301,7 +317,7 @@ def run_scrape_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: 
                          failed=progress.state["failed"] + (0 if ok else 1),
                          pages=progress.state["pages"] + len(page.pages),
                          records=progress.state["records"] + len(rows),
-                         ai_calls=ai.calls, ai_note=ai.note)
+                         ai_calls=ai.calls, ai_failures=ai.failures, ai_note=ai.summary)
         return _finish(platform, ctx, progress, schema, inputs, ai, status="completed")
     except (TaskCancelled, TaskPaused):
         raise
@@ -341,7 +357,8 @@ def _finish(platform: Any, ctx: Ctx, progress: _Progress, schema: Mapping[str, A
     progress.set(stage="Saving")
     summary = {"inputs": len(inputs), "processed": len(results), "outcomes": outcomes, "records": len(records),
                "duplicates_removed": duplicates, "filtered_out": filtered_out, "validation_problems": problems,
-               "ai_calls": ai.calls, "ai_note": ai.note, "status": status}
+               "ai_calls": ai.calls, "ai_failures": ai.failures, "ai_note": ai.summary,
+               "status": status}
     files = write_outputs(platform.storage, f"platform/{ctx.workspace_id}/scrape/{run['id']}", run["id"], schema,
                           records, pages, summary)
     counts = {"ok": 0, "blocked": 0, "error": 0, "empty": 0}
@@ -349,7 +366,7 @@ def _finish(platform: Any, ctx: Ctx, progress: _Progress, schema: Mapping[str, A
         counts[row["status"]] = counts.get(row["status"], 0) + 1
     stats = {**progress.run["stats"], "counts": counts, "outcomes": outcomes, "records": len(records),
              "duplicates_removed": duplicates, "filtered_out": filtered_out, "validation_problems": problems,
-             "files": files, "ai_calls": ai.calls, "ai_note": ai.note,
+             "files": files, "ai_calls": ai.calls, "ai_failures": ai.failures, "ai_note": ai.summary,
              "progress": {**progress.state, "stage": "Done" if status == "completed" else "Cancelled",
                           "records": len(records), "finished_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}}
     store.update(ctx, "scrape_runs", run["id"], {"status": status, "stats": stats})
