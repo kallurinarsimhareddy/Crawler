@@ -465,7 +465,10 @@ def _link_job(anchor: Any, href: str, page_url: str) -> Optional[Dict[str, Field
     if card is not None:
         company = _company_in_card(card)
         if company and company != title:
-            company = company[len(title):].strip(" ,-–—|:") if company.startswith(title) else company
+            # The company element often also holds the title link and badges ("New"):
+            # the employer is what follows the title.
+            if title in company:
+                company = company.split(title, 1)[1].strip(" ,-–—|:")
             if company and len(company) <= 150:
                 job["company_name"] = _fv(company, method, page_url, "company element in the job card", 0.75)
         stamp = card.find("time", attrs={"datetime": True})

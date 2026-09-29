@@ -1271,3 +1271,13 @@ class LiveFindingsRegressionTests(unittest.TestCase):
         merged = merge_job(listing, {"job_title": FieldValue("ERP Lead (SAP)", "json-ld", 0.95, "ld", "https://d")})
         self.assertEqual(merged["job_title"].value, "ERP Lead (SAP)")
         self.assertEqual([a.value for a in merged["job_title"].alternatives], ["ERP Lead"])
+
+    def test_a_badge_before_the_title_does_not_leak_into_the_company(self) -> None:
+        item = CATEGORY_ITEM.replace('<span class="listing-company-name">',
+                                     '<span class="listing-company-name"><span class="listing-new">New</span> ')
+        jobs = [{"id": 8137, "title": "Django Developer", "company": "The Developer Society", "loc": "Birmingham, UK",
+                 "loc_slug": "birmingham-uk", "day": 7}]
+        listing_html = PYORG.replace("{items}", "".join(item.format(**j) for j in jobs)).replace("{next}", "")
+        page, _ = crawl("https://www.python.org/jobs/", "Find all job titles and company name.",
+                        {"https://www.python.org/jobs/": (200, listing_html)})
+        self.assertEqual(values(page), [{"job_title": "Django Developer", "company_name": "The Developer Society"}])
