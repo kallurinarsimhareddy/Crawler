@@ -4,7 +4,7 @@ import { useAuth } from "../auth/AuthProvider";
 import { ErrorBanner } from "../components/Feedback";
 
 export function Login() {
-  const { mode, session, signIn, signUp, configured } = useAuth();
+  const { mode, session, signIn, signUp, requestPasswordReset, configured } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
   const from = (location.state as { from?: string } | null)?.from ?? "/";
@@ -12,6 +12,7 @@ export function Login() {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [creating, setCreating] = useState(false);
+  const [forgot, setForgot] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -24,7 +25,10 @@ export function Login() {
     setError(null);
     setNotice(null);
     try {
-      if (mode === "supabase" && creating) {
+      if (mode === "supabase" && forgot) {
+        await requestPasswordReset(email.trim());
+        setNotice("If an account exists for that email, a reset link is on its way. Open it on this device.");
+      } else if (mode === "supabase" && creating) {
         const message = await signUp(email.trim(), password);
         if (message) setNotice(message);
         else navigate(from, { replace: true });
@@ -54,11 +58,13 @@ export function Login() {
           <span>SANA GTM</span>
         </div>
         <div>
-          <h1 className="auth-title">{dev ? "Local development sign-in" : creating ? "Create your account" : "Sign in"}</h1>
+          <h1 className="auth-title">{dev ? "Local development sign-in" : forgot ? "Reset your password" : creating ? "Create your account" : "Sign in"}</h1>
           <p className="muted small">
             {dev
               ? "Development mode: enter any email. Tokens are issued by your local API and never work in production."
-              : "Use the email and password for your SANA GTM account."}
+              : forgot
+                ? "Enter your account email and we'll send you a link to choose a new password."
+                : "Use the email and password for your SANA GTM account."}
           </p>
         </div>
 
@@ -73,7 +79,7 @@ export function Login() {
           <input id="email" className="input" type="email" autoComplete="email" required value={email} onChange={(e) => setEmail(e.target.value)} />
         </div>
 
-        {!dev && (
+        {!dev && !forgot && (
           <div className="field">
             <label className="field__label" htmlFor="password">Password</label>
             <input
@@ -93,12 +99,25 @@ export function Login() {
         {notice && <p className="alert alert--info">{notice}</p>}
 
         <button type="submit" className="button button--primary button--large" disabled={busy || !configured || !email}>
-          {busy ? "Please wait…" : dev ? "Continue" : creating ? "Create account" : "Sign in"}
+          {busy ? "Please wait…" : dev ? "Continue" : forgot ? "Send reset link" : creating ? "Create account" : "Sign in"}
         </button>
 
-        {!dev && configured && (
+        {!dev && configured && !forgot && (
           <button type="button" className="link link-button" onClick={() => setCreating((value) => !value)}>
             {creating ? "Already have an account? Sign in" : "New here? Create an account"}
+          </button>
+        )}
+        {!dev && configured && !creating && (
+          <button
+            type="button"
+            className="link link-button"
+            onClick={() => {
+              setForgot((value) => !value);
+              setError(null);
+              setNotice(null);
+            }}
+          >
+            {forgot ? "Back to sign in" : "Forgot your password?"}
           </button>
         )}
       </form>

@@ -17,6 +17,10 @@ interface AuthState {
   signIn: (email: string, password?: string) => Promise<void>;
   signUp: (email: string, password: string) => Promise<string>;
   signOut: () => Promise<void>;
+  /** Email a password-reset link that opens /reset-password on this site. */
+  requestPasswordReset: (email: string) => Promise<void>;
+  /** Set a new password for the signed-in (or reset-link) session. */
+  updatePassword: (password: string) => Promise<void>;
 }
 
 const AuthContext = createContext<AuthState | null>(null);
@@ -135,6 +139,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (error) throw new Error(error.message);
   }, []);
 
+  const requestPasswordReset = useCallback(async (email: string) => {
+    if (!supabase.current) throw new Error("Password reset is not configured.");
+    const { error } = await supabase.current.auth.resetPasswordForEmail(email, {
+      redirectTo: `${window.location.origin}/reset-password`,
+    });
+    if (error) throw new Error(error.message);
+  }, []);
+
+  const updatePassword = useCallback(async (password: string) => {
+    if (!supabase.current) throw new Error("Password reset is not configured.");
+    const { error } = await supabase.current.auth.updateUser({ password });
+    if (error) throw new Error(error.message);
+  }, []);
+
   const signUp = useCallback(async (email: string, password: string) => {
     if (!supabase.current) throw new Error("Sign-up is not configured.");
     const { data, error } = await supabase.current.auth.signUp({ email, password });
@@ -143,8 +161,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const value = useMemo<AuthState>(
-    () => ({ mode: MODE, ready, session, configured, signIn, signUp, signOut }),
-    [ready, session, configured, signIn, signUp, signOut],
+    () => ({ mode: MODE, ready, session, configured, signIn, signUp, signOut, requestPasswordReset, updatePassword }),
+    [ready, session, configured, signIn, signUp, signOut, requestPasswordReset, updatePassword],
   );
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
 }

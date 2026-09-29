@@ -839,14 +839,23 @@ browser ── https://sanagtm.pages.dev (static build, strict CSP, noindex)
    ▼
 https://<random>.trycloudflare.com  (Cloudflare quick tunnel)
    ▼
-this machine: API on 127.0.0.1:8100 — CAREERCLOUD_AUTH_MODE=supabase, CORS https://sanagtm.pages.dev,
-              database sanagtm_staging on the embedded PostgreSQL (separate from development data)
+this machine: API on 127.0.0.1:8100 — CAREERCLOUD_AUTH_MODE=supabase, CORS https://sanagtm.pages.dev
+   │                                     platform worker (run-sanagtm-worker.bat)
+   ├──► Supabase PostgreSQL (staging project, session pooler, TLS) — migrations 0001–0006, RLS
+   └──► Upstash Redis (rediss://, TLS) — queue prefix sanagtm:staging
 ```
 
-- `cloud/api/.env.sana-staging` (git-ignored) holds the API settings. It runs
-  with `CAREERCLOUD_ENV=development`, like the CareerCloud staging API: the full
-  `staging` checks require Upstash Redis, a TLS database, S3 storage and the
-  resource registry, which this arrangement does not use. Dev sign-in is off
+**This machine must stay on** (API, worker and tunnel all run here) until the
+API moves to a server.
+
+- `cloud/api/.env.sana-cloud` and `cloud/worker/.env.sana-cloud` (git-ignored)
+  hold the API and worker settings: the staging Supabase database URL
+  (`CAREERCLOUD_DB_USER_ROLE=authenticated`, so RLS applies), the Upstash URL,
+  `CAREERCLOUD_QUEUE_PREFIX=sanagtm:staging` and the platform secrets key. They run
+  with `CAREERCLOUD_ENV=development` + `CAREERCLOUD_ALLOW_REMOTE_SERVICES=1`, like
+  the CareerCloud staging API: the full `staging` checks also require S3 storage
+  and the resource registry, which this arrangement does not use (exports are
+  written under `cloud/.localdev/sanagtm-cloud-*`). Dev sign-in is off
   (`/auth/dev-session` is 404 in Supabase mode); only verified Supabase ES256
   tokens are accepted.
 - `cloud/web/.env.staging.local` (git-ignored) holds the build's public values:
@@ -856,6 +865,7 @@ Start it:
 
 ```powershell
 run-sanagtm-staging.bat                                              # API on 127.0.0.1:8100
+run-sanagtm-worker.bat                                               # platform worker (scraper runs, exports…)
 & "C:\Program Files (x86)\cloudflared\cloudflared.exe" tunnel --no-autoupdate --url http://127.0.0.1:8100
 ```
 
@@ -872,6 +882,12 @@ A stable API hostname needs a domain on the Cloudflare account and a named tunne
 configuration, set the Site URL to `https://sanagtm.pages.dev` and add
 `https://sanagtm.pages.dev/**` to the redirect URLs, so confirmation and reset
 emails link back to SANA GTM (password sign-in itself does not depend on it).
+Password reset uses `/reset-password` on the site. Supabase's built-in email
+sender allows only a few emails per hour; configure custom SMTP in Supabase for
+reliable confirmation and reset emails.
+
+The worker's maintenance (every 30 s) re-queues tasks whose lease expired, so a
+scraper run interrupted by a crash or reboot resumes when the worker starts again.
 
 ## Running the worker on another host
 

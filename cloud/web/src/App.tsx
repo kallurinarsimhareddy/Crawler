@@ -6,6 +6,7 @@ import { JobDetail } from "./pages/JobDetail";
 import { Jobs } from "./pages/Jobs";
 import { Login } from "./pages/Login";
 import { NewCrawl } from "./pages/NewCrawl";
+import { ResetPassword } from "./pages/ResetPassword";
 import { Companies, CompanyDetail } from "./platform/pages/Companies";
 import { ContactDetail, Contacts, Discovery, HiringIntel, Postings, Provenance } from "./platform/pages/Intel";
 import { Credits, Exports, ImportDetail, Imports, Research, ResearchRun, Settings, Sources } from "./platform/pages/Tools";
@@ -27,6 +28,7 @@ export function App() {
   return (
     <Routes>
       <Route path="login" element={<Login />} />
+      <Route path="reset-password" element={<ResetPassword />} />
       <Route
         element={
           <RequireAuth>
