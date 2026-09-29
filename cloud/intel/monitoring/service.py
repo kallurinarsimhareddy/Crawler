@@ -172,7 +172,12 @@ class MonitoringService:
         previous = self.store.first(ctx, "company_snapshots", {"company_id": company_id}, order="-taken_at")
         current = self.snapshot(ctx, company_id)
         system = ctx if ctx.system else ctx.as_system()  # snapshots are platform-written
-        self.store.insert(system, "company_snapshots", {"company_id": company_id, "taken_at": utcnow(),
+        taken_at = utcnow()
+        if previous is not None and previous["taken_at"] is not None and taken_at <= previous["taken_at"]:
+            # A coarse clock can repeat a timestamp; snapshots must stay strictly ordered, or the
+            # next check may diff against the wrong one.
+            taken_at = previous["taken_at"] + timedelta(microseconds=1)
+        self.store.insert(system, "company_snapshots", {"company_id": company_id, "taken_at": taken_at,
                                                         "data": current})
         recorded = []
         for change in diff_snapshots(previous["data"] if previous else None, current):
