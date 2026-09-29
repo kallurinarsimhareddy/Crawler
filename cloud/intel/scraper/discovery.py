@@ -10,7 +10,8 @@ Candidates come from what the page itself links to, ranked:
       links to nothing better, at most :data:`MAX_GUESSES` of them
 ====  ================================================================
 
-Only the best few are ever fetched (the crawler's ``max_pages`` and the
+Filter and utility pages under a careers path (``/jobs/type/…``, ``/jobs/types/``,
+``/jobs/location/…``, how-to and feed pages) are never candidates. Only the best few are ever fetched (the crawler's ``max_pages`` and the
 per-domain request budget still apply), and robots.txt is respected for each.
 """
 
@@ -45,10 +46,14 @@ def rank_candidates(page_url: str, links: Sequence[Tuple[str, str]], detection: 
     home = _host(page_url)
     current = page_url.split("#")[0].rstrip("/")
 
+    from cloud.intel.scraper.extractor import _taxonomy_path
+
     def offer(url: str, score: int, why: str) -> None:
         key = url.split("#")[0].rstrip("/")
         if key == current:
             return
+        if _taxonomy_path(urlsplit(url).path):
+            return   # /jobs/type/…, /jobs/location/…, how-to and feed pages are filters, not careers pages
         if key not in scores or scores[key][0] < score:
             scores[key] = (score, why, url)
 

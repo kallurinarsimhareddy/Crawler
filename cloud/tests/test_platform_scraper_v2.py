@@ -1101,3 +1101,128 @@ class JobBoardTests(unittest.TestCase):
         self.assertEqual(detail_fetches, ["https://board.example/jobs/8139/"], "details are postings, not filters")
         for bad in ("type/back-end", "location/", "create", "feed/rss", "howto"):
             self.assertFalse(any(bad in str(r["job_url"]) for r in rows), bad)
+
+
+PYORG = """<html><head><title>Python Job Board | Python.org</title>
+<meta property="og:site_name" content="Python.org"></head><body>
+<div id="touchnav-wrapper">
+ <header class="main-header"><nav id="mainnav" class="python-navigation main-navigation">
+   <a href="/jobs/">Jobs</a> <a href="/jobs/create/">Submit a job</a></nav></header>
+ <div id="content" class="content-wrapper"><div class="container">
+  <aside class="left-sidebar" role="complementary"><h3>Job types</h3><ul>
+   <li><a href="/jobs/types/">All types</a></li><li><a href="/jobs/type/back-end/">Back end</a></li>
+   <li><a href="/jobs/type/big-data/">Big Data</a></li><li><a href="/jobs/category/developer-engineer/">Developer</a></li>
+   <li><a href="/jobs/location/remote-remote/">Remote - Remote</a></li></ul></aside>
+  <section class="main-content with-left-sidebar" role="main">
+   <div class="row"><div class="list-widget"><ol class="list-recent-jobs list-row-container menu">
+{items}
+   </ol></div></div>
+   <p><a href="/community/jobs/howto/">job submission how-to</a> <a href="/jobs/feed/rss/">Subscribe via RSS</a></p>
+   {next}
+  </section>
+ </div></div>
+ <footer class="main-footer"><a href="/jobs/create/">Submit a job</a> <a href="/jobs/">All jobs</a></footer>
+</div></body></html>"""
+
+
+def pyorg(jobs, next_page=None):
+    nav = (f'<ul class="pagination menu"><li><a href="?page={next_page}">Next &raquo;</a></li></ul>'
+           if next_page else "")
+    return PYORG.replace("{items}", "".join(BOARD_ITEM.format(**j) for j in jobs)).replace("{next}", nav)
+
+
+PYORG_JOBS_1 = [{"id": 8139, "title": "Senior Staff Engineer", "company": "Kraken", "loc": "Remote (UK / EU)",
+                 "loc_slug": "remote-uk-eu", "day": 8},
+                {"id": 8137, "title": "Django Developer", "company": "Widget Ltd", "loc": "Birmingham, UK",
+                 "loc_slug": "birmingham-uk", "day": 7},
+                {"id": 8136, "title": "ML Engineer", "company": "Deep Co", "loc": "Worldwide",
+                 "loc_slug": "worldwide", "day": 6}]
+PYORG_JOBS_2 = [{"id": 8101, "title": "Python Developer", "company": "Remote First", "loc": "Anywhere",
+                 "loc_slug": "anywhere", "day": 1}]
+PYORG_PAGES = {
+    "https://www.python.org/jobs/": (200, pyorg(PYORG_JOBS_1, next_page=2)),
+    "https://www.python.org/jobs/?page=2": (200, pyorg(PYORG_JOBS_2)),
+    "https://www.python.org/jobs/8139/": (200, detail_page("Senior Staff Engineer", ("London", "UK"), 90000)
+                                          .replace('"name": "Detail Co"', '"name": "Kraken"')),
+    "https://www.python.org/jobs/8137/": (200, detail_page("Django Developer", ("Birmingham", "UK"), 60000)
+                                          .replace('"name": "Detail Co"', '"name": "Widget Ltd"')),
+}
+
+
+class PythonOrgRegressionTests(unittest.TestCase):
+    """The live-test regression: python.org wraps its job list in
+    <section class="main-content with-left-sidebar" role="main">. A substring match on
+    "sidebar" rejected every real job; only whole class tokens and explicit roles count now."""
+
+    INSTRUCTION = ("Find all job titles, job URLs, company name, location, posted date, description and "
+                   "employment type.")
+
+    def run_board(self, pages=None, **options):
+        opts = {"max_listing_pages": 2, "follow_details": True, "max_detail_pages": 2, "max_pages": 8, **options}
+        return crawl("https://www.python.org/jobs/", self.INSTRUCTION, pages or PYORG_PAGES, **opts)
+
+    def test_real_jobs_are_found_and_navigation_is_not(self) -> None:
+        page, _ = self.run_board()
+        rows = values(page)
+        self.assertEqual([r["job_url"] for r in rows],
+                         ["https://www.python.org/jobs/8139/", "https://www.python.org/jobs/8137/",
+                          "https://www.python.org/jobs/8136/", "https://www.python.org/jobs/8101/"])
+        for bad in ("/type", "/category/", "/location/", "/create", "/feed/", "/howto"):
+            self.assertFalse(any(bad in r["job_url"] for r in rows), bad)
+        fetched = [(p["kind"], p["url"]) for p in page.pages if p["outcome"] == Outcome.OK]
+        self.assertEqual(fetched, [("input", "https://www.python.org/jobs/"),
+                                   ("listing", "https://www.python.org/jobs/?page=2"),
+                                   ("detail", "https://www.python.org/jobs/8139/"),
+                                   ("detail", "https://www.python.org/jobs/8137/")],
+                         "pagination proceeds after jobs are found; details are postings")
+        self.assertTrue(any("detail page limit (2)" in p for p in page.problems))
+        self.assertFalse(any("candidate careers pages" in p for p in page.problems), "no discovery needed")
+        urls = [p["url"] for p in page.pages]
+        self.assertEqual(len(urls), len(set(urls)), "no page twice")
+        self.assertEqual(len({r["job_url"] for r in rows}), len(rows), "no record twice")
+
+    def test_listing_and_detail_fields_merge(self) -> None:
+        page, _ = self.run_board()
+        first = page.records[0]
+        self.assertEqual(first["company_name"].value, "Kraken")
+        self.assertEqual(first["location"].value, "London, UK, US", "structured detail data beats the card")
+        self.assertEqual([a.value for a in first["location"].alternatives], ["Remote (UK / EU)"])
+        self.assertEqual(first["employment_type"].value, "FULL_TIME")
+        self.assertIn("SAP S/4HANA", first["description"].value)
+        self.assertEqual(first["job_url"].source_url, "https://www.python.org/jobs/")
+        self.assertEqual(first["description"].source_url, "https://www.python.org/jobs/8139/")
+        third = page.records[2]
+        self.assertEqual((third["company_name"].value, third["location"].value), ("Deep Co", "Worldwide"))
+        self.assertNotIn("description", third, "not enriched beyond the detail limit")
+
+    def test_container_tokens_and_roles(self) -> None:
+        from bs4 import BeautifulSoup
+
+        from cloud.intel.scraper.extractor import _in_chrome
+
+        html = """<div class="main-content with-left-sidebar"><a id="a" href="/jobs/1/">x</a></div>
+        <div class="content-area"><a id="b" href="/jobs/2/">x</a></div>
+        <div class="sidebar"><a id="c" href="/jobs/3/">x</a></div>
+        <div role="navigation"><a id="d" href="/jobs/4/">x</a></div>
+        <nav><a id="e" href="/jobs/5/">x</a></nav>
+        <div class="navbar-wrapper-thing"><a id="f" href="/jobs/6/">x</a></div>
+        <div id="sidebar"><main><a id="g" href="/jobs/7/">x</a></main></div>"""
+        soup = BeautifulSoup(html, "lxml")
+        verdict = {a["id"]: _in_chrome(a) for a in soup.find_all("a")}
+        self.assertEqual(verdict, {"a": False, "b": False, "c": True, "d": True, "e": True, "f": False, "g": False})
+
+    def test_filter_and_howto_pages_are_never_careers_candidates(self) -> None:
+        from cloud.intel.scraper.discovery import rank_candidates
+
+        links = [("All types", "https://www.python.org/jobs/types/"),
+                 ("Back end", "https://www.python.org/jobs/type/back-end/"),
+                 ("job submission how-to", "https://www.python.org/community/jobs/howto/"),
+                 ("Remote", "https://www.python.org/jobs/location/remote/"),
+                 ("Jobs", "https://www.python.org/jobs/")]
+        ranked = rank_candidates("https://www.python.org/", links)
+        self.assertEqual([u for u, _s, _w in ranked], ["https://www.python.org/jobs/"])
+        # A listing whose jobs cannot be read never wanders into its own filter pages.
+        empty = {"https://www.python.org/jobs/": (200, pyorg([]))}
+        page, f = self.run_board(empty)
+        calls = f.http._session.calls
+        self.assertFalse(any(("/type" in u or "howto" in u or "/location/" in u) for u in calls), calls)

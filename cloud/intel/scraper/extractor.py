@@ -373,22 +373,40 @@ _TAXONOMY = frozenset({"type", "types", "location", "locations", "category", "ca
                        "feed", "rss", "atom", "filter", "filters", "all", "archive", "alerts", "howto", "how-to",
                        "help", "faq", "about", "benefits", "culture", "login", "signin", "register", "saved",
                        "companies", "company", "employers", "recruiters", "remote", "level", "levels", "page"})
-_CHROME = re.compile(r"\b(?:nav|navbar|menu|breadcrumbs?|sidebar|filters?|facets?|footer|header|pagination|"
-                     r"tag-?cloud|subnav)\b", re.I)
+#: Whole class / id tokens of explicit navigation and sidebar containers. Compared as complete
+#: tokens: ``sidebar`` is a sidebar, ``with-left-sidebar`` (a layout modifier on the main content)
+#: is not. Generic words such as ``menu`` are deliberately absent: job lists use them too
+#: (python.org's list is ``<ol class="list-recent-jobs list-row-container menu">``).
+_CHROME_TOKENS = frozenset({"nav", "navbar", "navigation", "main-nav", "main-navigation", "site-nav", "subnav",
+                            "sub-nav", "breadcrumb", "breadcrumbs", "sidebar", "side-bar", "left-sidebar",
+                            "right-sidebar"})
+_CHROME_ROLES = frozenset({"navigation", "banner", "contentinfo", "complementary"})
 _ID_SEGMENT = re.compile(r"\d{3,}|[0-9a-f]{8}-[0-9a-f]{4}|[a-z0-9]+[-_]\d{3,}$", re.I)
 
 
+def _is_main(node: Any) -> bool:
+    return node.name == "main" or str(node.get("role") or "").lower() == "main"
+
+
 def _in_chrome(anchor: Any) -> bool:
-    """Links in navigation, headers, footers, sidebars and filter panels are not postings."""
+    """Links in navigation, headers, footers, sidebars and filter panels are not postings.
+
+    Only ``<nav>``/``<header>``/``<footer>``/``<aside>``, navigation/banner/complementary
+    roles and *whole* class or id tokens such as ``sidebar`` count; the walk stops at the
+    page's ``<main>`` / ``role="main"``, whose wrappers never make a link navigation."""
     node = anchor
-    for _ in range(8):
+    for _ in range(12):
         node = node.parent
-        if node is None or node.name in ("body", "html", "[document]"):
+        if node is None or node.name in ("body", "html", "[document]") or _is_main(node):
             return False
         if node.name in ("nav", "header", "footer", "aside"):
             return True
-        label = " ".join(node.get("class") or []) + " " + str(node.get("id") or "") + " " + str(node.get("role") or "")
-        if _CHROME.search(label):
+        if str(node.get("role") or "").lower() in _CHROME_ROLES:
+            return True
+        tokens = {c.lower() for c in (node.get("class") or [])}
+        if node.get("id"):
+            tokens.add(str(node.get("id")).lower())
+        if tokens & _CHROME_TOKENS:
             return True
     return False
 
@@ -566,6 +584,8 @@ def extract_page(html: str, url: str, *, fetch_json: Optional[Callable[..., Any]
     socials: List[str] = []
     job_links: List[Dict[str, FieldValue]] = []
     seen_jobs = set()
+    main_el = soup.find("main") or soup.find(attrs={"role": re.compile(r"^main$", re.I)})
+    in_main: set = set()
     page_host = _host(url)
     for anchor in soup.find_all("a", href=True):
         href = anchor["href"].strip()
@@ -599,7 +619,7 @@ def extract_page(html: str, url: str, *, fetch_json: Optional[Callable[..., Any]
             put("contact_page", absolute, "link", f'link "{text[:60]}"', 0.8)
         is_ats = ats_detect.detect(absolute) is not None
         if (any(w in text.lower() for w in _CAREERS_WORDS) or _CAREERS_HREF.search(urlsplit(absolute).path)) \
-                and (same_site or is_ats):
+                and (same_site or is_ats) and not _taxonomy_path(urlsplit(absolute).path):
             score = (2 if is_ats else 0) + (1 if any(w in text.lower() for w in _CAREERS_WORDS) else 0)
             careers.append((score, absolute))
         if want_jobs and absolute not in seen_jobs and absolute.rstrip("/") != url.rstrip("/") \
@@ -612,6 +632,11 @@ def extract_page(html: str, url: str, *, fetch_json: Optional[Callable[..., Any]
             if job is not None:
                 seen_jobs.add(absolute)
                 job_links.append(job)
+                if main_el is not None and any(p is main_el for p in anchor.parents):
+                    in_main.add(absolute)
+    # The page's <main> / role="main" is the listing when it holds any postings.
+    if in_main:
+        job_links = [j for j in job_links if j["job_url"].value in in_main]
     # When most job links carry an id (/jobs/8139/), links without one are filters, not postings.
     with_id = [j for j in job_links if _has_id(str(j["job_url"].value))]
     if len(with_id) >= 3:
