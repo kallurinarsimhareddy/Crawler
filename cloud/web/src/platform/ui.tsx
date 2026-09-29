@@ -104,6 +104,10 @@ const TONES: Record<string, string> = {
   // bad
   INVALID: "failed", failed: "failed", lost: "failed", error: "failed", REJECTED: "failed", MISSING: "failed",
   DISPOSABLE: "failed", cancelled: "cancelled", DUPLICATE: "cancelled", incompatible: "failed",
+  // scraper page outcomes
+  OK: "completed", EMPTY: "queued", BLOCKED: "cancelled", CAPTCHA: "cancelled", WAF: "cancelled",
+  LOGIN_REQUIRED: "cancelled", ROBOTS: "cancelled", RATE_LIMITED: "cancelled", NOT_FOUND: "failed",
+  TIMEOUT: "failed", UNSAFE: "failed", FAILED: "failed", empty: "queued",
 };
 
 export function Pill({ value }: { value: unknown }) {

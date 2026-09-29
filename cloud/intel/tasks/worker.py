@@ -45,7 +45,7 @@ log = logging.getLogger(__name__)
 HANDLERS: Dict[str, str] = {
     "crawl": "cloud.intel.jobs.crawl_task:run_crawl",
     "discovery": "cloud.intel.discovery.service:run_discovery_task",
-    "scraper": "cloud.intel.scraper.service:run_scrape_task",
+    "scraper": "cloud.intel.scraper.runner:run_scrape_task",
     "enrichment": "cloud.intel.providers.contacts:run_enrichment_task",
     "validation": "cloud.intel.email.service:run_validation_task",
     "research": "cloud.intel.research.service:run_research_task",

@@ -1,4 +1,4 @@
-// Research agent, AI scraper, imports, exports, sources, credits and settings.
+// Research agent, imports, exports, sources, credits and settings. The AI scraper is in Scraper.tsx.
 
 import { useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -147,113 +147,6 @@ export function ResearchRun() {
           <button className="button button--primary" disabled={action.busy || chosen.length === 0} onClick={() => action.run(async () => { await client.post(`/research/runs/${runId}/actions`, { action_ids: chosen }); setChosen([]); run.refresh(); })}>Apply selected</button>
         </div>
       )}
-    </div>
-  );
-}
-
-// --- AI scraper ------------------------------------------------------------------
-
-export function Scraper() {
-  const client = useWs();
-  const navigate = useNavigate();
-  const [instruction, setInstruction] = useState("Get company name, careers URL and ATS.");
-  const [urls, setUrls] = useState("");
-  const [file, setFile] = useState<File | null>(null);
-  const [column, setColumn] = useState("Website");
-  const [schema, setSchema] = useState<unknown>(null);
-  const action = useAction();
-  return (
-    <div className="page">
-      <PageHeader title="AI scraper" subtitle="Describe the fields you want. Deterministic extraction runs first; AI is used only for fields it cannot find, and only if this workspace allows it. Robots.txt is respected and blocked pages are reported, never bypassed." />
-      <div className="card form">
-        <label className="field field--wide">
-          <span className="field__label">Instruction</span>
-          <input className="input" value={instruction} onChange={(e) => setInstruction(e.target.value)} />
-        </label>
-        <div className="form__actions">
-          <button className="button button--ghost" disabled={action.busy} onClick={() => action.run(async () => setSchema(await client.post("/scraper/schema", { instruction })))}>Preview extraction schema</button>
-        </div>
-        {schema ? <Json value={schema} /> : null}
-        <label className="field field--wide">
-          <span className="field__label">URLs (one per line)</span>
-          <textarea className="input textarea" rows={4} value={urls} onChange={(e) => setUrls(e.target.value)} placeholder="https://example.com" />
-        </label>
-        <div className="field-row">
-          <label className="field">
-            <span className="field__label">…or a CSV/XLSX of URLs</span>
-            <input type="file" accept=".csv,.xlsx" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
-          </label>
-          <label className="field">
-            <span className="field__label">URL column</span>
-            <input className="input" value={column} onChange={(e) => setColumn(e.target.value)} />
-          </label>
-        </div>
-        {action.error && <ErrorBanner error={action.error} />}
-        <div className="form__actions">
-          <button
-            className="button button--primary"
-            disabled={action.busy || (!urls.trim() && !file)}
-            onClick={() =>
-              action.run(async () => {
-                const run = file
-                  ? await client.upload<Row>("/scraper/runs", [file], { instruction, column })
-                  : await client.post<Row>("/scraper/runs", { instruction, urls: urls.split(/\s+/).filter(Boolean) });
-                navigate(`/scraper/${run.id}`);
-              })
-            }
-          >
-            Start scrape
-          </button>
-        </div>
-      </div>
-      <ResourceList
-        load={(q, s) => client.list("/scraper/runs", q, s)}
-        link={(r) => `/scraper/${r.id}`}
-        columns={[
-          { key: "instruction", label: "Instruction" },
-          { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
-          { key: "urls", label: "URLs", render: (r) => (Array.isArray(r.urls) ? r.urls.length : 0) },
-          { key: "created_at", label: "Started", render: (r) => fmtDate(r.created_at) },
-        ]}
-      />
-    </div>
-  );
-}
-
-export function ScrapeRun() {
-  const { runId = "" } = useParams();
-  const client = useWs();
-  const run = useLoad((signal) => client.get<Row>(`/scraper/runs/${runId}`, undefined, signal), client.base + runId, 4000);
-  const results = useLoad((signal) => client.list(`/scraper/runs/${runId}/results`, { limit: 500 }, signal), client.base + runId + String(run.data?.status));
-  const action = useAction();
-  if (!run.data) return <div className="page">{run.error ? <ErrorBanner error={run.error} /> : <Loading />}</div>;
-  const fields = ((run.data.schema as { fields?: { name: string }[] })?.fields ?? []).map((f) => f.name);
-  return (
-    <div className="page">
-      <Link to="/scraper" className="back">← Scraper</Link>
-      <PageHeader
-        title="Scrape run"
-        subtitle={String(run.data.instruction)}
-        actions={
-          <>
-            <Pill value={run.data.status} />
-            {["csv", "xlsx", "json"].map((f) => (
-              <button key={f} className="button button--ghost button--small" disabled={action.busy} onClick={() => action.run(() => client.post("/exports", { entity_type: "scrape_results", filters: { run_id: runId }, format: f }))}>{f.toUpperCase()}</button>
-            ))}
-          </>
-        }
-      />
-      {action.error && <ErrorBanner error={action.error} />}
-      <DataTable
-        rows={results.data?.items ?? []}
-        empty="No results yet."
-        columns={[
-          { key: "url", label: "URL", className: "mono small" },
-          { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
-          ...fields.map((name) => ({ key: name, label: name.replace(/_/g, " "), render: (r: Row) => fmt(((r.data ?? {}) as Record<string, unknown>)[name]) })),
-          { key: "problems", label: "Problems", render: (r) => <Tags values={r.problems} /> },
-        ]}
-      />
     </div>
   );
 }

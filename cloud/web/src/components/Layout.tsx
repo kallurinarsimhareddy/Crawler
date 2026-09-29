@@ -13,6 +13,7 @@ const NAV_GROUPS: { title: string; items: { to: string; label: string; end?: boo
   {
     title: "Workspace",
     items: [
+      { to: "/scraper", label: "AI Scraper" },
       { to: "/", label: "AI Control Room", end: true },
       { to: "/dashboard", label: "Dashboard" },
       { to: "/companies", label: "Companies" },
@@ -21,7 +22,6 @@ const NAV_GROUPS: { title: string; items: { to: string; label: string; end?: boo
       { to: "/opportunities", label: "Opportunities" },
       { to: "/hiring", label: "Hiring Intelligence" },
       { to: "/discovery", label: "Discovery" },
-      { to: "/scraper", label: "Scraper" },
       { to: "/research", label: "Research Agent" },
       { to: "/campaigns", label: "Campaigns" },
       { to: "/sequences", label: "Sequences" },

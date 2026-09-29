@@ -1394,3 +1394,13 @@ a {
   .cr-flow__arrow { display: none; }
   .cr-flow__col { flex: 1 1 100%; }
 }
+
+/* --- AI scraper ------------------------------------------------------------ */
+.scraper-form .chips { gap: 6px; }
+.chip--button { cursor: pointer; font: inherit; font-size: 12px; color: var(--text); white-space: normal; text-align: left; }
+.chip--button:hover { border-color: var(--accent, var(--border)); }
+.scraper-schema { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 4px 0 12px; }
+.scraper-form .checkbox { display: inline-flex; align-items: center; gap: 8px; font-size: 14px; }
+.scraper-results__header { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; }
+.scraper-downloads { display: inline-flex; flex-wrap: wrap; gap: 6px; }
+.section-title { font-size: 16px; margin: 24px 0 8px; }

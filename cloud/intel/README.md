@@ -75,7 +75,7 @@ Every vendored file starts with a `# VENDORED from …` header naming its origin
 | C Job intelligence | `jobs/classify.py`, `jobs/service.py`, `jobs/crawl_task.py`, `jobs/careercrawler_bridge.py` |
 | D Hiring intelligence | `signals/engine.py` (11 signals), `signals/service.py` (aggregation, explainable scores) |
 | E External sources | `sources/` (SourceAdapter, ATS public APIs, keyed official APIs, authorization-required connectors) |
-| F AI scraper | `scraper/` |
+| F AI scraper | `scraper/` — models, schemas, planner (instruction → schema), fetcher (outcome classification: BLOCKED/CAPTCHA/WAF/LOGIN_REQUIRED/ROBOTS/TIMEOUT…), extractor (JSON-LD → official ATS APIs → links/headings → regex → AI with evidence checks), normalizer, validator, dedupe, exports (CSV/XLSX/JSON; Companies/Jobs/All views), runner (progress, cancel, retry, restart recovery), service. Module map in `scraper/service.py` |
 | G Email validation | `email/` |
 | H Contact enrichment | `providers/` (registry, ZoomInfo, Seamless, credit ledger, routing, contact intelligence) |
 | I GTM automation | `gtm/` (campaigns, sequences, suppression, unsubscribe), `automation/engine.py` |
@@ -131,7 +131,7 @@ caller is not a member of is a 404. POSTs honour `Idempotency-Key`. Lists take
 | Imports & exports | `/imports` (+ `/{id}/files` multipart, `/validate`, `/mapping-suggestions`, `PUT /mapping`, `/merge`, `/rows`), `/exports` (+ `/{id}/download`) |
 | Intelligence | `/jobs`, `POST /jobs/ingest`, `POST /crawl`, `/hiring-signals` (+ `/dismiss`), `POST /signals/run`, `/companies/{id}/scores`, `/company-technologies`, `/technology/taxonomy`, `POST /technology/detect`, `/discovery/candidates` (+ approve/reject), `POST /discovery/run`, `/monitors` (+ `/run`), `/change-events` |
 | Sources, providers, credits, email, contacts | `/sources`, `POST /sources/{name}/search`, `/providers` (+ `/credentials`, `/settings`, `/verify`), `/credits`, `/credits/ledger`, `/credits/{provider}/sync|grant|limit`, `POST /email/validate`, `/email/validations`, `/companies/{id}/contact-gaps`, `POST /contacts/find`, `/enrichment/plan` |
-| AI | `/ai/providers`, `POST /scraper/schema`, `/scraper/runs` (+ results, files), `POST /research/plan`, `/research/runs` (+ results, export, `approve`, `actions`) |
+| AI | `/ai/providers`, `POST /scraper/schema`, `/scraper/runs` (+ `/results`, `/records?view=`, `/files/{csv|xlsx|json}`, `/cancel`, `/retry`), `POST /research/plan`, `/research/runs` (+ results, export, `approve`, `actions`) |
 | GTM | `/campaigns` (+ `/match`), `/companies/{id}/campaign-mapping`, `/templates` (+ `/preview`), `/sequences` (+ `/enroll`), `/sequence-steps`, `/enrollments` (+ `/approve`, `/{id}/stop`), `/sequences/process-due`, `/message-events`, `/events/inbound`, `/suppressions`, `/workflows` (+ `/test`), `/workflow-runs`; public `/unsubscribe/{token}` |
 | Analytics | `/analytics/dashboard`, `/analytics/timeseries` |
 
