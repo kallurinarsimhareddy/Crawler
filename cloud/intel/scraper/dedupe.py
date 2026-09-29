@@ -1,24 +1,30 @@
-"""De-duplicating result rows, keeping every source URL.
+"""De-duplicating result rows, keeping every source, value and piece of evidence.
 
 The key, first that applies:
 
 1. ``job_url`` — canonical (no tracking parameters, fragment or trailing slash);
 2. a job without a URL — company/domain + title + location;
 3. a company row — its domain (from ``website``/``domain``), else its normalised name;
-4. anything else — a fingerprint of all requested field values.
+4. anything else — a fingerprint of all requested field values (so two identical
+   rows from different URLs collapse into one with both source URLs).
 
-When two rows share a key, the first is kept, empty fields in it are filled
-from the duplicate, and the duplicate's ``source_url`` is added to
-``source_urls``.
+When two rows share a key the first is kept and:
+
+* empty fields in it are filled from the duplicate (with the duplicate's evidence);
+* a field where the two disagree is recorded in ``_conflicts`` (both values, both
+  sources) — never silently discarded;
+* the duplicate's ``source_url`` and input are added to ``source_urls`` /
+  ``_merged_from``.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from cloud.intel.core.normalize import company_name_key, domain_of
+from cloud.intel.scraper.models import same_value
 from cloud.intel.scraper.normalizer import canonical_url
 
 __all__ = ["dedupe_records", "record_key"]
@@ -46,7 +52,7 @@ def record_key(record: Dict[str, Any], fields: Sequence[str], entity: str) -> Op
     return ("fields", digest)
 
 
-def dedupe_records(records: Iterable[Dict[str, Any]], fields: Sequence[str] = (), entity: str = "company"
+def dedupe_records(records: List[Dict[str, Any]], fields: Sequence[str] = (), entity: str = "company"
                    ) -> Tuple[List[Dict[str, Any]], int]:
     """Returns ``(unique_records, duplicates_removed)``."""
     kept: Dict[Tuple, Dict[str, Any]] = {}
@@ -67,9 +73,24 @@ def dedupe_records(records: Iterable[Dict[str, Any]], fields: Sequence[str] = ()
         for url in record["source_urls"]:
             if url not in first["source_urls"]:
                 first["source_urls"].append(url)
+        first.setdefault("_merged_from", []).append({"source_url": record.get("source_url"),
+                                                     "input_url": record.get("input_url"),
+                                                     "input_row": record.get("input_row")})
         for name in fields:
-            if first.get(name) in (None, "", []) and record.get(name) not in (None, "", []):
-                first[name] = record[name]
+            mine, theirs = first.get(name), record.get(name)
+            if theirs in (None, "", []):
+                continue
+            if mine in (None, "", []):
+                first[name] = theirs
                 if name in (record.get("_evidence") or {}):
                     first.setdefault("_evidence", {})[name] = record["_evidence"][name]
+                if name in (record.get("_field_status") or {}):
+                    first.setdefault("_field_status", {})[name] = record["_field_status"][name]
+            elif not same_value(mine, theirs):
+                conflict = first.setdefault("_conflicts", {}).setdefault(name, {"chosen": mine, "alternatives": []})
+                alternative = {"value": theirs, **{k: v for k, v in ((record.get("_evidence") or {}).get(name) or {})
+                                                   .items() if k in ("method", "confidence", "evidence", "source_url")}}
+                if not any(same_value(a.get("value"), theirs) for a in conflict["alternatives"]):
+                    conflict["alternatives"].append(alternative)
+                first.setdefault("_field_status", {})[name] = "conflict"
     return out, dupes

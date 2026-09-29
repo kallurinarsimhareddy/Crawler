@@ -303,6 +303,7 @@ def run_research_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter
             "signals": [{"id": s["id"], "type": s["signal_type"], "summary": s.get("summary"),
                          "confidence": s.get("confidence")} for s in extra.get("signals") or []][:20],
             "jobs": [{"id": j["id"], "title": j["title"], "url": j.get("job_url")} for j in extra.get("jobs") or []][:20],
+            "scraped_jobs": extra.get("scraped_jobs", [])[:50],
             "contact_gap": {k: v["status"] for k, v in (extra.get("contact_gap") or {}).items()},
             "contacts": extra.get("contacts", [])[:10], "email_validation": extra.get("email_validation", {}),
             "campaign": extra.get("campaign"), "possible_duplicates": extra.get("possible_duplicates", []),

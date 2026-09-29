@@ -50,7 +50,7 @@ function Conversation({ session, onPickRun, activeRun }: { session: Session | nu
     <div className="cr-chat" aria-label="Conversation" role="log">
       {session.messages!.map((m) => (
         <div key={m.id} className={`cr-msg cr-msg--${m.role}`}>
-          <div className="cr-msg__who">{m.role === "user" ? "You" : "CareerCrawler AI"}</div>
+          <div className="cr-msg__who">{m.role === "user" ? "You" : "SANA GTM AI"}</div>
           <div className="cr-msg__body">{m.content}</div>
           {m.run_id && (
             <button type="button" className={`button button--ghost button--small${m.run_id === activeRun ? " cr-active" : ""}`} onClick={() => onPickRun(m.run_id!)}>
@@ -260,7 +260,7 @@ export function ControlRoom() {
                 <label className="cr-mode">
                   <span className="sr-only">Agent</span>
                   <select className="input input--small" value={mode} onChange={(e) => setMode(e.target.value)} aria-describedby="cr-mode-desc">
-                    {(modes.data?.items ?? [{ key: "auto", title: "CareerCrawler AI", description: "", tools: [] }]).map((m) => (
+                    {(modes.data?.items ?? [{ key: "auto", title: "SANA GTM AI", description: "", tools: [] }]).map((m) => (
                       <option key={m.key} value={m.key}>{m.title}</option>
                     ))}
                   </select>

@@ -210,6 +210,9 @@ def parse_intent(question: str) -> Dict[str, Any]:
         functions = ["executive"]
 
     wants = lambda *ps: any(p in text for p in ps)  # noqa: E731
+    urls = list(dict.fromkeys(re.findall(r"https?://[^\s,;)\]]+", raw)))[:200]
+    collect = bool(re.search(r"\b(?:collect|scrape|extract|pull|gather|grab|get)\b[^.;]{0,60}\b(?:jobs|job postings|"
+                             r"postings|openings|open roles|positions|vacancies)\b", text))
     create_list = wants("outreach list", "create a list", "create list", "build a list", "add them to a list",
                         "target list", "call list")
     export_format = "xlsx"
@@ -242,6 +245,8 @@ def parse_intent(question: str) -> Dict[str, Any]:
         "create_opportunities": bool(re.search(r"\b(create|open|add|make)\b[^.;,]{0,30}\b(opportunit|deals?\b|pipeline)", text)),
         "export": wants("export", "download", "spreadsheet", "csv", "xlsx", "excel"),
         "export_format": export_format,
+        "scrape": {"required": bool(collect or urls), "urls": [u.rstrip(".") for u in urls],
+                   "keywords": hiring_keywords or technologies, "window_days": window_days if window else None},
         "question": raw,
         "parser": "rules",
     }

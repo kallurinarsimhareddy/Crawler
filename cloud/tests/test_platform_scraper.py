@@ -159,21 +159,26 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(company["fields"][0]["name"], "company_name")
 
     def test_any_field_can_be_requested(self) -> None:
-        schema = instruction_to_schema("Get company name, number of patents and founding year")
+        schema = instruction_to_schema("Get company name, number of patents and stock exchange")
         by = {f["name"]: f for f in schema["fields"]}
         self.assertIn("number_patents", by)
-        self.assertEqual(by["number_patents"]["type"], "number")
-        self.assertIn("founding_year", by)
-        self.assertEqual(by["founding_year"]["source"], "custom")
+        self.assertEqual(by["number_patents"]["type"], "integer")
+        self.assertIn("stock_exchange", by)
+        self.assertEqual(by["stock_exchange"]["source"], "custom")
         for request in ("department", "technology", "salary", "posted date", "description", "remote mode"):
             self.assertTrue(self.names(f"job titles and {request}"), request)
 
     def test_ai_names_custom_fields_and_failure_keeps_rules(self) -> None:
-        ai = FakeAI({"fields": [{"name": "Patent Count", "type": "number", "level": "company",
-                                 "description": "Patents held"}]})
+        ai = FakeAI({"fields": [{"phrase": "number patents", "name": "Patent Count", "type": "integer",
+                                 "level": "company", "description": "Patents held"},
+                                {"phrase": "revenue", "name": "revenue_usd", "type": "decimal", "level": "company",
+                                 "description": "not asked for"}]})
         extended = instruction_to_schema("Get company name and number of patents", ai=ai)
-        self.assertIn("patent_count", [f["name"] for f in extended["fields"]])
+        self.assertEqual([f["name"] for f in extended["fields"]], ["company_name", "patent_count"],
+                         "a suggestion for a phrase the user did not write is ignored")
+        self.assertEqual(extended["fields"][1]["type"], "integer")
         self.assertEqual(extended["parser"], "rules+fake")
+        self.assertIn("ignored", extended["ai_note"])
         broken = instruction_to_schema("Get company name and number of patents", ai=FakeAI(AIUnavailable("quota")))
         self.assertEqual(broken["parser"], "rules")
         self.assertIn("number_patents", [f["name"] for f in broken["fields"]])
@@ -182,7 +187,8 @@ class PlannerTests(unittest.TestCase):
     def test_posted_within_filter(self) -> None:
         schema = instruction_to_schema("Get job titles posted in the last 7 days.")
         self.assertEqual(schema["entity"], "job")
-        self.assertEqual(schema["filters"], [{"field": "posted_date", "op": "within_days", "value": 7}])
+        self.assertEqual(schema["filters"], [{"field": "posted_date", "op": "within_days", "value": 7,
+                                              "mode": "hard"}])
 
 
 class InputTests(unittest.TestCase):
@@ -390,15 +396,15 @@ class RefusedPageTests(unittest.TestCase):
 
 class AIExtractionTests(unittest.TestCase):
     def test_ai_fills_only_missing_fields_and_needs_evidence(self) -> None:
-        schema = instruction_to_schema("Get company name, industry and founding year")
+        schema = instruction_to_schema("Get company name, industry and stock ticker")
         ai = FakeAI({"industry": {"value": "Energy equipment", "evidence": "hydraulic valves for the energy sector"},
-                     "founding_year": {"value": "1890", "evidence": "Founded in 1890"}})
+                     "stock_ticker": {"value": "ACME", "evidence": "NYSE: ACME"}})
         page = scrape_one("https://www.acme-mfg.com/", schema, pages_fetcher(), AIBudget(ai, 5))
         record = page.records[0]
         self.assertEqual(record["company_name"].method, "json-ld", "rules first")
         self.assertEqual((record["industry"].value, record["industry"].method), ("Energy equipment", "ai"))
-        self.assertNotIn("founding_year", record, "an answer whose evidence is not on the page is dropped")
-        self.assertTrue(any("founding_year" in p for p in page.problems))
+        self.assertNotIn("stock_ticker", record, "an answer whose evidence is not on the page is dropped")
+        self.assertTrue(any("stock_ticker" in p for p in page.problems))
         self.assertTrue(page.ai_used)
         self.assertNotIn("company_name", ai.prompts[0].split("Fields:")[1].split("Page URL")[0],
                          "the model is only asked for what the rules did not find")
@@ -581,7 +587,8 @@ class RunTests(unittest.TestCase):
         from openpyxl import load_workbook
 
         book = load_workbook(io.BytesIO(self.read(run, "xlsx")))
-        self.assertEqual(book.sheetnames, ["All fields", "Jobs", "Companies", "Pages"])
+        self.assertEqual(book.sheetnames, ["All Fields", "Companies", "Jobs", "Pages", "Errors", "Run Summary",
+                                           "Inputs"])
         self.assertEqual(book["Jobs"].max_row, 3)
         self.assertEqual(book["Pages"]["F2"].value, "OK")
         payload = json.loads(self.read(run, "json"))
@@ -596,10 +603,10 @@ class RunTests(unittest.TestCase):
         self.assertEqual(self.run_task(run)["status"], "completed")
         run = self.store.get(self.ctx, "scrape_runs", run["id"])
         progress = run["stats"]["progress"]
-        self.assertEqual((progress["total"], progress["processed"], progress["completed"], progress["failed"]),
-                         (5, 5, 3, 2))
+        self.assertEqual((progress["total"], progress["processed"], progress["completed"], progress["failed"],
+                          progress["blocked"]), (5, 5, 3, 0, 2))
         self.assertGreaterEqual(progress["pages"], 6, "careers pages the homepages linked to are counted")
-        self.assertEqual(progress["stage"], "Done")
+        self.assertEqual(progress["stage"], "completed")
         self.assertEqual(run["stats"]["outcomes"], {"OK": 3, "BLOCKED": 1, "CAPTCHA": 1})
         self.assertEqual(run["stats"]["records"], 5)
         jobs = self.service.records(self.ctx, run["id"], "jobs")
@@ -646,7 +653,8 @@ class RunTests(unittest.TestCase):
             self.service.cancel(self.ctx, run["id"])
 
     def test_cancel_while_running_keeps_partial_results(self) -> None:
-        run = self.service.start(self.ctx, ["https://beta.example/", "https://www.acme-mfg.com/"], "Get company name")
+        run = self.service.start(self.ctx, ["https://beta.example/", "https://www.acme-mfg.com/"], "Get company name",
+                                 options={"concurrency": 1})   # one URL at a time, so the second never starts
         service, ctx = self.service, self.ctx
 
         class CancellingSession(FakeSession):
@@ -854,7 +862,7 @@ class ScraperApiTests(unittest.TestCase):
                                                                 "instruction": "Get company name and job titles"})
         self.assertEqual(r.status_code, 201, r.text)
         run = r.json()
-        self.assertEqual(run["stats"]["progress"]["stage"], "Queued")
+        self.assertEqual(run["stats"]["progress"]["stage"], "queued")
         run_task_inline(self.platform, self.ws, run["task_id"])
         run = self.client.get(f"{self.base}/scraper/runs/{run['id']}").json()
         self.assertEqual(run["status"], "completed")

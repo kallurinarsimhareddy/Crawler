@@ -58,7 +58,7 @@ export function MemoryPage() {
 
   return (
     <div className="page">
-      <PageHeader title="AI memory" subtitle="What CareerCrawler AI remembers for this workspace and applies to every request. Only this workspace can see it." />
+      <PageHeader title="AI memory" subtitle="What SANA GTM AI remembers for this workspace and applies to every request. Only this workspace can see it." />
       <div className="alert alert--info" role="note">Never store secrets here. API keys and passwords belong in Settings → Provider connections, where they are encrypted; memory refuses anything that looks like a key or token.</div>
       <form className="card form" onSubmit={submit}>
         <label className="field field--wide">

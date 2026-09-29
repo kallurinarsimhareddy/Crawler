@@ -77,6 +77,13 @@ def build_plan(intent: Dict[str, Any]) -> List[Dict[str, Any]]:
         add("validate_emails", "Validate contact emails (cache and local DNS checks first)", {"max_age_days": 30},
             reads=["contacts", "email_validations"], writes=["email_validations", "credit_ledger"],
             spends_credits=True, estimate={"email_validation": target * 3 * _COST["email_validation"]})
+    scrape = intent.get("scrape") or {}
+    if scrape.get("required"):
+        add("scrape_jobs", "Collect open jobs from the companies' public careers pages / job boards with the AI "
+            "scraper (robots.txt respected; blocked pages reported, never bypassed)",
+            {"urls": list(scrape.get("urls") or []), "keywords": list(scrape.get("keywords") or []),
+             "window_days": scrape.get("window_days"), "max_companies": 25},
+            reads=["companies"], writes=["scrape_runs", "scrape_results", "scrape_pages"])
     add("score", "Score and rank companies with explainable account/hiring/opportunity scores",
         {"limit": intent.get("count")}, reads=["hiring_signals", "job_postings", "contacts"])
     if intent.get("assign_campaign"):

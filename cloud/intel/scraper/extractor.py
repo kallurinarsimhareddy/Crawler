@@ -95,6 +95,16 @@ class PageFacts:
     is_careers_page: bool = False
     job_method: Optional[str] = None
     notes: List[str] = field(default_factory=list)                # e.g. a job board larger than the cap
+    pagination: Any = None                                       # pagination.Pagination
+    rendered: bool = False                                       # the HTML came from a browser
+
+
+def mark_browser(facts: "PageFacts") -> None:
+    """Values read from browser-rendered HTML rank below HTTP-deterministic ones."""
+    facts.rendered = True
+    for fv in list(facts.company.values()) + [fv for job in facts.jobs for fv in job.values()]:
+        if fv.method not in ("ats-api", "ai"):
+            fv.browser = True
 
 
 # --- small helpers ----------------------------------------------------------------------------
@@ -277,6 +287,18 @@ def ats_api_jobs(detection: Mapping[str, Any], fetch_json: Callable[..., Any], *
     for method, url, body, extractor in ats_detect.api_endpoints(dict(detection)):
         if extractor not in _SUPPORTED_ATS_API:
             continue
+        if extractor == "smartrecruiters":   # paged API: offset/limit until totalFound
+            offset = 0
+            base = url.split("?")[0]
+            while offset <= max_jobs:
+                data = fetch_json(f"{base}?limit=100&offset={offset}")
+                page = _ats_jobs(extractor, data, detection) if data else []
+                jobs.extend(page)
+                total = int((data or {}).get("totalFound") or 0)
+                offset += 100
+                if not page or offset >= total:
+                    break
+            continue
         if extractor == "workday":
             offset = 0
             while offset <= max_jobs:
@@ -333,13 +355,56 @@ def _card_of(anchor: Any) -> Any:
 
 
 def _by_class(node: Any, *words: str) -> Optional[str]:
+    """Text of the most specific element whose class names one of ``words`` (a wrapper such as
+    ``h2.listing-company`` loses to ``span.listing-company-name`` inside it)."""
+    found: List[str] = []
     for tag in node.find_all(True):
         classes = " ".join(tag.get("class") or []).lower() + " " + str(tag.get("data-testid") or "").lower()
         if any(w in classes for w in words):
             text = _clean(tag.get_text(" "), 300)
             if text:
-                return text
-    return None
+                found.append(text)
+    return min(found, key=len) if found else None
+
+
+#: Path segments of filter / taxonomy / utility pages on a jobs site — never a single posting.
+_TAXONOMY = frozenset({"type", "types", "location", "locations", "category", "categories", "tag", "tags",
+                       "department", "departments", "team", "teams", "search", "create", "new", "submit", "post",
+                       "feed", "rss", "atom", "filter", "filters", "all", "archive", "alerts", "howto", "how-to",
+                       "help", "faq", "about", "benefits", "culture", "login", "signin", "register", "saved",
+                       "companies", "company", "employers", "recruiters", "remote", "level", "levels", "page"})
+_CHROME = re.compile(r"\b(?:nav|navbar|menu|breadcrumbs?|sidebar|filters?|facets?|footer|header|pagination|"
+                     r"tag-?cloud|subnav)\b", re.I)
+_ID_SEGMENT = re.compile(r"\d{3,}|[0-9a-f]{8}-[0-9a-f]{4}|[a-z0-9]+[-_]\d{3,}$", re.I)
+
+
+def _in_chrome(anchor: Any) -> bool:
+    """Links in navigation, headers, footers, sidebars and filter panels are not postings."""
+    node = anchor
+    for _ in range(8):
+        node = node.parent
+        if node is None or node.name in ("body", "html", "[document]"):
+            return False
+        if node.name in ("nav", "header", "footer", "aside"):
+            return True
+        label = " ".join(node.get("class") or []) + " " + str(node.get("id") or "") + " " + str(node.get("role") or "")
+        if _CHROME.search(label):
+            return True
+    return False
+
+
+def _taxonomy_path(path: str) -> bool:
+    segments = [s for s in path.lower().split("/") if s]
+    for i, segment in enumerate(segments):
+        if re.fullmatch(r"(?:jobs?|careers?|positions?|openings?|vacanc(?:y|ies)|opportunit(?:y|ies))", segment):
+            rest = segments[i + 1:]
+            return bool(rest) and rest[0] in _TAXONOMY
+    return any(s in ("howto", "how-to", "feed", "rss") for s in segments)
+
+
+def _has_id(url: str) -> bool:
+    segments = [s for s in urlsplit(url).path.split("/") if s]
+    return bool(segments) and bool(_ID_SEGMENT.search(segments[-1]))
 
 
 def _link_job(anchor: Any, href: str, page_url: str) -> Optional[Dict[str, FieldValue]]:
@@ -363,9 +428,20 @@ def _link_job(anchor: Any, href: str, page_url: str) -> Optional[Dict[str, Field
         "job_url": _fv(href, "link", page_url, f"href of \"{title[:60]}\"", confidence),
     }
     scope = anchor if title_el is not None else card
+    if card is not None:
+        company = _by_class(card, "company", "employer", "organization", "organisation")
+        if company and company != title:
+            company = company[len(title):].strip(" ,-–—|:") if company.startswith(title) else company
+            if company and len(company) <= 150:
+                job["company_name"] = _fv(company, method, page_url, "company element in the job card", 0.75)
+        stamp = card.find("time", attrs={"datetime": True})
+        if stamp is not None:
+            job["posted_date"] = _fv(stamp["datetime"], method, page_url, "<time datetime> in the job card", 0.8)
     for name, words in (("location", ("location", "city")), ("department", ("department", "team", "category")),
                         ("employment_type", ("employment", "job-type", "jobtype", "commitment")),
                         ("posted_date", ("posted", "date"))):
+        if name in job:
+            continue
         value = _by_class(scope, *words) if scope is not None else None
         if value and value != title:
             job[name] = _fv(value, method, page_url, f"{name} element in the job card", 0.7)
@@ -382,6 +458,12 @@ def extract_page(html: str, url: str, *, fetch_json: Optional[Callable[..., Any]
     facts = PageFacts(url=url)
     soup = BeautifulSoup(html or "", "lxml")
     company = facts.company
+    from cloud.intel.scraper.pagination import find_pagination
+
+    try:
+        facts.pagination = find_pagination(soup, url, html or "")
+    except Exception:  # noqa: BLE001 - pagination hints are best effort
+        facts.pagination = None
 
     def put(name: str, value: Any, method: str, evidence: str, confidence: Optional[float] = None) -> None:
         if value in (None, "", []) or name in company:
@@ -417,8 +499,16 @@ def extract_page(html: str, url: str, *, fetch_json: Optional[Callable[..., Any]
                 put("location", ", ".join(str(_first(address.get(k))) for k in
                                           ("addressLocality", "addressRegion", "addressCountry") if address.get(k)),
                     "json-ld", "Organization.address")
+                put("headquarters", company["location"].value if "location" in company else None, "json-ld",
+                    "Organization.address")
             put("email", _first(obj.get("email")), "json-ld", "Organization.email")
             put("phone", _first(obj.get("telephone")), "json-ld", "Organization.telephone")
+            employees = obj.get("numberOfEmployees")
+            if isinstance(employees, dict):
+                employees = employees.get("value") or employees.get("minValue")
+            put("employee_count", employees, "json-ld", "Organization.numberOfEmployees")
+            founded = re.match(r"(\d{4})", str(obj.get("foundingDate") or ""))
+            put("founded_year", int(founded.group(1)) if founded else None, "json-ld", "Organization.foundingDate")
             people = []
             for key in ("employee", "founder", "member"):
                 value = obj.get(key)
@@ -515,11 +605,18 @@ def extract_page(html: str, url: str, *, fetch_json: Optional[Callable[..., Any]
         if want_jobs and absolute not in seen_jobs and absolute.rstrip("/") != url.rstrip("/") \
                 and (_ATS_JOB_HREF.search(absolute) or (_JOB_HREF.search(urlsplit(absolute).path)
                                                        and not _LISTING_HREF.search(urlsplit(absolute).path)
+                                                       and not _taxonomy_path(urlsplit(absolute).path)
+                                                       and not _in_chrome(anchor)
                                                        and (same_site or is_ats))):
             job = _link_job(anchor, absolute, url)
             if job is not None:
                 seen_jobs.add(absolute)
                 job_links.append(job)
+    # When most job links carry an id (/jobs/8139/), links without one are filters, not postings.
+    with_id = [j for j in job_links if _has_id(str(j["job_url"].value))]
+    if len(with_id) >= 3:
+        job_links = [j for j in job_links if _has_id(str(j["job_url"].value))
+                     or _ATS_JOB_HREF.search(str(j["job_url"].value))]
     careers.sort(key=lambda item: -item[0])
     facts.careers_links = list(dict.fromkeys(link for _score, link in careers))
     if socials:
@@ -581,6 +678,27 @@ def extract_page(html: str, url: str, *, fetch_json: Optional[Callable[..., Any]
         technologies = []
     if technologies:
         put("technology", technologies[:30], "regex", "technology names in the page text", 0.6)
+    try:
+        from cloud.intel.technology.service import TechnologyService
+
+        found = TechnologyService.detect_in_text(text[:200000])
+    except Exception:  # noqa: BLE001
+        found = []
+    erps = list(dict.fromkeys(t["technology"] for t in found if "ERP" in (t.get("families") or [])))
+    if erps:
+        put("erp", ", ".join(erps[:5]), "regex", "ERP names in the page text: " + ", ".join(erps[:5]), 0.6)
+    clouds = list(dict.fromkeys(t["technology"] for t in found if t.get("category") == "Cloud"
+                                or "Cloud" in (t.get("families") or [])))
+    if clouds:
+        put("cloud_provider", ", ".join(clouds[:5]), "regex", "cloud platforms named in the page text", 0.6)
+    employees = re.search(r"\b(\d{1,3}(?:,\d{3})+|\d{2,7})\+?\s+(?:employees|team members|people worldwide|staff)\b",
+                          text)
+    if employees:
+        put("employee_count", employees.group(1), "regex", employees.group(0)[:120], 0.5)
+    manager = re.search(r"\b(?:Hiring Manager|Recruiter)\s*[:\-–]\s*([A-Z][a-zA-Z'’.-]+(?:\s+[A-Z][a-zA-Z'’-]+){1,2})",
+                        text)
+    if manager:
+        put("hiring_manager", manager.group(1), "regex", manager.group(0)[:120], 0.6)
     if not ats_detect.detect(url):
         put("website", _origin(url), "url", "the page's own address", 0.7)
 
@@ -639,8 +757,8 @@ def build_records(facts: PageFacts, schema: Mapping[str, Any], *,
             if levels.get(name) == "job":
                 if name in job:
                     record[name] = job[name]
-            elif name == "company_name" and "company_name" in job and "company_name" not in page_company:
-                record[name] = job["company_name"]
+            elif name == "company_name" and "company_name" in job:
+                record[name] = job["company_name"]   # a job board lists other companies' jobs
             elif name in page_company:
                 record[name] = page_company[name]
         records.append(record)
@@ -760,3 +878,17 @@ def ai_extract_jobs(facts: PageFacts, fields: Sequence[Mapping[str, Any]], ai: A
 def iter_values(records: Iterable[Mapping[str, FieldValue]]) -> Iterable[FieldValue]:
     for record in records:
         yield from record.values()
+
+
+def keyword_fields(facts: PageFacts, fields: Sequence[Mapping[str, Any]], record: Dict[str, FieldValue]) -> None:
+    """Custom yes/no fields with a hint ("Uses SAP?"): ``True`` when the page names the hint,
+    with the sentence as evidence. Absence is not evidence of "no", so it stays empty."""
+    text = facts.text or ""
+    for spec in fields:
+        if spec.get("type") != "boolean" or not spec.get("hint") or spec["name"] in record:
+            continue
+        hint = str(spec["hint"]).strip()
+        match = re.search(r"(?<![A-Za-z0-9])" + re.escape(hint) + r"(?![A-Za-z0-9])", text, re.I)
+        if match:
+            start = max(0, match.start() - 60)
+            record[spec["name"]] = _fv(True, "regex", facts.url, text[start: match.end() + 60], 0.6)

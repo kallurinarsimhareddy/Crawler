@@ -1,12 +1,25 @@
 """Normalising extracted values without changing what they mean.
 
-URLs lose tracking parameters and fragments, websites become their origin,
-dates become ISO ``YYYY-MM-DD`` (relative dates such as "Posted 2 days ago" are
-resolved against the extraction time; open-ended ones such as "30+ days ago"
-are left empty), employment types get one spelling, and a few fields are
-*derived* from others (``domain`` from ``website``, ``remote_mode`` from a
-location/title that says "Remote"/"Hybrid"/"On-site") — marked with method
-``derived`` and the evidence they came from.
+Rules (a field's ``normalize`` names one; otherwise its type decides):
+
+=============  ==============================================================
+``website``    ``https://www.example.com/about`` -> ``https://example.com``
+``url``        lower-case host, no fragment, no tracking parameters, no trailing slash
+``domain``     registrable domain (``shop.example.co.uk`` -> ``example.co.uk``)
+``email``      lower-case, validated shape
+``phone``      E.164: ``(918) 555-0142`` -> ``+19185550142`` (US numbers without a
+               country code are assumed to be +1; other formats keep their ``+CC``)
+``iso_date``   ``Sep 3, 2026`` / ``Posted 2 days ago`` -> ``2026-09-03``; open-ended
+               ("30+ days ago") stays empty
+``location``   whitespace, and ``United States``/``USA`` -> ``US``
+``integer``    ``1,200`` / ``1.2k`` / ``501-1,000`` (lower bound) -> ``1200`` / ``1200`` / ``501``
+``decimal``    ``$1.2B`` -> ``1200000000.0``
+=============  ==============================================================
+
+A few fields are *derived* from others when requested and missing — ``domain``
+from ``website``, ``remote_mode`` from a location/title that says Remote/Hybrid/
+On-site, ``seniority`` and ``job_family`` from the job title — marked with method
+``derived`` (status ``inferred``) and the evidence they came from.
 """
 
 from __future__ import annotations
@@ -18,8 +31,10 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from cloud.intel.core.normalize import domain_of, normalize_email
 from cloud.intel.scraper.models import FieldValue
+from cloud.intel.scraper.schemas import canonical_type
 
-__all__ = ["canonical_url", "normalize_date", "normalize_record", "remote_mode_of"]
+__all__ = ["canonical_url", "job_family_of", "normalize_date", "normalize_phone", "normalize_record",
+           "normalize_value", "normalize_website", "remote_mode_of", "seniority_of"]
 
 _TRACKING = re.compile(r"^(?:utm_|gh_src$|gclid$|fbclid$|mc_|_hs|ref$|source$|src$|trk$|lever-source)", re.I)
 _MONTHS = {m: i for i, m in enumerate(["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov",
@@ -29,6 +44,32 @@ _EMPLOYMENT = {"full_time": "Full-time", "fulltime": "Full-time", "full time": "
                "contractor": "Contract", "contract": "Contract", "temporary": "Temporary", "temp": "Temporary",
                "intern": "Internship", "internship": "Internship", "per_diem": "Per diem", "volunteer": "Volunteer",
                "seasonal": "Seasonal", "other": "Other"}
+_COUNTRY_NAMES = re.compile(r"\b(?:United States of America|United States|U\.S\.A\.?|USA)\b", re.I)
+_SENIORITY_RULES = (
+    ("Intern", r"\bintern(?:ship)?\b|\bco-?op\b"),
+    ("Executive", r"\b(?:chief|ceo|cfo|cto|coo|cio|cmo|president|founder)\b"),
+    ("VP", r"\b(?:vp|vice president|svp|evp)\b"),
+    ("Director", r"\bdirector\b|\bhead of\b"),
+    ("Manager", r"\bmanager\b"),
+    ("Lead", r"\b(?:lead|principal|staff|architect)\b"),
+    ("Senior", r"\b(?:senior|sr\.?|iii|iv)\b"),
+    ("Entry", r"\b(?:junior|jr\.?|entry[- ]level|graduate|associate|trainee)\b"),
+)
+_FAMILY_RULES = (
+    ("Data", r"\b(?:data|analytics|machine learning|ml|ai research|scientist|bi)\b"),
+    ("Engineering", r"\b(?:engineer|developer|software|devops|sre|programmer|firmware)\b"),
+    ("IT", r"\b(?:it|systems administrator|sysadmin|help ?desk|network|erp|sap|oracle|infrastructure)\b"),
+    ("Sales", r"\b(?:sales|account executive|business development|account manager|sdr|bdr)\b"),
+    ("Marketing", r"\b(?:marketing|brand|content|seo|growth|communications)\b"),
+    ("Finance", r"\b(?:finance|accountant|accounting|controller|fp&a|treasury|tax|audit)\b"),
+    ("HR", r"\b(?:hr|human resources|recruiter|talent|people partner|people operations)\b"),
+    ("Legal", r"\b(?:legal|counsel|attorney|paralegal|compliance)\b"),
+    ("Design", r"\b(?:designer|ux|ui|design)\b"),
+    ("Product", r"\b(?:product manager|product owner|product)\b"),
+    ("Customer Support", r"\b(?:support|customer success|customer service)\b"),
+    ("Operations", r"\b(?:operations|logistics|supply chain|warehouse|procurement|buyer)\b"),
+    ("Manufacturing", r"\b(?:machinist|technician|production|manufacturing|assembler|welder|maintenance)\b"),
+)
 
 
 def canonical_url(value: Any) -> Optional[str]:
@@ -44,6 +85,37 @@ def canonical_url(value: Any) -> Optional[str]:
     if len(path) > 1:
         path = path.rstrip("/")
     return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, query, ""))
+
+
+def normalize_website(value: Any) -> Optional[str]:
+    """The site's origin, ``https``-first, without ``www.``: ``https://www.example.com/`` -> ``https://example.com``."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    url = canonical_url(text if "://" in text else "https://" + text)
+    if not url:
+        return None
+    parts = urlsplit(url)
+    host = parts.netloc[4:] if parts.netloc.startswith("www.") else parts.netloc
+    return f"{parts.scheme}://{host}"
+
+
+def normalize_phone(value: Any) -> Optional[str]:
+    """E.164 where the number allows it."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    text = re.split(r"\s*(?:x|ext\.?|extension)\s*\d+$", text, flags=re.I)[0]
+    digits = re.sub(r"\D", "", text)
+    if text.startswith("+"):
+        return "+" + digits if 8 <= len(digits) <= 15 else None
+    if text.startswith("00") and 10 <= len(digits) <= 17:
+        return "+" + digits[2:]
+    if len(digits) == 10:
+        return "+1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return "+" + digits
+    return None
 
 
 def normalize_date(value: Any, *, now: Optional[datetime] = None) -> Optional[str]:
@@ -88,11 +160,38 @@ def normalize_date(value: Any, *, now: Optional[datetime] = None) -> Optional[st
     return None
 
 
+def normalize_datetime(value: Any) -> Optional[str]:
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc).isoformat(timespec="seconds") if value.tzinfo else value.isoformat()
+    text = str(value or "").strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return parsed.isoformat(timespec="seconds")
+    except ValueError:
+        day = normalize_date(text)
+        return f"{day}T00:00:00" if day else None
+
+
 def _safe(year: int, month: int, day: int) -> Optional[str]:
     try:
         return date(year, month, day).isoformat()
     except ValueError:
         return None
+
+
+def _number(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    text = str(value).strip().lower().replace(",", "")
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(k|m|mm|b|bn|thousand|million|billion)?\b", text)
+    if not match:
+        return None
+    number = float(match.group(1))
+    scale = {"k": 1e3, "thousand": 1e3, "m": 1e6, "mm": 1e6, "million": 1e6, "b": 1e9, "bn": 1e9,
+             "billion": 1e9}.get(match.group(2) or "", 1)
+    return number * scale
 
 
 def remote_mode_of(*texts: Any) -> Optional[str]:
@@ -103,6 +202,22 @@ def remote_mode_of(*texts: Any) -> Optional[str]:
         return "Remote"
     if re.search(r"\b(?:on-?site|in[- ]office|in person)\b", joined):
         return "On-site"
+    return None
+
+
+def seniority_of(title: Any) -> Optional[str]:
+    text = str(title or "").lower()
+    for level, pattern in _SENIORITY_RULES:
+        if re.search(pattern, text):
+            return level
+    return None
+
+
+def job_family_of(title: Any) -> Optional[str]:
+    text = str(title or "").lower()
+    for family, pattern in _FAMILY_RULES:
+        if re.search(pattern, text):
+            return family
     return None
 
 
@@ -121,48 +236,101 @@ def _text(value: Any) -> Any:
     return value
 
 
-def normalize_value(name: str, kind: str, value: Any, *, now: Optional[datetime] = None) -> Any:
+def _enum(value: Any, allowed: Optional[List[str]]) -> Any:
+    if not allowed:
+        return _text(value)
+    text = str(value).strip().lower()
+    synonyms = {"onsite": "on-site", "on site": "on-site", "in office": "on-site", "in-office": "on-site",
+                "work from home": "remote", "telecommute": "remote", "wfh": "remote"}
+    text = synonyms.get(text, text)
+    for option in allowed:
+        if option.lower() == text:
+            return option
+    return value   # the validator reports it
+
+
+def normalize_value(name: str, kind: str, value: Any, *, now: Optional[datetime] = None,
+                    rule: Optional[str] = None, enum: Optional[List[str]] = None) -> Any:
+    kind = canonical_type(kind)
     if value in (None, "", []):
         return None
-    if kind == "list":
-        items = value if isinstance(value, list) else [value]
-        out: List[str] = []
+    rule = rule or {"url": "url", "email": "email", "phone": "phone", "date": "iso_date",
+                    "datetime": "iso_datetime", "integer": "integer", "decimal": "decimal"}.get(kind)
+    if name == "website" or rule == "website":
+        return normalize_website(value) or value
+    if kind == "array":
+        items = value if isinstance(value, list) else re.split(r"\s*[;|,]\s*", str(value))
+        out: List[Any] = []
         for item in items:
-            text = _text(str(item))
+            text = _text(str(item)) if not isinstance(item, dict) else item
+            if isinstance(text, str) and text.startswith("http"):
+                text = canonical_url(text) or text
             if text and text not in out:
-                out.append(canonical_url(text) or text if text.startswith("http") else text)
+                out.append(text)
         return out or None
-    if name == "website":
-        url = canonical_url(value if "://" in str(value) else "https://" + str(value).strip())
-        if not url:
-            return value   # the validator reports it
-        parts = urlsplit(url)
-        return f"{parts.scheme}://{parts.netloc}"
-    if kind == "url":
+    if kind == "object":
+        return value if isinstance(value, dict) else value
+    if kind == "boolean":
+        if isinstance(value, bool):
+            return value
+        return {"true": True, "yes": True, "y": True, "1": True, "false": False, "no": False, "n": False,
+                "0": False}.get(str(value).strip().lower(), value)
+    if kind == "enum":
+        return _enum(value, enum)
+    if rule == "url":
         return canonical_url(value) or value
-    if kind == "email":
+    if rule == "domain" or name == "domain":
+        return domain_of(value) or value
+    if rule == "email":
         return normalize_email(value) or value
-    if kind == "date":
+    if rule == "phone":
+        return normalize_phone(value) or value
+    if rule == "iso_date":
         return normalize_date(value, now=now) or value
+    if rule == "iso_datetime":
+        return normalize_datetime(value) or value
+    if rule == "integer":
+        number = _number(value)
+        return int(number) if number is not None else value
+    if rule == "decimal":
+        number = _number(value)
+        return number if number is not None else value
     if name == "employment_type":
         return _employment(value)
-    if name == "company_name":
+    if rule == "company_name" or name == "company_name":
         text = _text(str(value))
         return text.strip(" |-–—:·") if text else None
-    return _text(value)
+    if rule == "location":
+        text = _text(str(value))
+        return _COUNTRY_NAMES.sub("US", text) if text else None
+    if rule == "lower":
+        return _text(str(value)).lower()
+    if rule == "upper":
+        return _text(str(value)).upper()
+    return _text(value) if isinstance(value, str) else value
+
+
+def _derived(value: Any, origin: FieldValue, evidence: str) -> FieldValue:
+    return FieldValue(value, "derived", 0.7, evidence[:200], origin.source_url, origin.browser)
 
 
 def normalize_record(record: Mapping[str, FieldValue], fields: List[Mapping[str, Any]], *,
                      now: Optional[datetime] = None) -> Dict[str, FieldValue]:
     """Normalised copy of ``record``, with derived fields added where requested."""
-    kinds = {f["name"]: f.get("type", "string") for f in fields}
+    specs = {f["name"]: f for f in fields}
     out: Dict[str, FieldValue] = {}
     for name, fv in record.items():
-        value = normalize_value(name, kinds.get(name, "string"), fv.value, now=now)
+        spec = specs.get(name, {})
+        value = normalize_value(name, spec.get("type", "string"), fv.value, now=now, rule=spec.get("normalize"),
+                                enum=spec.get("enum"))
         if value in (None, "", []):
             continue
-        out[name] = FieldValue(value, fv.method, fv.confidence, fv.evidence, fv.source_url)
-    if "domain" in kinds and "domain" not in out:
+        alternatives = [FieldValue(normalize_value(name, spec.get("type", "string"), a.value, now=now,
+                                                   rule=spec.get("normalize"), enum=spec.get("enum")) or a.value,
+                                   a.method, a.confidence, a.evidence, a.source_url, a.browser)
+                        for a in fv.alternatives]
+        out[name] = FieldValue(value, fv.method, fv.confidence, fv.evidence, fv.source_url, fv.browser, alternatives)
+    if "domain" in specs and "domain" not in out:
         site = out.get("website") or record.get("website")
         base = site.value if site else None
         if base is None:
@@ -172,16 +340,20 @@ def normalize_record(record: Mapping[str, FieldValue], fields: List[Mapping[str,
         if domain and not _is_ats_host(domain):
             out["domain"] = FieldValue(domain, "derived", 0.8 if site else 0.6, f"from {base}"[:200],
                                        site.source_url if site else base)
-    elif "domain" in out:
-        out["domain"] = FieldValue(domain_of(out["domain"].value) or out["domain"].value, out["domain"].method,
-                                   out["domain"].confidence, out["domain"].evidence, out["domain"].source_url)
-    if "remote_mode" in kinds and "remote_mode" not in out:
-        clues = [record[n].value for n in ("location", "job_title", "employment_type") if n in record]
-        mode = remote_mode_of(*clues)
+    title = record.get("job_title")
+    if "remote_mode" in specs and "remote_mode" not in out:
+        present = [record[n] for n in ("location", "job_title", "employment_type") if n in record]
+        mode = remote_mode_of(*[fv.value for fv in present])
         if mode:
-            origin = next(record[n] for n in ("location", "job_title", "employment_type") if n in record)
-            out["remote_mode"] = FieldValue(mode, "derived", 0.7, f"from {', '.join(str(c)[:60] for c in clues)}",
-                                            origin.source_url)
+            out["remote_mode"] = _derived(mode, present[0], "from " + ", ".join(str(fv.value)[:60] for fv in present))
+    if "seniority" in specs and "seniority" not in out and title is not None:
+        level = seniority_of(title.value)
+        if level:
+            out["seniority"] = _derived(level, title, f"from the title {str(title.value)[:120]!r}")
+    if "job_family" in specs and "job_family" not in out and title is not None:
+        family = job_family_of(title.value)
+        if family:
+            out["job_family"] = _derived(family, title, f"from the title {str(title.value)[:120]!r}")
     return out
 
 

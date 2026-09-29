@@ -200,6 +200,8 @@ class PlatformWorker:
                 report["reaped"] += len(self.platform.tasks.reap(ctx))
                 report["requeued"] += self.platform.tasks.requeue_orphans(ctx)
                 report["monitors"] += self.platform.service("monitoring").schedule_due(ctx)
+                # Scraper runs whose task died with the worker: mark them so they can be retried.
+                report["scrape_recovered"] = report.get("scrape_recovered", 0) +                     self.platform.service("scraper").recover(ctx)
                 # Sequence steps advance only where sending is actually permitted
                 # (production + explicit flag). Elsewhere every send would just be
                 # recorded as "blocked" again each cycle, so nothing is scheduled.
@@ -214,8 +216,14 @@ class PlatformWorker:
                 log.exception("maintenance failed for workspace %s", workspace_id)
         return report
 
-    def run(self) -> None:
-        log.info("platform worker %s started", self.worker_id)
+    def run(self, concurrency: int = 1) -> None:
+        """Process tasks until stopped. ``concurrency`` > 1 runs that many tasks at once
+        (e.g. several scraper runs), each on its own thread; maintenance stays on this one."""
+        log.info("platform worker %s started (concurrency %s)", self.worker_id, concurrency)
+        extra = [threading.Thread(target=self._loop, name=f"platform-worker-{n}", daemon=True)
+                 for n in range(1, max(1, concurrency))]
+        for thread in extra:
+            thread.start()
         while not self._stopping.is_set():
             now = time.monotonic()
             if now - self._last_maintenance >= self.maintenance_seconds:
@@ -224,14 +232,23 @@ class PlatformWorker:
                 self.maintain()
             if not self.process_next():
                 self._stopping.wait(self.poll_seconds)
+        for thread in extra:
+            thread.join(timeout=self.lease_seconds)
         self.queue.forget_worker(self.worker_id)
         log.info("platform worker %s stopped", self.worker_id)
+
+    def _loop(self) -> None:
+        while not self._stopping.is_set():
+            if not self.process_next():
+                self._stopping.wait(self.poll_seconds)
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="CareerCrawler platform worker")
     parser.add_argument("--env-file")
     parser.add_argument("--once", action="store_true", help="run maintenance and at most one task, then exit")
+    parser.add_argument("--concurrency", type=int, default=int(os.environ.get("CAREERCLOUD_PLATFORM_CONCURRENCY", "1")),
+                        help="tasks processed at once (default 1)")
     args = parser.parse_args(argv)
     if args.env_file:
         from dotenv import load_dotenv
@@ -250,7 +267,7 @@ def main(argv=None) -> int:
             print(worker.maintain())
             worker.process_next()
         else:
-            worker.run()
+            worker.run(concurrency=max(1, min(args.concurrency, 16)))
     finally:
         platform.close()
     return 0

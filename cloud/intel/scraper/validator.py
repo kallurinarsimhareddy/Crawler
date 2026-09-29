@@ -1,9 +1,16 @@
-"""Checking records against their schema, and URL input validation.
+"""Checking records against their schema, and input URL validation.
 
-Validation never "fixes" meaning: a value that does not fit its declared type is
-set to ``None`` and reported as a problem, a missing required field is reported
-(and a job row without a title is dropped — it is not a job), and nothing is
-filled in.
+Validation never "fixes" meaning: a value that does not fit its field (type,
+enum, max length, pattern) is set to ``None``, its field status becomes
+``invalid``, and the rejected value is kept with its evidence and the error —
+nothing is filled in instead. A missing required field is reported.
+
+Field statuses: ``valid`` · ``invalid`` · ``missing`` · ``inferred`` (derived or
+AI-supplied) · ``conflict`` (another source disagreed; both values are kept).
+
+Filters: ``within_days`` and ``contains_any`` are *hard* (a row that fails, or
+whose value is unknown, is dropped and counted); ``mode: "soft"`` filters only
+annotate each row with pass / fail / unknown.
 """
 
 from __future__ import annotations
@@ -14,10 +21,13 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import urlsplit
 
 from cloud.intel.core.normalize import normalize_email
+from cloud.intel.scraper.schemas import canonical_type
 
-__all__ = ["apply_filters", "check_input_url", "validate_record", "valid_date", "valid_url"]
+__all__ = ["apply_filters", "check_input_url", "check_value", "valid_date", "valid_url", "validate_fields",
+           "validate_record"]
 
 _HOST = re.compile(r"^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9-]{2,59})$", re.I)
+_DEFAULT_MAX = {"string": 4000, "url": 2048, "email": 320, "phone": 32}
 
 
 def valid_url(value: Any) -> Optional[str]:
@@ -70,61 +80,157 @@ def check_input_url(raw: Any) -> Tuple[Optional[str], Optional[str]]:
     return parts.geturl(), None
 
 
-def validate_record(record: Mapping[str, Any], fields: Sequence[Mapping[str, Any]]
-                    ) -> Tuple[Dict[str, Any], List[str]]:
-    """Type-check every requested field. Returns ``(clean, problems)``; missing values are ``None``."""
+def check_value(spec: Mapping[str, Any], value: Any) -> Tuple[Any, Optional[str]]:
+    """``(clean, None)`` or ``(None, error)`` for one value of one field."""
+    kind = canonical_type(spec.get("type"))
+    name = spec.get("name", "value")
+    if kind == "url":
+        clean: Any = valid_url(value)
+    elif kind == "email":
+        clean = normalize_email(value)
+    elif kind == "phone":
+        digits = re.sub(r"\D", "", str(value))
+        clean = str(value).strip() if 7 <= len(digits) <= 15 and re.fullmatch(r"[+\d\s().\-x]+", str(value).strip()) \
+            else None
+    elif kind == "date":
+        clean = valid_date(value)
+    elif kind == "datetime":
+        try:
+            clean = datetime.fromisoformat(str(value).replace("Z", "+00:00")).isoformat() if value else None
+        except ValueError:
+            clean = None
+    elif kind == "integer":
+        if isinstance(value, bool):
+            clean = None
+        elif isinstance(value, int):
+            clean = value
+        else:
+            try:
+                number = float(re.sub(r"[,\s]", "", str(value)))
+                clean = int(number) if number.is_integer() else None
+            except ValueError:
+                clean = None
+    elif kind == "decimal":
+        try:
+            clean = None if isinstance(value, bool) else float(re.sub(r"[,$€£\s]", "", str(value)))
+        except ValueError:
+            clean = None
+    elif kind == "boolean":
+        clean = value if isinstance(value, bool) else None
+    elif kind == "enum":
+        allowed = spec.get("enum") or []
+        clean = value if (not allowed or value in allowed) else None
+        if clean is None:
+            return None, f"{name}: {str(value)[:80]!r} is not one of {', '.join(map(str, allowed))[:200]}"
+    elif kind == "array":
+        items = value if isinstance(value, list) else [value]
+        clean = [item if isinstance(item, (dict, int, float)) else re.sub(r"\s+", " ", str(item)).strip()[:500]
+                 for item in items if str(item).strip()][:100] or None
+    elif kind == "object":
+        clean = value if isinstance(value, dict) else None
+    else:
+        clean = re.sub(r"\s+", " ", str(value)).strip() or None
+    if clean is None:
+        return None, f"{name}: {str(value)[:80]!r} is not a valid {kind}"
+    limit = spec.get("max_length") or _DEFAULT_MAX.get(kind)
+    if limit and isinstance(clean, str) and len(clean) > int(limit):
+        if kind == "string" and not spec.get("max_length"):
+            clean = clean[: int(limit)]   # the default cap trims long page text; an explicit one rejects
+        else:
+            return None, f"{name}: longer than {limit} characters"
+    pattern = spec.get("pattern")
+    if pattern and isinstance(clean, str):
+        try:
+            if not re.fullmatch(pattern, clean):
+                return None, f"{name}: {clean[:80]!r} does not match {pattern}"
+        except re.error:
+            return None, f"{name}: invalid pattern in the schema"
+    return clean, None
+
+
+def validate_fields(record: Mapping[str, Any], fields: Sequence[Mapping[str, Any]], *,
+                    methods: Optional[Mapping[str, str]] = None, conflicts: Iterable[str] = ()
+                    ) -> Tuple[Dict[str, Any], Dict[str, str], Dict[str, str]]:
+    """Returns ``(clean, statuses, errors)``: cleaned values, a status per field, and an
+    error per invalid or missing-required field."""
     clean: Dict[str, Any] = {}
-    problems: List[str] = []
+    statuses: Dict[str, str] = {}
+    errors: Dict[str, str] = {}
+    conflicted = set(conflicts)
     for spec in fields:
-        name, kind = spec["name"], spec.get("type", "string")
+        name = spec["name"]
         value = record.get(name)
         if value in (None, "", []):
             clean[name] = None
+            statuses[name] = "missing"
             if spec.get("required"):
-                problems.append(f"{name}: required but not found")
+                errors[name] = f"{name}: required but not found"
             continue
-        if kind == "url":
-            checked: Any = valid_url(value)
-        elif kind == "email":
-            checked = normalize_email(value)
-        elif kind == "date":
-            checked = valid_date(value)
-        elif kind == "number":
-            try:
-                checked = float(re.sub(r"[,$€£\s]", "", str(value)))
-                checked = int(checked) if checked.is_integer() else checked
-            except ValueError:
-                checked = None
-        elif kind == "boolean":
-            checked = value if isinstance(value, bool) else {"true": True, "yes": True, "false": False,
-                                                              "no": False}.get(str(value).strip().lower())
-        elif kind == "list":
-            items = value if isinstance(value, list) else [value]
-            checked = [re.sub(r"\s+", " ", str(v)).strip()[:500] for v in items if str(v).strip()][:50] or None
-        else:
-            checked = re.sub(r"\s+", " ", str(value)).strip()[:4000] or None
-        if checked is None:
-            problems.append(f"{name}: {str(value)[:80]!r} is not a valid {kind}; left empty")
+        checked, error = check_value(spec, value)
         clean[name] = checked
+        if error:
+            statuses[name] = "invalid"
+            errors[name] = error
+        elif name in conflicted:
+            statuses[name] = "conflict"
+        elif (methods or {}).get(name) in ("ai", "derived"):
+            statuses[name] = "inferred"
+        else:
+            statuses[name] = "valid"
+    return clean, statuses, errors
+
+
+def validate_record(record: Mapping[str, Any], fields: Sequence[Mapping[str, Any]]
+                    ) -> Tuple[Dict[str, Any], List[str]]:
+    """Type-check every requested field. Returns ``(clean, problems)``; missing values are ``None``."""
+    clean, _statuses, errors = validate_fields(record, fields)
+    problems = [e if "required" in e else e + "; left empty" for e in errors.values()]
     return clean, problems
+
+
+def _passes(record: Mapping[str, Any], rule: Mapping[str, Any], now: datetime) -> Optional[bool]:
+    """True / False, or ``None`` when the record does not state the value."""
+    value = record.get(rule.get("field"))
+    op = rule.get("op")
+    if op == "within_days":
+        day = valid_date(value)
+        if day is None:
+            return None
+        return date.fromisoformat(day) >= (now - timedelta(days=int(rule["value"]))).date()
+    if op == "contains_any":
+        if value in (None, "", []):
+            return None
+        text = " ".join(map(str, value)) if isinstance(value, list) else str(value)
+        return any(re.search(r"(?<![A-Za-z0-9])" + re.escape(str(k)) + r"(?![A-Za-z0-9])", text, re.I)
+                   for k in rule.get("value") or [])
+    if op == "equals":
+        if value in (None, ""):
+            return None
+        return str(value).strip().lower() == str(rule.get("value")).strip().lower()
+    return True
 
 
 def apply_filters(records: Iterable[Dict[str, Any]], filters: Sequence[Mapping[str, Any]], *,
                   now: Optional[datetime] = None) -> Tuple[List[Dict[str, Any]], int]:
-    """Keep records passing every filter. Returns ``(kept, dropped)``.
+    """Keep records passing every hard filter. Returns ``(kept, dropped)``.
 
-    ``within_days`` keeps only records whose date is known and recent enough: an
-    undated posting cannot be shown to be recent, so it is dropped (and counted).
+    A hard filter drops a row whose value is unknown too: an undated posting cannot
+    be shown to be recent. Soft filters annotate ``_filters`` and never drop.
     """
     now = now or datetime.now(timezone.utc)
     kept, dropped = [], 0
     for record in records:
         ok = True
+        notes: Dict[str, str] = {}
         for rule in filters:
-            if rule.get("op") == "within_days":
-                value = valid_date(record.get(rule["field"]))
-                if value is None or date.fromisoformat(value) < (now - timedelta(days=int(rule["value"]))).date():
-                    ok = False
+            result = _passes(record, rule, now)
+            label = f"{rule.get('field')} {rule.get('op')}"
+            if rule.get("mode", "hard") == "soft":
+                notes[label] = "unknown" if result is None else "pass" if result else "fail"
+            elif not result:
+                ok = False
+        if notes:
+            record["_filters"] = notes
         if ok:
             kept.append(record)
         else:

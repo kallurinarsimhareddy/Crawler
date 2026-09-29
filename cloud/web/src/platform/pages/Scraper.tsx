@@ -1,7 +1,8 @@
-// The AI scraper: URLs (pasted or CSV/XLSX) + a plain-language instruction -> a run
-// with live progress -> Companies / Jobs / All-fields results -> CSV, XLSX, JSON.
+// SANA GTM AI Scraper: URLs (paste / CSV / TXT / XLSX) + an instruction -> schema preview (editable)
+// -> advanced options -> work & cost estimate -> run (a persistent background job) -> live progress
+// -> All / Companies / Jobs / Pages / Errors / Evidence / CRM -> CSV, XLSX, JSON, NDJSON.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
@@ -15,35 +16,67 @@ const EXAMPLES = [
   "Find all job titles and job URLs from this page.",
 ];
 
+const TYPES = ["string", "integer", "decimal", "boolean", "date", "datetime", "url", "email", "phone", "enum", "array", "object"];
+const ACTIVE = ["queued", "planning", "fetching", "extracting", "paginating", "enriching", "validating", "normalizing", "saving", "running"];
+
 interface Field {
   name: string;
+  label?: string;
   type: string;
   level?: string;
   required?: boolean;
   source?: string;
+  enum?: string[] | null;
+  hint?: string | null;
+  description?: string;
 }
 
 interface Schema {
   entity: string;
+  entities?: string[];
   fields: Field[];
-  filters?: { field: string; op: string; value: number }[];
+  filters?: { field: string; op: string; value: unknown; mode?: string }[];
+  criteria?: Record<string, unknown>;
   custom?: string[];
   parser?: string;
   ai_note?: string;
+  instruction?: string;
 }
 
-interface Progress {
-  total?: number;
-  processed?: number;
-  completed?: number;
-  failed?: number;
-  pages?: number;
-  records?: number;
-  current_url?: string | null;
-  stage?: string;
-  ai_calls?: number;
-  ai_note?: string | null;
+interface Options {
+  max_pages: number;
+  max_records: number;
+  max_runtime_minutes: number;
+  follow_details: boolean;
+  browser: boolean;
+  pagination: boolean;
+  use_ai: boolean;
+  concurrency: number;
 }
+
+interface Plan {
+  inputs: { accepted: number; rejected: { row: number; url: string; reason: string }[]; report: Record<string, number> };
+  sources: { url: string; row: number; label: string; kind: string; official_api?: boolean }[];
+  schema: Schema;
+  limits: Record<string, number>;
+  browser: { requested: boolean; available: boolean; note?: string | null };
+  estimate: { pages_max: number; requests_max: number; requests_typical: number; ai_calls_max: number; estimated_cost_usd: number | null; cost_note: string; ai_free_only: boolean };
+  requires_confirmation: boolean;
+  confirmation_reasons: string[];
+}
+
+interface Template {
+  id: string;
+  name: string;
+  description?: string;
+  category?: string;
+  instruction: string;
+  schema?: Schema | Record<string, never>;
+  options?: Partial<Options> & { max_runtime_s?: number };
+  builtin: boolean;
+}
+
+const DEFAULT_OPTIONS: Options = { max_pages: 25, max_records: 10000, max_runtime_minutes: 30, follow_details: false, browser: false, pagination: true, use_ai: true, concurrency: 4 };
 
 const label = (name: string) => name.replace(/_/g, " ");
 
@@ -53,7 +86,7 @@ function FieldChips({ schema }: { schema: Schema }) {
       <span className="muted small">{schema.entity === "job" ? "One row per job posting:" : "One row per company/page:"}</span>
       <span className="chips">
         {schema.fields.map((f) => (
-          <span key={f.name} className="chip" title={`${f.type}${f.required ? ", required" : ""}${f.source === "custom" ? ", custom field (filled by AI when allowed)" : ""}`}>
+          <span key={f.name} className="chip" title={`${f.type}${f.required ? ", required" : ""}${f.source === "custom" ? ", custom field" : ""}`}>
             {label(f.name)}
             <span className="muted"> · {f.type}</span>
             {f.required ? " *" : ""}
@@ -61,13 +94,134 @@ function FieldChips({ schema }: { schema: Schema }) {
         ))}
       </span>
       {schema.filters?.map((f) => (
-        <span key={f.field} className="chip">
-          {label(f.field)} within {f.value} days
+        <span key={`${f.field}${f.op}`} className="chip chip--warn">
+          {label(f.field)} {f.op === "within_days" ? `within ${String(f.value)} days` : `contains ${(f.value as string[]).join(" / ")}`}
         </span>
       ))}
       {schema.ai_note && <span className="muted small">{schema.ai_note}</span>}
     </div>
   );
+}
+
+function SchemaEditor({ schema, onChange }: { schema: Schema; onChange: (s: Schema) => void }) {
+  const set = (fields: Field[]) => onChange({ ...schema, fields });
+  const update = (i: number, patch: Partial<Field>) => set(schema.fields.map((f, j) => (j === i ? { ...f, ...patch } : f)));
+  const move = (i: number, d: number) => {
+    const fields = [...schema.fields];
+    const [f] = fields.splice(i, 1);
+    fields.splice(Math.max(0, Math.min(fields.length, i + d)), 0, f);
+    set(fields);
+  };
+  return (
+    <div className="table-wrap">
+      <table className="table scraper-schema-editor">
+        <thead>
+          <tr>
+            <th>Order</th>
+            <th>Field</th>
+            <th>Type</th>
+            <th>Level</th>
+            <th>Required</th>
+            <th>Source</th>
+            <th />
+          </tr>
+        </thead>
+        <tbody>
+          {schema.fields.map((f, i) => (
+            <tr key={i}>
+              <td className="nowrap">
+                <button type="button" className="button button--ghost button--small" aria-label="Move up" disabled={i === 0} onClick={() => move(i, -1)}>↑</button>
+                <button type="button" className="button button--ghost button--small" aria-label="Move down" disabled={i === schema.fields.length - 1} onClick={() => move(i, 1)}>↓</button>
+              </td>
+              <td>
+                <input className="input input--small" value={f.name} aria-label="Field name" onChange={(e) => update(i, { name: e.target.value })} />
+                {f.type === "enum" && (
+                  <input className="input input--small" placeholder="Allowed values, comma-separated" value={(f.enum ?? []).join(", ")} onChange={(e) => update(i, { enum: e.target.value.split(",").map((v) => v.trim()).filter(Boolean) })} />
+                )}
+              </td>
+              <td>
+                <select className="input input--small" value={f.type} aria-label="Type" onChange={(e) => update(i, { type: e.target.value })}>
+                  {TYPES.map((t) => <option key={t}>{t}</option>)}
+                </select>
+              </td>
+              <td>
+                <select className="input input--small" value={f.level ?? "company"} aria-label="Level" onChange={(e) => update(i, { level: e.target.value })}>
+                  <option value="company">company</option>
+                  <option value="job">job</option>
+                </select>
+              </td>
+              <td><input type="checkbox" checked={Boolean(f.required)} aria-label="Required" onChange={(e) => update(i, { required: e.target.checked })} /></td>
+              <td className="small muted">{f.source ?? "user"}</td>
+              <td><button type="button" className="button button--ghost button--small" onClick={() => set(schema.fields.filter((_, j) => j !== i))}>Remove</button></td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <button type="button" className="button button--ghost button--small" onClick={() => set([...schema.fields, { name: `field_${schema.fields.length + 1}`, type: "string", level: schema.entity === "job" ? "job" : "company", source: "user" }])}>
+        + Add field
+      </button>
+    </div>
+  );
+}
+
+function OptionsPanel({ options, onChange }: { options: Options; onChange: (o: Options) => void }) {
+  const num = (key: keyof Options, text: string, min: number, max: number) => (
+    <label className="field">
+      <span className="field__label">{text}</span>
+      <input className="input" type="number" min={min} max={max} value={options[key] as number} onChange={(e) => onChange({ ...options, [key]: Number(e.target.value) })} />
+    </label>
+  );
+  const box = (key: keyof Options, text: string) => (
+    <label className="checkbox">
+      <input type="checkbox" checked={options[key] as boolean} onChange={(e) => onChange({ ...options, [key]: e.target.checked })} />
+      <span>{text}</span>
+    </label>
+  );
+  return (
+    <details className="scraper-advanced">
+      <summary>Advanced options</summary>
+      <div className="field-row">
+        {num("max_pages", "Max pages per URL", 1, 500)}
+        {num("max_records", "Max records", 1, 100000)}
+        {num("max_runtime_minutes", "Max runtime (minutes)", 1, 360)}
+        {num("concurrency", "URLs at once", 1, 16)}
+      </div>
+      <div className="scraper-checks">
+        {box("pagination", "Follow pagination / load-more links")}
+        {box("follow_details", "Open each job's detail page")}
+        {box("browser", "Browser rendering fallback (JavaScript pages)")}
+        {box("use_ai", "AI extraction when rules can't find a field (free tier, $0)")}
+      </div>
+    </details>
+  );
+}
+
+function Templates({ onPick, reloadKey }: { onPick: (t: Template) => void; reloadKey: number }) {
+  const client = useWs();
+  const list = useLoad((signal) => client.get<{ items: Template[] }>("/scraper/templates", undefined, signal), client.base + "tpl" + reloadKey);
+  const action = useAction();
+  const items = list.data?.items ?? [];
+  return (
+    <div className="scraper-templates">
+      <span className="field__label">Templates</span>
+      <div className="chips">
+        {items.map((t) => (
+          <span key={t.id} className="chip chip--button-group">
+            <button type="button" className="chip chip--button" title={t.description} onClick={() => onPick(t)}>{t.name}</button>
+            <button type="button" className="chip chip--button" title="Duplicate" onClick={() => void action.run(async () => { await client.post(`/scraper/templates/${t.id}/duplicate`, {}); list.refresh(); })}>⧉</button>
+            {!t.builtin && (
+              <button type="button" className="chip chip--button" title="Delete" onClick={() => void action.run(async () => { await client.del(`/scraper/templates/${t.id}`); list.refresh(); })}>✕</button>
+            )}
+          </span>
+        ))}
+      </div>
+      {action.error && <ErrorBanner error={action.error} />}
+    </div>
+  );
+}
+
+function toOptionsPayload(o: Options) {
+  return { ...o, max_runtime_minutes: o.max_runtime_minutes };
 }
 
 export function Scraper() {
@@ -77,42 +231,80 @@ export function Scraper() {
   const [file, setFile] = useState<File | null>(null);
   const [column, setColumn] = useState("");
   const [instruction, setInstruction] = useState(EXAMPLES[0]);
-  const [useAi, setUseAi] = useState(true);
+  const [options, setOptions] = useState<Options>(DEFAULT_OPTIONS);
+  const [plan, setPlan] = useState<Plan | null>(null);
   const [schema, setSchema] = useState<Schema | null>(null);
+  const [templateId, setTemplateId] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState(false);
+  const [templateName, setTemplateName] = useState("");
+  const [tplKey, setTplKey] = useState(0);
   const action = useAction();
   const urlCount = urls.split(/\n/).filter((line) => line.trim()).length;
   const ready = instruction.trim() && (urlCount > 0 || file);
 
+  const invalidate = () => {
+    setPlan(null);
+    setConfirm(false);
+  };
+
+  const body = (withSchema: boolean) => ({
+    urls,
+    instruction,
+    options: toOptionsPayload(options),
+    ...(withSchema && schema ? { schema } : {}),
+    ...(templateId ? { template_id: templateId } : {}),
+  });
+
+  const formFields = (withSchema: boolean): Record<string, string> => ({
+    instruction,
+    urls,
+    column,
+    options: JSON.stringify(toOptionsPayload(options)),
+    ...(withSchema && schema ? { schema: JSON.stringify(schema) } : {}),
+    ...(templateId ? { template_id: templateId } : {}),
+  });
+
+  const preview = () =>
+    action.run(async () => {
+      const result = file ? await client.upload<Plan>("/scraper/plan", [file], formFields(Boolean(schema))) : await client.post<Plan>("/scraper/plan", body(Boolean(schema)));
+      setPlan(result);
+      setSchema(result.schema);
+      setConfirm(false);
+    });
+
   const run = () =>
     action.run(async () => {
-      const started = file
-        ? await client.upload<Row>("/scraper/runs", [file], { instruction, urls, column, use_ai: String(useAi) })
-        : await client.post<Row>("/scraper/runs", { instruction, urls, use_ai: useAi });
+      const fields = { ...formFields(true), confirm: String(confirm) };
+      const started = file ? await client.upload<Row>("/scraper/runs", [file], fields) : await client.post<Row>("/scraper/runs", { ...body(true), confirm });
       navigate(`/scraper/${started.id}`);
     });
+
+  const pickTemplate = (t: Template) => {
+    setInstruction(t.instruction);
+    setTemplateId(t.id);
+    const o = t.options ?? {};
+    setOptions({ ...DEFAULT_OPTIONS, ...o, max_runtime_minutes: o.max_runtime_s ? Math.round(o.max_runtime_s / 60) : DEFAULT_OPTIONS.max_runtime_minutes } as Options);
+    setSchema(t.schema && "fields" in t.schema ? (t.schema as Schema) : null);
+    invalidate();
+  };
 
   return (
     <div className="page">
       <PageHeader
         title="AI Scraper"
-        subtitle="Paste URLs or upload a CSV/XLSX, say what to extract, and run. Structured data and page links are read first; AI (Gemini, free tier) is used only for what they can't find. Pages that block robots, need a login or show a CAPTCHA are reported, never bypassed."
+        subtitle="Paste URLs or upload a CSV/TXT/XLSX, say what to extract, review the schema and estimate, and run. Structured data, official job-board APIs and page links are read first; AI (Gemini free tier, $0) only fills what they can't. Pages behind a login, CAPTCHA or firewall are reported, never bypassed."
       />
       <div className="card form scraper-form">
+        <Templates onPick={pickTemplate} reloadKey={tplKey} />
         <label className="field field--wide">
-          <span className="field__label">URLs</span>
-          <textarea
-            className="input textarea mono"
-            rows={5}
-            value={urls}
-            onChange={(e) => setUrls(e.target.value)}
-            placeholder={"https://example1.com\nhttps://example2.com\nhttps://example3.com"}
-          />
+          <span className="field__label">1 · URLs</span>
+          <textarea className="input textarea mono" rows={5} value={urls} onChange={(e) => { setUrls(e.target.value); invalidate(); }} placeholder={"https://example1.com\nhttps://example2.com\nhttps://example3.com"} />
           <span className="field__hint">{urlCount ? `${urlCount} line${urlCount === 1 ? "" : "s"}` : "One per line"}</span>
         </label>
         <div className="field-row">
           <label className="field">
-            <span className="field__label">…or upload CSV / XLSX</span>
-            <input type="file" accept=".csv,.xlsx,.txt" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
+            <span className="field__label">…or upload CSV / TXT / XLSX</span>
+            <input type="file" accept=".csv,.xlsx,.txt,.tsv" onChange={(e) => { setFile(e.target.files?.[0] ?? null); invalidate(); }} />
           </label>
           <label className="field">
             <span className="field__label">URL column (optional)</span>
@@ -120,54 +312,71 @@ export function Scraper() {
           </label>
         </div>
         <label className="field field--wide">
-          <span className="field__label">What should I extract?</span>
-          <textarea
-            className="input textarea"
-            rows={2}
-            value={instruction}
-            onChange={(e) => {
-              setInstruction(e.target.value);
-              setSchema(null);
-            }}
-            placeholder="Get company name, website and job titles…"
-          />
+          <span className="field__label">2 · What should I extract?</span>
+          <textarea className="input textarea" rows={2} value={instruction} onChange={(e) => { setInstruction(e.target.value); setSchema(null); setTemplateId(null); invalidate(); }} placeholder="Get company name, website and job titles…" />
         </label>
         <div className="chips">
           {EXAMPLES.map((example) => (
-            <button
-              key={example}
-              type="button"
-              className="chip chip--button"
-              onClick={() => {
-                setInstruction(example);
-                setSchema(null);
-              }}
-            >
+            <button key={example} type="button" className="chip chip--button" onClick={() => { setInstruction(example); setSchema(null); setTemplateId(null); invalidate(); }}>
               {example}
             </button>
           ))}
         </div>
-        {schema && <FieldChips schema={schema} />}
-        <label className="checkbox">
-          <input type="checkbox" checked={useAi} onChange={(e) => setUseAi(e.target.checked)} />
-          <span>Use AI when the rules can't find a field (free tier only, $0)</span>
-        </label>
+        <OptionsPanel options={options} onChange={(o) => { setOptions(o); invalidate(); }} />
         {action.error && <ErrorBanner error={action.error} />}
         <div className="form__actions">
-          <button
-            type="button"
-            className="button button--ghost"
-            disabled={action.busy || !instruction.trim()}
-            onClick={() => action.run(async () => setSchema(await client.post<Schema>("/scraper/schema", { instruction })))}
-          >
-            Preview fields
-          </button>
-          <button type="button" className="button button--primary button--large" disabled={action.busy || !ready} onClick={() => void run()}>
-            {action.busy ? "Starting…" : "Run scraper"}
+          <button type="button" className="button button--ghost" disabled={action.busy || !ready} onClick={() => void preview()}>
+            {plan ? "Re-check plan" : "3 · Preview schema & estimate"}
           </button>
         </div>
+        {plan && schema && (
+          <div className="scraper-plan">
+            <h3 className="section-title">Schema</h3>
+            <FieldChips schema={schema} />
+            <SchemaEditor schema={schema} onChange={(s) => { setSchema(s); setConfirm(false); }} />
+            {plan.schema.criteria && Object.keys(plan.schema.criteria).length > 0 && (
+              <p className="small muted">Research criteria (shown, never used to drop rows): {JSON.stringify(plan.schema.criteria)}</p>
+            )}
+            <h3 className="section-title">Sources</h3>
+            <DataTable
+              rows={plan.sources.slice(0, 20).map((s, i) => ({ ...s, id: String(i) }) as unknown as Row)}
+              columns={[
+                { key: "row", label: "Row" },
+                { key: "url", label: "URL", className: "mono small" },
+                { key: "label", label: "Detected source" },
+              ]}
+            />
+            {plan.inputs.rejected.length > 0 && <p className="small">{plan.inputs.rejected.length} inputs will be skipped: {plan.inputs.rejected.slice(0, 5).map((r) => `row ${r.row} (${r.reason})`).join(", ")}</p>}
+            <h3 className="section-title">5 · Work & cost estimate</h3>
+            <div className="stats">
+              <Stat label="URLs" value={fmt(plan.inputs.accepted)} />
+              <Stat label="Pages (max)" value={fmt(plan.estimate.pages_max)} />
+              <Stat label="Requests" value={`~${fmt(plan.estimate.requests_typical)}`} hint={`max ${fmt(plan.estimate.requests_max)}`} />
+              <Stat label="AI calls (max)" value={fmt(plan.estimate.ai_calls_max)} />
+              <Stat label="Estimated AI cost" value={plan.estimate.estimated_cost_usd === null ? "?" : `$${plan.estimate.estimated_cost_usd.toFixed(2)}`} hint={plan.estimate.cost_note} />
+            </div>
+            <p className="small muted">
+              Limits: {plan.limits.max_pages} pages per URL · {fmt(plan.limits.max_records)} records · {Math.round(plan.limits.max_runtime_s / 60)} min · browser {plan.browser.requested ? (plan.browser.available ? "on" : "requested, unavailable on this server") : "off"}
+            </p>
+            {plan.requires_confirmation && (
+              <label className="checkbox scraper-confirm">
+                <input type="checkbox" checked={confirm} onChange={(e) => setConfirm(e.target.checked)} />
+                <span>High-volume run ({plan.confirmation_reasons.join("; ")}). I confirm.</span>
+              </label>
+            )}
+            <div className="form__actions">
+              <input className="input input--small" placeholder="Template name" value={templateName} onChange={(e) => setTemplateName(e.target.value)} />
+              <button type="button" className="button button--ghost" disabled={action.busy || !templateName.trim()} onClick={() => void action.run(async () => { await client.post("/scraper/templates", { name: templateName, instruction, schema, options: toOptionsPayload(options) }); setTemplateName(""); setTplKey((k) => k + 1); })}>
+                Save as template
+              </button>
+              <button type="button" className="button button--primary button--large" disabled={action.busy || (plan.requires_confirmation && !confirm)} onClick={() => void run()}>
+                {action.busy ? "Starting…" : "6 · Run scraper"}
+              </button>
+            </div>
+          </div>
+        )}
       </div>
-      <h2 className="section-title">Recent runs</h2>
+      <h2 className="section-title">Run history</h2>
       <ResourceList
         load={(q, s) => client.list("/scraper/runs", q, s)}
         link={(r) => `/scraper/${r.id}`}
@@ -175,7 +384,7 @@ export function Scraper() {
           { key: "instruction", label: "Instruction" },
           { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
           { key: "url_count", label: "URLs", render: (r) => fmt((r.stats as Row | undefined)?.url_count) },
-          { key: "records", label: "Records", render: (r) => fmt((r.stats as Row | undefined)?.records ?? ((r.stats as Row | undefined)?.progress as Progress | undefined)?.records) },
+          { key: "records", label: "Records", render: (r) => fmt((r.stats as Row | undefined)?.records ?? ((r.stats as Row | undefined)?.progress as Row | undefined)?.records) },
           { key: "created_at", label: "Started", render: (r) => fmtDate(r.created_at) },
         ]}
       />
@@ -183,46 +392,55 @@ export function Scraper() {
   );
 }
 
-// --- one run --------------------------------------------------------------------------
+// --- one run --------------------------------------------------------------------------------
 
-type View = "companies" | "jobs" | "all";
+type View = "all" | "companies" | "jobs" | "pages" | "errors" | "evidence" | "crm";
 
 function ProgressPanel({ run }: { run: Row }) {
   const stats = (run.stats ?? {}) as Row;
-  const progress = (stats.progress ?? {}) as Progress;
-  const total = progress.total ?? Number(stats.url_count ?? 0);
-  const done = progress.processed ?? 0;
+  const p = (stats.progress ?? {}) as Row;
+  const obs = (stats.observability ?? {}) as Row;
+  const total = Number(p.total ?? stats.url_count ?? 0);
+  const done = Number(p.processed ?? 0);
   const percent = total ? Math.min(100, Math.round((done / total) * 100)) : 0;
   const status = String(run.status);
-  const active = status === "queued" || status === "running";
+  const active = ACTIVE.includes(status);
+  const current = (p.current_urls as string[] | undefined) ?? [];
   return (
     <div className="card pad">
       <div className="progress">
         <div className="progress__track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
-          <div className={`progress__fill progress__fill--${status}`} style={{ width: `${percent}%` }} />
+          <div className={`progress__fill progress__fill--${active ? "running" : status}`} style={{ width: `${percent}%` }} />
         </div>
         <div className="progress__meta">
           <span>
-            Stage: <strong>{progress.stage ?? (active ? "Queued" : status)}</strong>
+            Stage: <strong>{String(p.stage ?? status)}</strong>
           </span>
           <span className="tabular">
             {done} / {total} · {percent}%
           </span>
         </div>
       </div>
-      <div className="stats">
+      <div className="stats scraper-stats">
         <Stat label="URLs" value={`${done} / ${total}`} />
-        <Stat label="Pages" value={fmt(progress.pages ?? 0)} />
-        <Stat label="Records" value={fmt(stats.records ?? progress.records ?? 0)} />
-        <Stat label="Completed" value={fmt(progress.completed ?? 0)} />
-        <Stat label="Failed / blocked" value={fmt(progress.failed ?? 0)} />
+        <Stat label="Pages" value={fmt(p.pages ?? obs.pages_visited ?? 0)} />
+        <Stat label="Records" value={fmt(stats.records ?? p.records ?? 0)} />
+        <Stat label="Jobs" value={fmt(p.jobs ?? obs.jobs_found ?? "—")} />
+        <Stat label="Companies" value={fmt(p.companies ?? obs.companies_found ?? "—")} />
+        <Stat label="Requests" value={fmt(p.requests ?? obs.requests ?? 0)} />
+        <Stat label="Completed" value={fmt(p.completed ?? 0)} />
+        <Stat label="Blocked" value={fmt(p.blocked ?? obs.blocked_urls ?? 0)} />
+        <Stat label="Errors" value={fmt(p.failed ?? 0)} hint={stats.errors !== undefined ? `${fmt(stats.errors)} notes` : undefined} />
+        <Stat label="AI calls" value={fmt(p.ai_calls ?? stats.ai_calls ?? 0)} hint={`${fmt(p.ai_failures ?? stats.ai_failures ?? 0)} failed`} />
+        <Stat label="Browser pages" value={fmt(p.browser_pages ?? obs.browser_pages ?? 0)} />
+        {obs.duration_seconds !== undefined && <Stat label="Duration" value={`${fmt(obs.duration_seconds)} s`} />}
       </div>
-      {active && progress.current_url && (
+      {active && current.length > 0 && (
         <p className="small">
-          Current: <span className="mono">{progress.current_url}</span>
+          Current: {current.map((u) => <span key={u} className="mono">{u} </span>)}
         </p>
       )}
-      {Boolean(progress.ai_note || stats.ai_note) && <p className="small muted">AI: {String(progress.ai_note ?? stats.ai_note)}{progress.ai_calls ? ` · ${progress.ai_calls} call(s)` : ""}</p>}
+      {Boolean(p.ai_note || stats.ai_note) && <p className="small muted">AI: {String(p.ai_note ?? stats.ai_note)}</p>}
       {run.error ? <p className="small error-text">{String(run.error)}</p> : null}
     </div>
   );
@@ -230,9 +448,10 @@ function ProgressPanel({ run }: { run: Row }) {
 
 function Cell({ value, type }: { value: unknown; type?: string }) {
   if (value === null || value === undefined || value === "") return <span className="muted">—</span>;
-  if (Array.isArray(value)) return <span>{value.map(String).join(" | ")}</span>;
+  if (Array.isArray(value)) return <span>{value.map((v) => (typeof v === "object" ? JSON.stringify(v) : String(v))).join(" | ")}</span>;
+  if (typeof value === "object") return <code className="small">{JSON.stringify(value)}</code>;
   const text = String(value);
-  if ((type === "url" || /^https?:\/\//.test(text)) && /^https?:\/\//.test(text)) {
+  if (/^https?:\/\//.test(text) && (type === "url" || type === undefined || /^https?:\/\//.test(text))) {
     return (
       <a className="link mono small" href={text} target="_blank" rel="noopener noreferrer nofollow">
         {text.length > 70 ? text.slice(0, 70) + "…" : text}
@@ -242,64 +461,171 @@ function Cell({ value, type }: { value: unknown; type?: string }) {
   return <span>{fmt(value)}</span>;
 }
 
-function Results({ run }: { run: Row }) {
+function RecordsTable({ run, view }: { run: Row; view: "all" | "companies" | "jobs" }) {
   const client = useWs();
   const schema = run.schema as Schema;
-  const views: { key: View; label: string }[] =
-    schema.entity === "job"
-      ? [{ key: "companies", label: "Companies" }, { key: "jobs", label: "Jobs" }, { key: "all", label: "All fields" }]
-      : [{ key: "companies", label: "Companies" }, { key: "all", label: "All fields" }];
-  const [view, setView] = useState<View>(schema.entity === "job" ? "jobs" : "companies");
+  const types = Object.fromEntries(schema.fields.map((f) => [f.name, f.type]));
   const records = useLoad(
     (signal) => client.get<{ columns: string[]; items: Row[]; total: number; final: boolean }>(`/scraper/runs/${run.id}/records`, { view, limit: 2000 }, signal),
     `${client.base}${run.id}${view}${String(run.status)}${String(run.updated_at)}`,
   );
-  const action = useAction();
-  const types = Object.fromEntries(schema.fields.map((f) => [f.name, f.type]));
-  const files = ((run.stats as Row)?.files ?? {}) as Record<string, unknown>;
-  const download = (fmtName: "csv" | "xlsx" | "json") =>
-    action.run(() => {
-      const csvView = fmtName === "csv" && view !== "all" ? view : "all";
-      const name = fmtName === "csv" ? `scrape-${run.id}-${csvView === "all" ? "results" : csvView}.csv` : `scrape-${run.id}.${fmtName}`;
-      return client.download(`/scraper/runs/${run.id}/files/${fmtName}${csvView !== "all" ? `?view=${csvView}` : ""}`, name);
-    });
-  const data = records.data;
-  const columns = (data?.columns ?? []).filter((c) => c !== "extracted_at");
+  if (records.error) return <ErrorBanner error={records.error} />;
+  if (!records.data) return <Loading />;
+  const columns = records.data.columns.filter((c) => c !== "extracted_at");
   return (
-    <div className="card">
-      <div className="card__header scraper-results__header">
-        <Tabs tabs={views.map((v) => ({ key: v.key, label: v.label, count: v.key === view ? data?.total : undefined }))} active={view} onChange={(k) => setView(k as View)} />
-        <div className="scraper-downloads">
-          {(["csv", "xlsx", "json"] as const).map((f) => (
-            <button key={f} type="button" className="button button--ghost button--small" disabled={action.busy || !files[f]} onClick={() => void download(f)}>
-              Download {f.toUpperCase()}
-            </button>
-          ))}
-        </div>
+    <DataTable
+      rows={records.data.items.map((r, i) => ({ ...r, id: `${i}` }))}
+      empty={records.data.final ? "No records." : "Results appear here when the run finishes."}
+      columns={columns.map((c) => ({
+        key: c,
+        label: label(c),
+        className: c === "confidence" || c === "job_count" ? "tabular" : undefined,
+        render: (r: Row) => {
+          const status = ((r._field_status ?? {}) as Record<string, string>)[c];
+          const cell = <Cell value={r[c]} type={types[c]} />;
+          return status && status !== "valid" && status !== "missing" ? (
+            <span title={status}>
+              {cell} <span className={`chip ${status === "invalid" || status === "conflict" ? "chip--warn" : ""}`}>{status}</span>
+            </span>
+          ) : c === "source_url" && Array.isArray(r.source_urls) && (r.source_urls as string[]).length > 1 ? (
+            <span title={(r.source_urls as string[]).join("\n")}>
+              {cell} <span className="muted small">+{(r.source_urls as string[]).length - 1}</span>
+            </span>
+          ) : (
+            cell
+          );
+        },
+      }))}
+    />
+  );
+}
+
+function PagesTable({ run }: { run: Row }) {
+  const client = useWs();
+  const pages = useLoad((signal) => client.get<{ items: Row[]; total: number }>(`/scraper/runs/${run.id}/pages`, { limit: 1000 }, signal), `${client.base}${run.id}pages${String(run.updated_at)}`);
+  return (
+    <DataTable
+      rows={pages.data?.items ?? []}
+      empty="No pages visited yet."
+      columns={[
+        { key: "input_index", label: "Input", render: (r) => fmt(Number(r.input_index) + 1) },
+        { key: "url", label: "URL", render: (r) => <Cell value={r.url} type="url" /> },
+        { key: "kind", label: "Kind" },
+        { key: "outcome", label: "Outcome", render: (r) => <Pill value={r.outcome} /> },
+        { key: "http_status", label: "HTTP" },
+        { key: "records", label: "Records" },
+        { key: "attempts", label: "Attempts" },
+        { key: "browser_used", label: "Browser", render: (r) => (r.browser_used ? <span title={String(r.browser_reason ?? "")}>yes · {fmt(r.browser_duration_ms)} ms</span> : "—") },
+        { key: "error", label: "Notes", className: "small" },
+      ]}
+    />
+  );
+}
+
+function ErrorsTable({ run }: { run: Row }) {
+  const client = useWs();
+  const errors = useLoad((signal) => client.get<{ items: Row[]; total: number }>(`/scraper/runs/${run.id}/errors`, undefined, signal), `${client.base}${run.id}errors${String(run.updated_at)}`);
+  return (
+    <DataTable
+      rows={(errors.data?.items ?? []).map((r, i) => ({ ...r, id: String(i) }) as Row)}
+      empty={run.stats && (run.stats as Row).files ? "No errors." : "Errors appear when the run finishes."}
+      columns={[
+        { key: "kind", label: "Kind" },
+        { key: "input_row", label: "Row" },
+        { key: "url", label: "URL", render: (r) => <Cell value={r.url} type="url" /> },
+        { key: "outcome", label: "Outcome", render: (r) => <Pill value={r.outcome} /> },
+        { key: "field", label: "Field" },
+        { key: "error", label: "Error", className: "small" },
+      ]}
+    />
+  );
+}
+
+function EvidenceTable({ run }: { run: Row }) {
+  const client = useWs();
+  const evidence = useLoad((signal) => client.get<{ items: Row[]; total: number }>(`/scraper/runs/${run.id}/evidence`, { limit: 200 }, signal), `${client.base}${run.id}evidence${String(run.updated_at)}`);
+  const rows: Row[] = [];
+  (evidence.data?.items ?? []).forEach((item, i) => {
+    Object.entries((item.fields ?? {}) as Record<string, Row>).forEach(([name, info]) => {
+      rows.push({ ...info, id: `${i}-${name}`, record: item.label, field: name, status: ((item.status ?? {}) as Record<string, string>)[name] });
+    });
+  });
+  return (
+    <DataTable
+      rows={rows}
+      empty="Evidence appears when the run finishes."
+      columns={[
+        { key: "record", label: "Record" },
+        { key: "field", label: "Field", render: (r) => label(String(r.field)) },
+        { key: "value", label: "Value", render: (r) => <Cell value={r.value} /> },
+        { key: "method", label: "Method" },
+        { key: "confidence", label: "Confidence", className: "tabular" },
+        { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
+        { key: "evidence", label: "Evidence", className: "small" },
+        { key: "source_url", label: "Source", render: (r) => <Cell value={r.source_url} type="url" /> },
+        { key: "alternatives", label: "Conflicting values", render: (r) => <Cell value={(r.alternatives as Row[] | undefined)?.map((a) => `${String(a.value)} (${String(a.method)})`)} /> },
+      ]}
+    />
+  );
+}
+
+function CrmPanel({ run }: { run: Row }) {
+  const client = useWs();
+  const [reload, setReload] = useState(0);
+  const [actions, setActions] = useState<string[]>(["company", "job"]);
+  const [selected, setSelected] = useState<string[]>([]);
+  const match = useLoad((signal) => client.get<{ items: Row[]; summary: Record<string, number> }>(`/scraper/runs/${run.id}/crm/match`, undefined, signal), `${client.base}${run.id}match${reload}`);
+  const proposals = useLoad((signal) => client.get<{ items: Row[] }>(`/scraper/runs/${run.id}/proposals`, undefined, signal), `${client.base}${run.id}prop${reload}`);
+  const action = useAction();
+  const toggle = (id: string) => setSelected((s) => (s.includes(id) ? s.filter((x) => x !== id) : [...s, id]));
+  const done = () => { setSelected([]); setReload((n) => n + 1); };
+  return (
+    <div className="pad">
+      <p className="small muted">Matching is read-only. Proposals change nothing until you approve them and press Apply.</p>
+      {match.error && <ErrorBanner error={match.error} />}
+      <div className="chips">
+        {Object.entries(match.data?.summary ?? {}).map(([k, v]) => <span key={k} className="chip">{label(k)}: {v}</span>)}
+      </div>
+      <DataTable
+        rows={(match.data?.items ?? []).map((r, i) => ({ ...r, id: String(i) }) as Row)}
+        empty="No companies to match."
+        columns={[
+          { key: "company_name", label: "Company" },
+          { key: "website", label: "Website", render: (r) => <Cell value={r.website} type="url" /> },
+          { key: "match", label: "CRM", render: (r) => <Pill value={r.match} /> },
+          { key: "crm_name", label: "CRM record" },
+          { key: "conflicts", label: "Conflicts", render: (r) => <Cell value={Object.keys((r.conflicts ?? {}) as object)} /> },
+        ]}
+      />
+      <div className="form__actions">
+        {["company", "job", "contact", "opportunity", "task"].map((a) => (
+          <label key={a} className="checkbox">
+            <input type="checkbox" checked={actions.includes(a)} onChange={(e) => setActions((s) => (e.target.checked ? [...s, a] : s.filter((x) => x !== a)))} />
+            <span>{a}</span>
+          </label>
+        ))}
+        <button type="button" className="button button--ghost" disabled={action.busy || !actions.length} onClick={() => void action.run(async () => { await client.post(`/scraper/runs/${run.id}/crm/propose`, { actions }); done(); })}>
+          Propose CRM changes
+        </button>
       </div>
       {action.error && <ErrorBanner error={action.error} />}
-      {records.error && <ErrorBanner error={records.error} />}
-      {!data ? (
-        <Loading />
-      ) : (
-        <DataTable
-          rows={data.items.map((r, i) => ({ ...r, id: `${i}` }))}
-          empty={data.final ? "No records." : "Results appear here when the run finishes."}
-          columns={columns.map((c) => ({
-            key: c,
-            label: label(c),
-            className: c === "confidence" || c === "job_count" ? "tabular" : undefined,
-            render: (r: Row) =>
-              c === "source_url" && Array.isArray(r.source_urls) && r.source_urls.length > 1 ? (
-                <span title={(r.source_urls as string[]).join("\n")}>
-                  <Cell value={r[c]} type="url" /> <span className="muted small">+{r.source_urls.length - 1}</span>
-                </span>
-              ) : (
-                <Cell value={r[c]} type={types[c]} />
-              ),
-          }))}
-        />
-      )}
+      <DataTable
+        rows={proposals.data?.items ?? []}
+        empty="No proposals yet."
+        columns={[
+          { key: "select", label: "", render: (r) => <input type="checkbox" aria-label="Select" checked={selected.includes(String(r.id))} disabled={r.status === "applied"} onChange={() => toggle(String(r.id))} /> },
+          { key: "action", label: "Action" },
+          { key: "record_key", label: "Record", className: "small" },
+          { key: "match", label: "Match", render: (r) => <Pill value={r.match} /> },
+          { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
+          { key: "error", label: "Notes", className: "small" },
+        ]}
+      />
+      <div className="form__actions">
+        <button type="button" className="button button--ghost" disabled={!selected.length || action.busy} onClick={() => void action.run(async () => { await client.post("/scraper/proposals/review", { ids: selected, decision: "approved" }); done(); })}>Approve</button>
+        <button type="button" className="button button--ghost" disabled={!selected.length || action.busy} onClick={() => void action.run(async () => { await client.post("/scraper/proposals/review", { ids: selected, decision: "rejected" }); done(); })}>Reject</button>
+        <button type="button" className="button button--primary" disabled={!selected.length || action.busy} onClick={() => void action.run(async () => { await client.post("/scraper/proposals/apply", { ids: selected }); done(); })}>Apply approved to CRM</button>
+      </div>
     </div>
   );
 }
@@ -307,85 +633,96 @@ function Results({ run }: { run: Row }) {
 export function ScrapeRun() {
   const { runId = "" } = useParams();
   const client = useWs();
+  const navigate = useNavigate();
   const [active, setActive] = useState(true);
+  const [view, setView] = useState<View | null>(null);
+  const [templateName, setTemplateName] = useState("");
   const run = useLoad(
     async (signal) => {
       const loaded = await client.get<Row>(`/scraper/runs/${runId}`, undefined, signal);
-      setActive(loaded.status === "queued" || loaded.status === "running");
+      setActive(ACTIVE.includes(String(loaded.status)) || loaded.status === "paused");
       return loaded;
     },
     client.base + runId,
     active ? 2000 : undefined,
   );
-  const pages = useLoad(
-    (signal) => client.list(`/scraper/runs/${runId}/results`, { limit: 500 }, signal),
-    client.base + runId + String(run.data?.status) + String(((run.data?.stats as Row | undefined)?.progress as Progress | undefined)?.processed),
-  );
   const action = useAction();
+  useEffect(() => {
+    if (run.data && view === null) setView((run.data.schema as Schema).entity === "job" ? "jobs" : "companies");
+  }, [run.data, view]);
   if (!run.data) return <div className="page">{run.error ? <ErrorBanner error={run.error} /> : <Loading />}</div>;
   const data = run.data;
   const stats = (data.stats ?? {}) as Row;
   const schema = data.schema as Schema;
   const status = String(data.status);
-  const rejected = (stats.rejected ?? []) as { row: number; url: string; reason: string; source?: string }[];
-  const failed = Number(((stats.progress ?? {}) as Progress).failed ?? 0);
+  const files = (stats.files ?? {}) as Record<string, unknown>;
+  const current: View = view ?? "all";
+  const tabs: { key: View; label: string }[] = [
+    { key: "all", label: "All" },
+    { key: "companies", label: "Companies" },
+    ...(schema.entity === "job" ? [{ key: "jobs" as View, label: "Jobs" }] : []),
+    { key: "pages", label: "Pages" },
+    { key: "errors", label: "Errors" },
+    { key: "evidence", label: "Evidence" },
+    { key: "crm", label: "CRM" },
+  ];
+  const act = (name: string) =>
+    action.run(async () => {
+      const result = await client.post<Row>(`/scraper/runs/${runId}/${name}`);
+      if (name === "restart") navigate(`/scraper/${result.id}`);
+      setActive(true);
+      run.refresh();
+    });
+  const download = (fmtName: "csv" | "xlsx" | "json" | "ndjson") =>
+    action.run(() => {
+      const csvView = fmtName === "csv" && ["companies", "jobs", "pages", "errors"].includes(current) ? current : "all";
+      const name = `scrape-${runId}${fmtName === "csv" && csvView !== "all" ? "-" + csvView : ""}.${fmtName}`;
+      return client.download(`/scraper/runs/${runId}/files/${fmtName}${csvView !== "all" ? `?view=${csvView}` : ""}`, name);
+    });
+  const isActive = ACTIVE.includes(status);
   return (
     <div className="page">
-      <Link to="/scraper" className="back">
-        ← AI Scraper
-      </Link>
+      <Link to="/scraper" className="back">← AI Scraper</Link>
       <PageHeader
         title="Scrape run"
         subtitle={String(data.instruction)}
         actions={
           <>
             <Pill value={status} />
-            {(status === "queued" || status === "running") && (
-              <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void action.run(async () => { await client.post(`/scraper/runs/${runId}/cancel`); run.refresh(); })}>
-                Cancel
-              </button>
-            )}
-            {(status === "failed" || status === "cancelled" || (status === "completed" && failed > 0)) && (
-              <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void action.run(async () => { await client.post(`/scraper/runs/${runId}/retry`); setActive(true); run.refresh(); })}>
-                Retry
-              </button>
-            )}
+            {isActive && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void act("pause")}>Pause</button>}
+            {status === "paused" && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void act("resume")}>Resume</button>}
+            {(isActive || status === "paused") && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void act("cancel")}>Cancel</button>}
+            {["failed", "cancelled", "completed"].includes(status) && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void act("retry")}>Retry</button>}
+            {["failed", "cancelled", "completed"].includes(status) && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void act("restart")}>Restart</button>}
           </>
         }
       />
       {action.error && <ErrorBanner error={action.error} />}
       <FieldChips schema={schema} />
       <ProgressPanel run={data} />
-      {rejected.length > 0 && (
-        <details className="card pad">
-          <summary>
-            {rejected.length} input{rejected.length === 1 ? "" : "s"} skipped
-          </summary>
-          <DataTable
-            rows={rejected.map((r, i) => ({ ...r, id: String(i) }))}
-            columns={[
-              { key: "row", label: "Row" },
-              { key: "url", label: "Input", className: "mono small" },
-              { key: "reason", label: "Reason" },
-            ]}
-          />
-        </details>
-      )}
-      <Results run={data} />
-      <h2 className="section-title">Pages</h2>
-      <DataTable
-        rows={(pages.data?.items ?? []) as Row[]}
-        empty="No pages processed yet."
-        columns={[
-          { key: "row", label: "Row", render: (r) => fmt(((r.data as Row)?.input as Row | undefined)?.row) },
-          { key: "url", label: "URL", render: (r) => <Cell value={r.url} type="url" /> },
-          { key: "outcome", label: "Outcome", render: (r) => <Pill value={String((r.data as Row)?.outcome ?? r.status)} /> },
-          { key: "records", label: "Records", render: (r) => fmt((((r.data as Row)?.records as unknown[]) ?? []).length) },
-          { key: "pages", label: "Pages fetched", render: (r) => fmt((((r.data as Row)?.pages as unknown[]) ?? []).length) },
-          { key: "method", label: "Method", className: "small" },
-          { key: "problems", label: "Notes", render: (r) => <span className="small">{((r.problems as string[]) ?? []).slice(0, 2).join("; ") || "—"}</span> },
-        ]}
-      />
+      <div className="card">
+        <div className="card__header scraper-results__header">
+          <Tabs tabs={tabs.map((t) => ({ key: t.key, label: t.label }))} active={current} onChange={(k) => setView(k as View)} />
+          <div className="scraper-downloads">
+            {(["csv", "xlsx", "json", "ndjson"] as const).map((f) => (
+              <button key={f} type="button" className="button button--ghost button--small" disabled={action.busy || !files[f]} onClick={() => void download(f)}>
+                {f.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        </div>
+        {current === "all" || current === "companies" || current === "jobs" ? <RecordsTable run={data} view={current} /> : null}
+        {current === "pages" && <PagesTable run={data} />}
+        {current === "errors" && <ErrorsTable run={data} />}
+        {current === "evidence" && <EvidenceTable run={data} />}
+        {current === "crm" && (files.json ? <CrmPanel run={data} /> : <p className="pad muted">CRM matching is available when the run finishes.</p>)}
+      </div>
+      <div className="form__actions">
+        <input className="input input--small" placeholder="Template name" value={templateName} onChange={(e) => setTemplateName(e.target.value)} />
+        <button type="button" className="button button--ghost button--small" disabled={action.busy || !templateName.trim()} onClick={() => void action.run(async () => { await client.post("/scraper/templates", { name: templateName, instruction: data.instruction, schema, options: stats.options }); setTemplateName(""); })}>
+          Save as template
+        </button>
+      </div>
     </div>
   );
 }

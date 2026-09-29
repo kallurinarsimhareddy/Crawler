@@ -51,6 +51,10 @@ class Col:
     immutable: bool = False
     minimum: Optional[float] = None
     maximum: Optional[float] = None
+    #: Choices a later migration widened: ``(migration, original choices)``. The
+    #: creating migration keeps the original list (applied files never change);
+    #: the named migration replaces the check constraint with ``choices``.
+    widened: Optional[Tuple[str, Tuple[str, ...]]] = None
 
     def __post_init__(self) -> None:
         if self.kind not in PG_TYPES:
@@ -569,11 +573,16 @@ entity("email_validations", "ev", {
 # Track F: AI scraper
 # ---------------------------------------------------------------------------
 
+#: Fine-grained scraper run states (0006). ``running`` stays valid for older rows.
+SCRAPE_RUN_STATES = ("queued", "planning", "fetching", "extracting", "paginating", "enriching", "validating",
+                     "normalizing", "saving", "completed", "failed", "cancelled", "paused", "running")
+
 entity("scrape_runs", "sc", {
     "instruction": _t(4000, required=True),
     "schema": _j(),
     "urls": _tags(),
-    "status": _choice("queued", "running", "completed", "failed", "cancelled"),
+    "status": Col("text", choices=SCRAPE_RUN_STATES, default="queued", required=True, index=True,
+                  widened=("0006", ("queued", "running", "completed", "failed", "cancelled"))),
     "task_id": _t(40),
     "stats": _j(),
     "error": _t(4000),
@@ -590,6 +599,57 @@ entity("scrape_results", "sx", {
     "problems": _j([]),
     "fetched_at": Col("ts"),
 }, default_order="created_at asc")
+
+# AI scraper V2-V4 (0006): every page a run visited, saved templates, and CRM
+# proposals built from results (applied only after review).
+
+entity("scrape_pages", "spg", {
+    "run_id": _t(40, required=True, index=True),
+    "input_index": Col("int", required=True, default=0, minimum=0),
+    "url_key": _t(64, required=True),
+    "url": _t(2048, required=True),
+    "final_url": _t(2048),
+    "kind": _choice("input", "discovery", "careers", "listing", "detail", "api"),
+    "depth": Col("int", required=True, default=0, minimum=0),
+    "page_no": Col("int", minimum=0),
+    "outcome": _t(30, required=True, index=True),
+    "http_status": Col("int", minimum=0),
+    "attempts": Col("int", required=True, default=1, minimum=0),
+    "records": Col("int", required=True, default=0, minimum=0),
+    "browser_used": Col("bool", required=True, default=False),
+    "browser_reason": _t(200),
+    "browser_duration_ms": Col("float", minimum=0),
+    "browser_outcome": _t(30),
+    "error": _t(1000),
+    "fetched_at": Col("ts"),
+}, unique=(("run_id", "url_key"),), default_order="created_at asc", migration="0006",
+   description="Every page a scraper run visited, with its outcome (never fetched twice in one run).")
+
+entity("scrape_templates", "stp", {
+    "name": _t(200, required=True, search=True),
+    "description": _t(1000),
+    "category": _t(60),
+    "instruction": _t(4000, required=True),
+    "schema": _j(),
+    "options": _j(),
+}, unique=(("name",),), default_order="name asc", migration="0006",
+   description="Saved scraper templates: instruction, edited schema and run options.")
+
+entity("scrape_proposals", "spr", {
+    "run_id": _t(40, required=True, index=True),
+    "record_key": _t(200, required=True),
+    "action": _choice("company", "contact", "job", "opportunity", "task"),
+    "status": _choice("proposed", "approved", "rejected", "applied", "failed"),
+    "match": _choice("new", "existing", "possible_duplicate", "conflict"),
+    "match_company_id": _t(40),
+    "match_reasons": _j([]),
+    "payload": _j(),
+    "applied_entity_type": _t(40),
+    "applied_entity_id": _t(40),
+    "error": _t(1000),
+    "reviewed_at": Col("ts"),
+}, unique=(("run_id", "record_key", "action"),), migration="0006",
+   description="CRM changes proposed from scraper results. Applied only after a person approves them.")
 
 # ---------------------------------------------------------------------------
 # Track I: GTM campaigns, sequences, suppression

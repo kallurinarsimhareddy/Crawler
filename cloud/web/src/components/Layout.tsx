@@ -125,7 +125,7 @@ export function Layout() {
         <div className="sidebar__top">
           <NavLink to="/" className="brand">
             <img src="/favicon.svg" alt="" width={28} height={28} />
-            <span>CareerCrawler</span>
+            <span className="brand__name">SANA GTM<small className="brand__tagline">AI-Powered Company, Hiring &amp; GTM Intelligence Platform</small></span>
           </NavLink>
           <button
             type="button"
@@ -138,8 +138,8 @@ export function Layout() {
             <span aria-hidden="true">{menuOpen ? "✕" : "☰"}</span>
           </button>
         </div>
-        <button type="button" className="button button--primary cr-askbtn" onClick={ask} title="Ask CareerCrawler AI (Ctrl+K)">
-          <span aria-hidden="true">✦</span> Ask CareerCrawler AI
+        <button type="button" className="button button--primary cr-askbtn" onClick={ask} title="Ask SANA GTM AI (Ctrl+K)">
+          <span aria-hidden="true">✦</span> Ask SANA GTM AI
           <kbd className="cr-kbd" aria-hidden="true">Ctrl K</kbd>
         </button>
         <nav id="primary-nav" className={`nav${menuOpen ? " nav--open" : ""}`}>

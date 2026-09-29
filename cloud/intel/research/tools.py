@@ -348,6 +348,62 @@ def assign_campaign(state: ResearchState, params: Dict[str, Any]) -> Dict[str, A
             "detail": f"{assigned} companies matched to a campaign (not applied)"}
 
 
+def scrape_jobs(state: ResearchState, params: Dict[str, Any]) -> Dict[str, Any]:
+    """Run the AI scraper over explicit URLs and the candidates' careers pages / websites, then
+    attach the jobs found to each company. Public pages only; nothing in the CRM changes."""
+    from cloud.intel.core.normalize import domain_of
+    from cloud.intel.scraper.toolkit import match_scrape_crm, run_scrape_now
+
+    urls = [u for u in params.get("urls") or [] if isinstance(u, str)]
+    by_domain: Dict[str, str] = {}
+    for cid in state.order[: int(params.get("max_companies") or 25)]:
+        company = state.companies[cid]
+        target = company.get("careers_url") or company.get("website")
+        if target:
+            urls.append(target)
+        for value in (company.get("domain"), company.get("website"), company.get("careers_url")):
+            if value and domain_of(value):
+                by_domain.setdefault(domain_of(value), cid)
+    urls = list(dict.fromkeys(urls))
+    if not urls:
+        return {"status": "skipped", "detail": "no URLs or company websites to scrape"}
+    keywords = [k for k in params.get("keywords") or [] if k]
+    instruction = "Get company name, website, careers URL, job titles, job URLs, location and posted date"
+    if keywords:
+        instruction = instruction.replace("job titles", f"open {' '.join(keywords[:1])} jobs, job titles")
+    if params.get("window_days"):
+        instruction += f" posted in the last {int(params['window_days'])} days"
+    try:
+        run = run_scrape_now(state.platform, state.ctx, urls, instruction + ".", confirm=True, options={
+            "pagination": True, "max_pages": 5, "max_runtime_minutes": 10, "concurrency": 4,
+            "follow_details": False, "max_ai_calls": 10})
+    except Exception as error:  # noqa: BLE001 - scraping is best effort inside research
+        return {"status": "failed", "detail": f"scraper: {error}"[:300]}
+    records = state.platform.service("scraper").records(state.ctx, run["id"], "jobs", limit=5000)["items"]
+    attached = 0
+    for row in records:
+        cid = None
+        for value in (row.get("website"), row.get("source_url"), row.get("input_url")):
+            if value and domain_of(value) in by_domain:
+                cid = by_domain[domain_of(value)]
+                break
+        if cid is None:
+            continue
+        state.extra(cid).setdefault("scraped_jobs", []).append(
+            {"title": row.get("job_title"), "url": row.get("job_url"), "location": row.get("location"),
+             "posted_date": row.get("posted_date"), "source_url": row.get("source_url")})
+        state.note(cid, "scrape_jobs", f"job found on a public page: {row.get('job_title')}",
+                   url=row.get("job_url") or row.get("source_url"))
+        attached += 1
+    crm = match_scrape_crm(state.platform, state.ctx, run["id"]) if records or run["stats"].get("records") else {}
+    stats = run["stats"]
+    return {"status": "done", "scrape_run_id": run["id"],
+            "detail": f"scrape run {run['id']}: {stats.get('records', 0)} records from {len(urls)} URLs, "
+                      f"{attached} jobs attached to candidates; CRM match {crm.get('summary') or {}}"
+                      + (f"; AI: {stats['ai_note']}" if stats.get("ai_note") else ""),
+            "count": attached, "crm_match": crm.get("summary") or {}, "outcomes": stats.get("outcomes") or {}}
+
+
 def _deferred(state: ResearchState, params: Dict[str, Any]) -> Dict[str, Any]:
     return {"status": "deferred", "count_out": len(state.order), "detail": "built after ranking"}
 
@@ -372,6 +428,9 @@ TOOLS: Dict[str, Dict[str, Any]] = {
         "missing_only": {"type": "boolean"}, "authorized_sources": {"type": "boolean"}}}},
     "validate_emails": {"fn": validate_emails, "mutates": False, "schema": {**_OBJ, "properties": {
         "max_age_days": {"type": "integer"}}}},
+    "scrape_jobs": {"fn": scrape_jobs, "mutates": False, "schema": {**_OBJ, "properties": {
+        "urls": {"type": "array", "items": {"type": "string"}}, "keywords": {"type": "array", "items": {"type": "string"}},
+        "window_days": {"type": ["integer", "null"]}, "max_companies": {"type": ["integer", "null"]}}}},
     "score": {"fn": score, "mutates": False, "schema": {**_OBJ, "properties": {"limit": {"type": ["integer", "null"]}}}},
     "assign_campaign": {"fn": assign_campaign, "mutates": True, "schema": {**_OBJ, "properties": {}}},
     "create_list": {"fn": _deferred, "mutates": True, "schema": {**_OBJ, "properties": {"name": {"type": "string"}}}},

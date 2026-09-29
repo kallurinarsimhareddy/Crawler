@@ -294,7 +294,7 @@ export function ProactiveSettings() {
   return (
     <div className="card pad">
       <h3>Proactive AI</h3>
-      <p className="muted small">CareerCrawler AI checks your data hourly and surfaces meaningful changes in the Control Room. Insights never change CRM data.</p>
+      <p className="muted small">SANA GTM AI checks your data hourly and surfaces meaningful changes in the Control Room. Insights never change CRM data.</p>
       <label className="check">
         <input type="checkbox" checked={draft.enabled} disabled={!admin} onChange={(e) => setDraft({ ...draft, enabled: e.target.checked })} />
         Notifications on

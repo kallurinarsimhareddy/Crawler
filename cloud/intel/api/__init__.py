@@ -21,6 +21,7 @@ ROUTER_MODULES = (
     "cloud.intel.api.routes_intel",
     "cloud.intel.api.routes_sources",
     "cloud.intel.api.routes_ai",
+    "cloud.intel.api.routes_scraper",
     "cloud.intel.api.routes_gtm",
     "cloud.intel.api.routes_analytics",
     "cloud.intel.api.routes_agent",

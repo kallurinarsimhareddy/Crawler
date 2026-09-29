@@ -51,14 +51,14 @@ export function Login() {
       <form className="card auth-card" onSubmit={onSubmit}>
         <div className="brand brand--center">
           <img src="/favicon.svg" alt="" width={32} height={32} />
-          <span>CareerCrawler</span>
+          <span>SANA GTM</span>
         </div>
         <div>
           <h1 className="auth-title">{dev ? "Local development sign-in" : creating ? "Create your account" : "Sign in"}</h1>
           <p className="muted small">
             {dev
               ? "Development mode: enter any email. Tokens are issued by your local API and never work in production."
-              : "Use the email and password for your CareerCrawler account."}
+              : "Use the email and password for your SANA GTM account."}
           </p>
         </div>
 

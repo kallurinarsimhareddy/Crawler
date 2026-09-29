@@ -1,0 +1,5 @@
+# Optional: the AI scraper's browser rendering fallback (off by default; enable per run AND with
+# scraper_browser_enabled on a host whose firewall enforces public-internet-only egress).
+#   cloud\.venv\Scripts\python -m pip install -r cloud\intel\requirements-browser.txt
+#   cloud\.venv\Scripts\python -m playwright install chromium
+playwright==1.62.0
