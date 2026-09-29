@@ -9,16 +9,54 @@
 
 from __future__ import annotations
 
+import contextvars
 import logging
+import re
 from datetime import datetime
 from typing import Any, Dict, Mapping, Optional
 
 from cloud.intel.core.context import Ctx, utcnow
 from cloud.intel.store.base import Store
 
-__all__ = ["audit", "provenance", "record_activity"]
+__all__ = ["audit", "provenance", "record_activity", "redact", "actor_label", "set_actor_label"]
 
 log = logging.getLogger(__name__)
+
+#: Who is acting, for display (an email). Set per request by the API layer; audit
+#: rows carry it so the log is readable without a user directory lookup.
+_ACTOR_LABEL: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("audit_actor_label", default=None)
+
+#: Keys whose values never reach the audit log, at any depth.
+_SECRET_KEY = re.compile(r"(pass(word|wd)?|secret|token|api[_-]?key|authorization|credential|"
+                         r"private[_-]?key|cookie|session[_-]?id|ciphertext|signature|smtp_pass)", re.I)
+REDACTED = "[redacted]"
+
+
+def set_actor_label(label: Optional[str]) -> contextvars.Token:
+    return _ACTOR_LABEL.set((label or None) and str(label)[:320])
+
+
+def actor_label() -> Optional[str]:
+    return _ACTOR_LABEL.get()
+
+
+def redact(value: Any) -> Any:
+    """Replace the value of every secret-looking key (recursively) with ``[redacted]``.
+    Keys that only *name* fields (``fields``, ``secret_hint``) stay readable."""
+    if isinstance(value, dict):
+        out = {}
+        for key, item in value.items():
+            name = str(key)
+            if name in ("fields", "secret_hint", "hint") or not _SECRET_KEY.search(name):
+                out[name] = redact(item)
+            else:
+                out[name] = REDACTED if item not in (None, "") else item
+        return out
+    if isinstance(value, (list, tuple, set)):
+        return [redact(v) for v in value]
+    if isinstance(value, str) and re.match(r"(?i)^bearer\s+\S+", value):
+        return REDACTED
+    return value
 
 
 def _jsonable(value: Any) -> Any:
@@ -44,8 +82,10 @@ def audit(store: Store, ctx: Ctx, action: str, *, entity_type: Optional[str] = N
             "entity_type": entity_type,
             "entity_id": entity_id,
             "summary": (summary or "")[:1000] or None,
-            "changes": _jsonable(dict(changes or {})),
+            "changes": redact(_jsonable(dict(changes or {}))),
             "request_id": ctx.request_id,
+            "actor_label": getattr(ctx, "actor_label", None) or actor_label()
+                           or (None if ctx.actor_kind == "user" else ctx.actor_kind),
         })
     except Exception:  # noqa: BLE001 - the audited work is already committed
         log.exception("could not write audit row for %s %s", action, entity_id)

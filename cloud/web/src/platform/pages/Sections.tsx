@@ -10,12 +10,14 @@ import type { Row } from "../api";
 import { Bars, Sparkline, counts, num } from "../charts";
 import { MemoryPage } from "../controlroom/Memory";
 import { ResourcePage } from "../ResourcePage";
-import { ACTIVITIES, CAMPAIGNS, LISTS, SEGMENTS, SEQUENCES, SUPPRESSIONS, TEMPLATES } from "../resources";
+import { ACTIVITIES, CAMPAIGNS, LISTS, SEGMENTS, SEQUENCES, TEMPLATES } from "../resources";
 import { SectionPage } from "../Section";
 import { DataTable, Pill, ResourceList, Score, Tags, fmt, fmtDate, useAction, useLoad } from "../ui";
 import { useWs } from "../workspace";
+import { AdminLinks } from "./Admin";
 import { Companies } from "./Companies";
 import { Contacts, Discovery, HiringIntel, Postings } from "./Intel";
+import { Suppressions } from "./Sending";
 import { Credits, Research, Settings } from "./Tools";
 import { Analytics, BackgroundTasks, Dashboard } from "./Work";
 
@@ -135,6 +137,7 @@ export function ContactsSection() {
       actions={
         <>
           <ImportExport />
+          <Link className="button button--ghost" to="/email-validation" title="Validate a contact list or an uploaded file (nothing is sent)"><Icon name="mailcheck" size={16} /> Validate Emails</Link>
           <Link className="button button--primary" to="?create=1"><Icon name="plus" size={16} /> Add Contact</Link>
         </>
       }
@@ -283,7 +286,7 @@ export function CampaignsSection() {
         { key: "drafts", label: "Drafts", render: () => <ResourcePage config={CAMPAIGNS} query={{ status: "draft" }} emptyTitle="No draft campaigns" /> },
         { key: "templates", label: "Templates", render: () => <ResourcePage config={TEMPLATES} /> },
         { key: "performance", label: "Performance", render: () => <CampaignPerformance /> },
-        { key: "suppressions", label: "Suppression list", render: () => <ResourcePage config={SUPPRESSIONS} /> },
+        { key: "suppressions", label: "Suppression list", render: () => <Suppressions /> },
       ]}
     />
   );
@@ -518,6 +521,7 @@ export function SettingsSection() {
       subtitle="Workspace, AI, credits and background work."
       tabs={[
         { key: "general", label: "General", render: () => <Settings /> },
+        { key: "administration", label: "Administration", render: () => <AdminLinks /> },
         { key: "credits", label: "Credits", render: () => <Credits /> },
         { key: "background", label: "Background jobs", render: () => <BackgroundTasks /> },
         { key: "memory", label: "AI memory", render: () => <MemoryPage /> },

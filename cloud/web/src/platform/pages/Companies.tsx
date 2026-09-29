@@ -5,8 +5,9 @@ import { useAssistant } from "../../shell/Assistant";
 import type { PageOf, Row } from "../api";
 import { CreateForm } from "../ResourcePage";
 import { OPPORTUNITY_COLUMNS } from "../resources";
-import { DataTable, Json, KeyValues, PageHeader, Pill, ResourceList, Score, Stat, Tabs, Tags, fmt, fmtDate, useAction, useLoad, type Empty } from "../ui";
+import { DataTable, KeyValues, PageHeader, Pill, ResourceList, Score, Stat, Tabs, Tags, fmt, fmtDate, useAction, useLoad, type Empty } from "../ui";
 import { useWs } from "../workspace";
+import { ScorePanel } from "./Scoring";
 
 const COMPANY_FIELDS = [
   { key: "name", label: "Company name", required: true },
@@ -98,13 +99,12 @@ export function CompanyDetail() {
   const [tab, setTab] = useState("overview");
   const assistant = useAssistant();
   const { data: company, error, loading, refresh } = useLoad((signal) => client.get<Row>(`/companies/${companyId}`, undefined, signal), client.base + companyId);
-  const scores = useLoad((signal) => client.get<Record<string, unknown>>(`/companies/${companyId}/scores`, undefined, signal).catch(() => null), client.base + companyId + "scores");
+  const [scoreKey, setScoreKey] = useState(0);
   const action = useAction();
 
   if (error) return <div className="page"><ErrorBanner error={error} onRetry={refresh} /></div>;
   if (loading || !company) return <div className="page"><Loading /></div>;
   const c = company;
-  const breakdown = (c.score_breakdown ?? {}) as Record<string, unknown>;
 
   return (
     <div className="page">
@@ -119,7 +119,13 @@ export function CompanyDetail() {
         }
         actions={
           <>
-            <button className="button button--ghost" disabled={action.busy} onClick={() => action.run(async () => { await client.post(`/companies/${companyId}/scores`); refresh(); scores.refresh(); })}>
+            <button className="button button--ghost" disabled={action.busy} onClick={() => action.run(async () => {
+              // Re-detect hiring signals, then save every explainable score (incl. technology and buying stage).
+              await client.post(`/companies/${companyId}/scores`);
+              await client.post(`/scores/company/${companyId}`);
+              refresh();
+              setScoreKey((n) => n + 1);
+            })}>
               Recompute scores
             </button>
             <button className="button button--ghost" disabled={action.busy} onClick={() => action.run(() => client.post("/crawl", { company_ids: [companyId] }))}>
@@ -136,6 +142,8 @@ export function CompanyDetail() {
         <Stat label="Account score" value={<Score value={c.account_score} />} />
         <Stat label="Hiring score" value={<Score value={c.hiring_score} />} />
         <Stat label="Opportunity score" value={<Score value={c.opportunity_score} />} />
+        <Stat label="Technology score" value={<Score value={c.technology_score} />} />
+        <Stat label="Buying stage" value={c.buying_stage ? <Pill value={c.buying_stage} /> : "—"} hint={typeof c.buying_stage_score === "number" ? `score ${Math.round(c.buying_stage_score)}` : "not scored yet"} />
         <Stat label="Open jobs" value={fmt(c.hiring_count)} hint={c.ats ? `ATS: ${c.ats}` : undefined} />
       </div>
       <Tabs
@@ -178,11 +186,7 @@ export function CompanyDetail() {
                 ["Sources", fmt(c.source_count)],
               ]}
             />
-            <div>
-              <h3>Why this score</h3>
-              <p className="muted small">Every score is a weighted sum of named components — no opaque AI score.</p>
-              <Json value={scores.data ?? breakdown} />
-            </div>
+            <ScorePanel key={scoreKey} entityType="company" entityId={companyId} onRecomputed={refresh} />
           </div>
         )}
         {tab === "jobs" && (

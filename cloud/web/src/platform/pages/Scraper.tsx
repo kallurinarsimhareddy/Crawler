@@ -8,6 +8,7 @@ import { EmptyState, ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
 import { DataTable, PageHeader, Pill, ResourceList, Stat, Tabs, fmt, fmtDate, useAction, useLoad } from "../ui";
 import { useWs } from "../workspace";
+import { GtmActions } from "./GtmBridge";
 
 const EXAMPLES = [
   "Get the company name, company website and all job post titles.",
@@ -517,7 +518,7 @@ export function Scraper() {
 
 // --- one run --------------------------------------------------------------------------------
 
-type View = "all" | "companies" | "jobs" | "pages" | "errors" | "evidence" | "crm";
+type View = "all" | "companies" | "jobs" | "pages" | "errors" | "evidence" | "crm" | "gtm";
 
 function ProgressPanel({ run }: { run: Row }) {
   const stats = (run.stats ?? {}) as Row;
@@ -788,6 +789,7 @@ export function ScrapeRun() {
     { key: "errors", label: "Errors" },
     { key: "evidence", label: "Evidence" },
     { key: "crm", label: "CRM" },
+    { key: "gtm", label: "GTM" },
   ];
   const act = (name: string) =>
     action.run(async () => {
@@ -838,6 +840,7 @@ export function ScrapeRun() {
         {current === "errors" && <ErrorsTable run={data} />}
         {current === "evidence" && <EvidenceTable run={data} />}
         {current === "crm" && (files.json ? <CrmPanel run={data} /> : <p className="pad muted">CRM matching is available when the run finishes.</p>)}
+        {current === "gtm" && (files.json ? <GtmActions sourceType="scrape" sourceId={String(data.id)} /> : <p className="pad muted">GTM actions are available when the run finishes.</p>)}
       </div>
       <div className="form__actions">
         <input className="input input--small" placeholder="Template name" value={templateName} onChange={(e) => setTemplateName(e.target.value)} />

@@ -10,6 +10,7 @@ import { usePolling } from "../hooks/usePolling";
 import type { Row } from "../platform/api";
 import { WorkspaceSwitcher } from "../platform/Shell";
 import { useLoad } from "../platform/ui";
+import { roleLabel } from "../platform/logic/admin";
 import { useWorkspace } from "../platform/workspace";
 import { useAssistant } from "./Assistant";
 import { Icon } from "./Icon";
@@ -59,33 +60,62 @@ function Notifications() {
     `appr:${client?.base ?? ""}`,
     30000,
   );
+  // In-app notifications (assignments, finished work). Older APIs without the route just show none.
+  const inbox = useLoad<{ items: Row[]; unread: number }>(
+    async (signal) => (client ? await client.get<{ items: Row[]; unread: number }>("/notifications", { unread: true, limit: 5 }, signal).catch(() => ({ items: [], unread: 0 })) : { items: [], unread: 0 }),
+    `notif:${client?.base ?? ""}`,
+    30000,
+  );
   const pending = approvals.data?.items ?? [];
+  const unread = inbox.data?.items ?? [];
+  const count = pending.length + (inbox.data?.unread ?? 0);
   return (
     <Dropdown
-      label={`Notifications${pending.length ? ` (${pending.length} waiting)` : ""}`}
+      label={`Notifications${count ? ` (${count} unread or waiting)` : ""}`}
       button={
         <>
           <Icon name="bell" />
-          {pending.length > 0 && <span className="iconbtn__badge">{pending.length}</span>}
+          {count > 0 && <span className="iconbtn__badge">{count > 99 ? "99+" : count}</span>}
         </>
       }
     >
       {(close) => (
         <div className="notif">
           <div className="dropdown__title">Notifications</div>
-          {pending.length === 0 ? (
-            <p className="muted small notif__empty">You're all caught up. Approvals for AI plans that change your CRM, spend credits or reach out will appear here.</p>
+          {pending.length === 0 && unread.length === 0 ? (
+            <p className="muted small notif__empty">You're all caught up. Assignments, finished imports and scrapes, and approvals for AI plans that change your CRM, spend credits or reach out will appear here.</p>
           ) : (
-            pending.slice(0, 6).map((a) => (
-              <button key={a.id} type="button" className="dropdown__item" onClick={() => { close(); navigate("/ai"); }}>
-                <span className="notif__dot" />
-                <span>
-                  <strong>Approval needed</strong>
-                  <span className="muted small block">{String(a.reason ?? a.action ?? "An AI plan step is waiting for you")}</span>
-                </span>
-              </button>
-            ))
+            <>
+              {pending.slice(0, 4).map((a) => (
+                <button key={a.id} type="button" className="dropdown__item" onClick={() => { close(); navigate("/ai"); }}>
+                  <span className="notif__dot" />
+                  <span>
+                    <strong>Approval needed</strong>
+                    <span className="muted small block">{String(a.reason ?? a.action ?? "An AI plan step is waiting for you")}</span>
+                  </span>
+                </button>
+              ))}
+              {unread.map((n) => (
+                <button
+                  key={n.id}
+                  type="button"
+                  className="dropdown__item"
+                  onClick={() => {
+                    close();
+                    void client?.post(`/notifications/${n.id}/read`).catch(() => undefined).finally(inbox.refresh);
+                    navigate(n.link ? String(n.link) : "/notifications");
+                  }}
+                >
+                  <span className="notif__dot" />
+                  <span>
+                    <strong>{String(n.title)}</strong>
+                    {n.body ? <span className="muted small block">{String(n.body)}</span> : null}
+                  </span>
+                </button>
+              ))}
+            </>
           )}
+          <Link className="dropdown__item" to="/notifications" onClick={close}><Icon name="bell" size={16} /> All notifications</Link>
           <div className="dropdown__sep" />
           <StatusLine />
         </div>
@@ -94,10 +124,47 @@ function Notifications() {
   );
 }
 
+const LOGIN_MARK = "sanagtm.audit.login";
+
+/** Record one sign-in per browser session and workspace in the audit log (best effort). */
+function useSessionAudit() {
+  const { session } = useAuth();
+  const { client, current } = useWorkspace();
+  useEffect(() => {
+    if (!session || !client || !current) return;
+    const key = `${LOGIN_MARK}.${current.id}.${session.email ?? ""}`;
+    try {
+      if (window.sessionStorage.getItem(key)) return;
+      window.sessionStorage.setItem(key, "1");
+    } catch {
+      return; // storage blocked: skip rather than record a sign-in on every page load
+    }
+    void client.post("/audit/session", { event: "login" }).catch(() => undefined);
+  }, [session, client, current]);
+}
+
+function clearLoginMarks() {
+  try {
+    for (let i = window.sessionStorage.length - 1; i >= 0; i -= 1) {
+      const key = window.sessionStorage.key(i);
+      if (key?.startsWith(LOGIN_MARK)) window.sessionStorage.removeItem(key);
+    }
+  } catch {
+    // storage blocked: nothing to clear
+  }
+}
+
 function UserMenu() {
   const { session, signOut, mode } = useAuth();
-  const { current } = useWorkspace();
+  const { current, client } = useWorkspace();
+  useSessionAudit();
   if (!session) return null;
+  const logout = async () => {
+    // Record the sign-out while the token is still valid; never block signing out on it.
+    await Promise.race([client?.post("/audit/session", { event: "logout" }).catch(() => undefined), new Promise((r) => setTimeout(r, 1500))]);
+    clearLoginMarks();
+    await signOut();
+  };
   const who = session.email ?? "Signed in";
   return (
     <Dropdown label="Account" button={<span className="avatar" aria-hidden="true">{who.slice(0, 1).toUpperCase()}</span>}>
@@ -105,13 +172,15 @@ function UserMenu() {
         <>
           <div className="dropdown__title">
             <span className="truncate block" title={who}>{who}</span>
-            <span className="muted small">{current ? `${current.name} · ${current.role}` : "No workspace"}{mode === "dev" ? " · dev" : ""}</span>
+            <span className="muted small">{current ? `${current.name} · ${roleLabel(current.role)}` : "No workspace"}{mode === "dev" ? " · dev" : ""}</span>
           </div>
           <Link className="dropdown__item" to="/settings" onClick={close}><Icon name="settings" size={16} /> Settings</Link>
+          <Link className="dropdown__item" to="/settings/users" onClick={close}><Icon name="shield" size={16} /> Users &amp; Permissions</Link>
+          <Link className="dropdown__item" to="/notifications" onClick={close}><Icon name="bell" size={16} /> Notifications</Link>
           <Link className="dropdown__item" to="/credits" onClick={close}><Icon name="coin" size={16} /> Credits</Link>
           <Link className="dropdown__item" to="/background" onClick={close}><Icon name="clock" size={16} /> Background jobs</Link>
           <div className="dropdown__sep" />
-          <button type="button" className="dropdown__item" onClick={() => void signOut()}><Icon name="logout" size={16} /> Sign out</button>
+          <button type="button" className="dropdown__item" onClick={() => void logout()}><Icon name="logout" size={16} /> Sign out</button>
         </>
       )}
     </Dropdown>

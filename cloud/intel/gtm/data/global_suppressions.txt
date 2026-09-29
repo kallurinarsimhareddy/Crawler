@@ -1,0 +1,4 @@
+# Platform-wide suppression list (operator-managed, read-only in the product).
+# One email address or domain per line. Lines starting with # are comments.
+# Reserved example/test domains never receive mail:
+example.invalid

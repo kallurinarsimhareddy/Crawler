@@ -7,6 +7,7 @@ import type { Row } from "../api";
 import { CreateForm } from "../ResourcePage";
 import { KeyValues, PageHeader, Pill, ResourceList, Score, Stat, Tabs, Tags, fmt, fmtDate, useAction, useLoad } from "../ui";
 import { useWs } from "../workspace";
+import { ScorePanel } from "./Scoring";
 
 export function Contacts() {
   const client = useWs();
@@ -99,12 +100,13 @@ export function ContactDetail() {
         }
       />
       {action.error && <ErrorBanner error={action.error} />}
-      <Tabs active={tab} onChange={setTab} tabs={["profile", "company", "role", "email", "validation", "source", "activities", "sequences"].map((k) => ({ key: k, label: k[0].toUpperCase() + k.slice(1) }))} />
+      <Tabs active={tab} onChange={setTab} tabs={["profile", "company", "role", "score", "email", "validation", "source", "activities", "sequences"].map((k) => ({ key: k, label: k[0].toUpperCase() + k.slice(1) }))} />
       <div className="card pad">
         {tab === "profile" && (
           <KeyValues items={[["Name", fmt(c.full_name)], ["Location", fmt(c.location)], ["Phone", fmt(c.phone)], ["LinkedIn", c.linkedin_url ? <a className="link" href={String(c.linkedin_url)} target="_blank" rel="noreferrer noopener">profile</a> : null], ["Tags", <Tags values={c.tags} />], ["Status", <Pill value={c.status} />], ["Owner", fmt(c.owner_id)]]} />
         )}
         {tab === "company" && (c.company_id ? <Link className="link" to={`/companies/${c.company_id}`}>Open company →</Link> : <p className="muted">Not linked to a company.</p>)}
+        {tab === "score" && <ScorePanel entityType="contact" entityId={contactId} onRecomputed={refresh} />}
         {tab === "role" && <KeyValues items={[["Title", fmt(c.title)], ["Department", fmt(c.department)], ["Function", <Pill value={c.function} />], ["Seniority", fmt(c.seniority)], ["Contact score", <Score value={c.contact_score} />]]} />}
         {tab === "email" && <KeyValues items={[["Email", fmt(c.email)], ["Status", <Pill value={c.email_status} />], ["Score", fmt(c.email_score)], ["Validated", fmtDate(c.email_validated_at)], ["Unsubscribed", fmt(c.unsubscribed)]]} />}
         {tab === "validation" && <KeyValues items={[["Validation status", <Pill value={c.validation_status} />], ["Confidence", fmt(c.confidence)]]} />}

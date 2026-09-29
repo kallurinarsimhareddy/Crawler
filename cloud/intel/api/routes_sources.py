@@ -45,6 +45,12 @@ def list_sources(ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends
     return {"items": jsonable_encoder(platform.service("sources").list_sources(ctx))}
 
 
+@router.get("/sources/status")
+def sources_status(ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    """Access method, credentials required/missing, configured/verified state, last check, usage."""
+    return jsonable_encoder(platform.service("sources").status(ctx))
+
+
 @router.post("/sources/{source}/search", status_code=status.HTTP_202_ACCEPTED)
 def search_source(source: str, request: Request, body: Dict[str, Any] = Body(default={}),
                   ctx: Ctx = Depends(write_ctx), platform: Platform = Depends(get_platform)):

@@ -326,6 +326,9 @@ class Store(ABC):
     @abstractmethod
     def list_members(self, ctx: Ctx) -> List[Dict[str, Any]]: ...
 
+    def remove_member(self, ctx: Ctx, user_id: str) -> bool:  # pragma: no cover - implemented by stores
+        raise NotImplementedError
+
     @abstractmethod
     def update_workspace(self, ctx: Ctx, **changes: Any) -> Dict[str, Any]: ...
 

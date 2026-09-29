@@ -342,12 +342,14 @@ class ZipRecruiterAdapter(_FetchMixin, SourceAdapter):
                 "workplace_type": "unknown"}
 
 
-class _PartnerOnlyAdapter(SourceAdapter):
+class _PartnerOnlyAdapter(_FetchMixin, SourceAdapter):
     """A source whose job data is available only under a partner agreement.
 
-    Storing a partner token marks it ``configured_unverified``; search still
-    refuses until the partner agreement's documented endpoint is implemented,
-    because there is no public API to call and scraping is not an option.
+    Storing a partner token marks it ``configured_unverified``. Search refuses
+    until the partner supplies its data endpoint: set ``partner_feed_url`` (https,
+    a JSON list of jobs or ``{"jobs": [...]}`` issued under the agreement) in the
+    connection settings and it is read with the partner token as a Bearer
+    credential. There is no public API to call and scraping is not an option.
     """
 
     access_method = "partner"
@@ -355,11 +357,26 @@ class _PartnerOnlyAdapter(SourceAdapter):
 
     def search(self, query: SourceQuery) -> List[Dict[str, Any]]:
         self.require_configured()
-        raise SourceUnavailable(f"{self.label}: the partner endpoint is defined by your partner agreement and is "
-                                "not implemented yet; supply its documentation to enable it")
+        feed = str(self.settings.get("partner_feed_url") or "")
+        if not feed.startswith("https://"):
+            raise SourceUnavailable(f"{self.label}: the partner endpoint is defined by your partner agreement and is "
+                                    "not implemented yet; supply its documentation to enable it (or set the "
+                                    "partner-issued https partner_feed_url in the connection settings)")
+        payload = self._get_json(feed, headers={"Authorization": f"Bearer {self.credentials['partner_api_token']}"})
+        items = payload if isinstance(payload, list) else (payload or {}).get("jobs") or []
+        keywords = [k for k in query.keywords.lower().split() if k]
+        if keywords:
+            items = [i for i in items if all(k in json.dumps(i).lower() for k in keywords)]
+        return list(items)[: query.limit]
 
     def normalize(self, raw: Mapping[str, Any]) -> Dict[str, Any]:
-        return dict(raw)
+        return {"company_name": raw.get("company") or raw.get("company_name") or "",
+                "title": raw.get("title"), "job_url": raw.get("url") or raw.get("job_url"),
+                "external_id": str(raw.get("id") or ""), "location": raw.get("location"),
+                "posted_at": _ts(raw.get("posted_at") or raw.get("date_posted")),
+                "description": raw.get("description"), "employment_type": raw.get("employment_type"),
+                "source_kind": "external_source", "source_name": self.name,
+                "workplace_type": _workplace(raw.get("remote"), str(raw.get("location") or ""))}
 
 
 class LinkedInAdapter(_PartnerOnlyAdapter):

@@ -160,7 +160,7 @@ class PostgresStore(Store):
         role = conn.execute("select careercloud.member_role(%s::uuid) as role", [ctx.workspace_id]).fetchone()["role"]
         if role is None:
             raise NotFoundError("workspace not found")
-        return role in ("owner", "admin", "member") if write else True
+        return role in ("owner", "admin", "manager", "member") if write else True
 
     def _update(self, ctx: Ctx, spec: EntitySpec, row_id: str, changes: Dict[str, Any],
                 expected_version: Optional[int]) -> Optional[Dict[str, Any]]:
@@ -258,13 +258,25 @@ class PostgresStore(Store):
         return _plain(row) if row else None
 
     def add_member(self, ctx: Ctx, user_id: str, role: str) -> None:
-        if role not in ("admin", "member", "viewer"):
-            raise ValidationError("role must be admin, member or viewer")
+        if role not in ("admin", "manager", "member", "viewer"):
+            raise ValidationError("role must be admin, manager, member or viewer")
         with self._tx(self._scope(ctx)) as conn:
             conn.execute(
                 "insert into careercloud.workspace_members (workspace_id, user_id, role) values (%s, %s, %s) "
                 "on conflict (workspace_id, user_id) do update set role = excluded.role",
                 [ctx.workspace_id, str(uuid.UUID(user_id)), role])
+
+    def remove_member(self, ctx: Ctx, user_id: str) -> bool:
+        with self._tx(self._scope(ctx)) as conn:
+            row = conn.execute("select role from careercloud.workspace_members where workspace_id = %s and user_id = %s",
+                               [ctx.workspace_id, str(uuid.UUID(user_id))]).fetchone()
+            if row is None:
+                return False
+            if row["role"] == "owner":
+                raise ValidationError("the workspace owner cannot be removed")
+            conn.execute("delete from careercloud.workspace_members where workspace_id = %s and user_id = %s "
+                         "and role <> 'owner'", [ctx.workspace_id, str(uuid.UUID(user_id))])
+        return True
 
     def list_members(self, ctx: Ctx) -> List[Dict[str, Any]]:
         with self._tx(self._scope(ctx)) as conn:

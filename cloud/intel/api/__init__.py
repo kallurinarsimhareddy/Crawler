@@ -25,6 +25,14 @@ ROUTER_MODULES = (
     "cloud.intel.api.routes_gtm",
     "cloud.intel.api.routes_analytics",
     "cloud.intel.api.routes_agent",
+    # SANA GTM completion
+    "cloud.intel.api.routes_email",
+    "cloud.intel.api.routes_sending",
+    "cloud.intel.api.routes_scoring",
+    "cloud.intel.api.routes_admin",
+    "cloud.intel.api.routes_integrations",
+    "cloud.intel.api.routes_internal",
+    "cloud.intel.api.routes_workflows",
 )
 
 

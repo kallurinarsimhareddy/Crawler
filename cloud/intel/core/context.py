@@ -27,10 +27,13 @@ __all__ = [
     "READ_ROLES",
     "WRITE_ROLES",
     "ADMIN_ROLES",
+    "MANAGER_ROLES",
 ]
 
-READ_ROLES = frozenset({"owner", "admin", "member", "viewer"})
-WRITE_ROLES = frozenset({"owner", "admin", "member"})
+READ_ROLES = frozenset({"owner", "admin", "manager", "member", "viewer"})
+WRITE_ROLES = frozenset({"owner", "admin", "manager", "member"})
+#: Managers write like members and also manage teams, ownership and assignment.
+MANAGER_ROLES = frozenset({"owner", "admin", "manager"})
 ADMIN_ROLES = frozenset({"owner", "admin"})
 
 
@@ -76,6 +79,8 @@ class Ctx:
     request_id: Optional[str] = None
     #: Whether private workspace data may be sent to external AI providers.
     ai_external_allowed: bool = False
+    #: Display label for the actor (the signed-in email), recorded on audit rows.
+    actor_label: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "workspace_id", str(uuid.UUID(str(self.workspace_id))))
@@ -99,6 +104,14 @@ class Ctx:
     @property
     def can_write(self) -> bool:
         return self.system or self.role in WRITE_ROLES
+
+    @property
+    def can_manage(self) -> bool:
+        return self.system or self.role in MANAGER_ROLES
+
+    def require_manager(self) -> None:
+        if not self.can_manage:
+            raise ForbiddenError("workspace manager rights required")
 
     @property
     def can_admin(self) -> bool:

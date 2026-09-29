@@ -138,7 +138,36 @@ def _blob(data: bytes) -> _Blob:
     return b
 
 
+class DpapiBackend:
+    """The real Windows DPAPI (per-user CryptProtectData). Tests swap in a fake
+    with :func:`set_dpapi_backend` so the encryption logic is testable anywhere."""
+
+    def protect(self, data: bytes) -> bytes:
+        return _win_protect(data)
+
+    def unprotect(self, data: bytes) -> bytes:
+        return _win_unprotect(data)
+
+
+_DPAPI = DpapiBackend()
+
+
+def set_dpapi_backend(backend):
+    """Replace the DPAPI backend (an object with ``protect``/``unprotect``); returns the old one."""
+    global _DPAPI
+    old, _DPAPI = _DPAPI, backend
+    return old
+
+
 def dpapi_protect(data: bytes) -> bytes:
+    return _DPAPI.protect(data)
+
+
+def dpapi_unprotect(data: bytes) -> bytes:
+    return _DPAPI.unprotect(data)
+
+
+def _win_protect(data: bytes) -> bytes:
     crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
     src, ent, out = _blob(data), _blob(_ENTROPY), _Blob()
     if not crypt32.CryptProtectData(ctypes.byref(src), "SANA GTM", ctypes.byref(ent), None, None,
@@ -150,7 +179,7 @@ def dpapi_protect(data: bytes) -> bytes:
         kernel32.LocalFree(out.pbData)
 
 
-def dpapi_unprotect(data: bytes) -> bytes:
+def _win_unprotect(data: bytes) -> bytes:
     crypt32, kernel32 = ctypes.windll.crypt32, ctypes.windll.kernel32
     src, ent, out = _blob(data), _blob(_ENTROPY), _Blob()
     if not crypt32.CryptUnprotectData(ctypes.byref(src), None, ctypes.byref(ent), None, None,
@@ -173,9 +202,29 @@ def save_secrets(paths: Paths, secrets: Dict[str, str]) -> None:
 
 
 def load_secrets(paths: Paths) -> Dict[str, str]:
+    """Decrypt secrets.dat. A tampered, foreign or corrupt file raises OSError; partial
+    data is never returned."""
     if not paths.secrets.exists():
         return {}
-    return json.loads(dpapi_unprotect(paths.secrets.read_bytes()).decode("utf-8"))
+    plain = dpapi_unprotect(paths.secrets.read_bytes())
+    try:
+        data = json.loads(plain.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        raise OSError("secrets.dat decrypted to unreadable data") from None
+    if not isinstance(data, dict):
+        raise OSError("secrets.dat does not hold a configuration object")
+    return {k: v for k, v in data.items() if k in SECRET_KEYS and isinstance(v, str)}
+
+
+def secrets_status(paths: Paths) -> Dict[str, object]:
+    """Which secrets are present -- names only, never values (status pages, verify.py)."""
+    try:
+        secrets = load_secrets(paths)
+    except OSError as e:
+        return {"decryptable": False, "present": [], "missing": list(REQUIRED_SECRETS),
+                "error": str(e).split(":")[0][:120]}
+    return {"decryptable": True, "present": sorted(k for k, v in secrets.items() if v),
+            "missing": [k for k in REQUIRED_SECRETS if not secrets.get(k)], "error": ""}
 
 
 # --- settings ---------------------------------------------------------------------------------
@@ -364,10 +413,23 @@ def _xml_escape(s: str) -> str:
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;"))
 
 
-def register_task(paths: Paths) -> None:
-    user = f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}"
-    start = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 60))
-    xml = f"""<?xml version="1.0" encoding="UTF-16"?>
+def task_definition(paths: Paths) -> Dict[str, str]:
+    """What the startup task runs: windowless pythonw.exe + supervisor.py, per user, no admin."""
+    return {"name": TASK_NAME, "command": str(paths.pythonw),
+            "arguments": f'"{paths.manager / "supervisor.py"}"', "working_directory": str(paths.root),
+            "logon_delay": "PT20S", "watchdog_interval": "PT2M", "run_level": "LeastPrivilege"}
+
+
+def current_user() -> str:
+    return f"{os.environ.get('USERDOMAIN', '')}\\{os.environ.get('USERNAME', '')}"
+
+
+def task_xml(paths: Paths, user: Optional[str] = None, start: Optional[str] = None) -> str:
+    """Task Scheduler XML for the per-user startup task. Pure: generating it registers nothing."""
+    user = user or current_user()
+    start = start or time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 60))
+    d = task_definition(paths)
+    return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Description>Starts and supervises the SANA GTM API, worker and Cloudflare tunnel ({_xml_escape(str(paths.root))}). Hidden; no console windows.</Description>
@@ -376,13 +438,13 @@ def register_task(paths: Paths) -> None:
     <LogonTrigger>
       <Enabled>true</Enabled>
       <UserId>{_xml_escape(user)}</UserId>
-      <Delay>PT20S</Delay>
+      <Delay>{d["logon_delay"]}</Delay>
     </LogonTrigger>
     <TimeTrigger>
       <Enabled>true</Enabled>
       <StartBoundary>{start}</StartBoundary>
       <Repetition>
-        <Interval>PT2M</Interval>
+        <Interval>{d["watchdog_interval"]}</Interval>
         <StopAtDurationEnd>false</StopAtDurationEnd>
       </Repetition>
     </TimeTrigger>
@@ -391,7 +453,7 @@ def register_task(paths: Paths) -> None:
     <Principal id="Author">
       <UserId>{_xml_escape(user)}</UserId>
       <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
+      <RunLevel>{d["run_level"]}</RunLevel>
     </Principal>
   </Principals>
   <Settings>
@@ -413,13 +475,17 @@ def register_task(paths: Paths) -> None:
   </Settings>
   <Actions Context="Author">
     <Exec>
-      <Command>{_xml_escape(str(paths.pythonw))}</Command>
-      <Arguments>"{_xml_escape(str(paths.manager / 'supervisor.py'))}"</Arguments>
-      <WorkingDirectory>{_xml_escape(str(paths.root))}</WorkingDirectory>
+      <Command>{_xml_escape(d["command"])}</Command>
+      <Arguments>{_xml_escape(d["arguments"])}</Arguments>
+      <WorkingDirectory>{_xml_escape(d["working_directory"])}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
 """
+
+
+def register_task(paths: Paths) -> None:
+    xml = task_xml(paths)
     xml_file = paths.state / "task.xml"
     paths.state.mkdir(parents=True, exist_ok=True)
     xml_file.write_text(xml, encoding="utf-16")

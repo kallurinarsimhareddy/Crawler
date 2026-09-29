@@ -17,6 +17,12 @@ Otherwise the step is recorded as a ``blocked`` message event by the
 Enrollments always start in ``pending_approval``. Approval is an explicit,
 audited user action; automation can enroll but never approve.
 
+Every send is also queued in ``outbound_messages`` (what was rendered, through
+which mailbox, and what happened), and respects the campaign/sequence schedule
+window, daily cap, and each mailbox's daily/hourly limit. A sequence stops on
+reply (configurable), and always on unsubscribe, hard bounce, complaint,
+suppression, a disabled contact, or a stopped (archived) campaign.
+
 Unsubscribe links carry an HMAC-signed token (workspace + contact). Without a
 server secret the platform refuses to render them — and a template that needs
 ``{{unsubscribe.url}}`` then fails to render rather than going out without one.
@@ -52,7 +58,64 @@ log = logging.getLogger(__name__)
 
 _VAR = re.compile(r"\{\{\s*([a-zA-Z_][a-zA-Z0-9_]*(?:\.[a-zA-Z_][a-zA-Z0-9_]*)*)\s*\}\}")
 _UNDELIVERABLE = frozenset({"INVALID", "DISPOSABLE"})
-_TERMINAL = frozenset({"completed", "replied", "bounced", "unsubscribed", "suppressed", "stopped"})
+_TERMINAL = frozenset({"completed", "replied", "bounced", "unsubscribed", "suppressed", "stopped", "failed"})
+_DISABLED_STATUSES = ("do_not_contact", "left_company", "archived", "merged")
+#: Stop conditions. Compliance ones are always on and cannot be switched off.
+STOP_CONDITIONS = ("reply", "unsubscribe", "bounce", "contact_disabled", "campaign_stopped", "suppressed")
+LOCKED_STOP_CONDITIONS = frozenset({"unsubscribe", "bounce", "suppressed"})
+#: The default cadence: Day 1 initial, Day 3 follow-up, Day 6 follow-up, Day 10 final.
+DEFAULT_CADENCE = ((1, "initial"), (3, "follow_up"), (6, "follow_up"), (10, "final"))
+
+
+def stop_conditions(sequence: Optional[Mapping[str, Any]]) -> Dict[str, bool]:
+    """The effective stop conditions of a sequence (defaults on; compliance always on)."""
+    sequence = sequence or {}
+    out = {name: True for name in STOP_CONDITIONS}
+    if sequence.get("stop_on_reply") is False:
+        out["reply"] = False
+    for name, value in (sequence.get("stop_conditions") or {}).items():
+        if name in out and name not in LOCKED_STOP_CONDITIONS:
+            out[name] = bool(value)
+    return out
+
+
+def cadence_days(delays: Sequence[int]) -> List[int]:
+    """Step delays (days after the previous step) -> the day each step runs, Day 1 first."""
+    day, out = 1, []
+    for i, delay in enumerate(delays):
+        day = 1 + int(delay) if i == 0 else day + int(delay)
+        out.append(day)
+    return out
+
+
+def next_send_window(now: datetime, schedule: Optional[Mapping[str, Any]]) -> Optional[datetime]:
+    """None when ``now`` is inside the schedule window, else the next window start.
+
+    ``schedule``: ``{"timezone": "America/New_York", "days": [1..7 ISO weekdays],
+    "start_hour": 9, "end_hour": 17}``. An empty schedule means "any time".
+    """
+    schedule = schedule or {}
+    days = [int(d) for d in schedule.get("days") or []] or list(range(1, 8))
+    start = int(schedule.get("start_hour", 0) or 0)
+    end = int(schedule.get("end_hour", 24) or 24)
+    if not schedule or (len(days) == 7 and start <= 0 and end >= 24):
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+
+        tz = ZoneInfo(str(schedule.get("timezone") or "UTC"))
+    except Exception:  # noqa: BLE001 - unknown zone: fall back to UTC rather than never sending
+        from datetime import timezone as _tz
+
+        tz = _tz.utc
+    local = now.astimezone(tz)
+    if local.isoweekday() in days and start <= local.hour < end:
+        return None
+    for offset in range(0, 8):
+        day = (local + timedelta(days=offset)).replace(hour=start, minute=0, second=0, microsecond=0)
+        if day.isoweekday() in days and day > local:
+            return day.astimezone(now.tzinfo or tz)
+    return None
 
 
 class TemplateError(ValidationError):
@@ -220,49 +283,43 @@ class SequenceService:
     # --- suppression ----------------------------------------------------------------
 
     def add_suppression(self, ctx: Ctx, value: str, *, kind: str = "email", reason: str = "manual",
-                        source: Optional[str] = None) -> Dict[str, Any]:
-        value = (normalize_email(value) if kind == "email" else domain_of(value)) or ""
-        if not value:
-            raise ValidationError(f"not a valid {kind}")
-        existing = self.store.first(ctx, "suppressions", {"kind": kind, "value": value})
-        if existing is not None:
-            return existing
-        try:
-            row = self.store.insert(ctx, "suppressions", {"value": value, "kind": kind, "reason": reason,
-                                                          "source": source})
-        except ConflictError:
-            return self.store.first(ctx, "suppressions", {"kind": kind, "value": value})
-        audit(self.store, ctx, "suppression.add", entity_type="suppressions", entity_id=row["id"],
-              changes={"value": value, "kind": kind, "reason": reason})
-        return row
+                        source: Optional[str] = None, scope: str = "workspace",
+                        campaign_id: Optional[str] = None) -> Dict[str, Any]:
+        """Suppress an address or domain (see :mod:`cloud.intel.gtm.suppression`)."""
+        return self.platform.service("suppression").add(ctx, value, kind=kind, reason=reason, source=source,
+                                                        scope=scope, campaign_id=campaign_id)
 
-    def suppression_for(self, ctx: Ctx, email: Optional[str]) -> Optional[Dict[str, Any]]:
-        email = normalize_email(email)
-        if not email:
-            return None
-        hit = self.store.first(ctx, "suppressions", {"kind": "email", "value": email})
-        if hit is None:
-            domain = email.rpartition("@")[2]
-            hit = self.store.first(ctx, "suppressions", {"kind": "domain", "value": domain})
-            if hit is None and domain_of(domain) and domain_of(domain) != domain:
-                hit = self.store.first(ctx, "suppressions", {"kind": "domain", "value": domain_of(domain)})
-        return hit
+    def suppression_for(self, ctx: Ctx, email: Optional[str], *,
+                        campaign_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        return self.platform.service("suppression").check(ctx, email, campaign_id=campaign_id)
 
-    def contact_block_reason(self, ctx: Ctx, contact: Mapping[str, Any]) -> Optional[str]:
-        """Why this contact must not be emailed, or None."""
+    def contact_block_reason(self, ctx: Ctx, contact: Mapping[str, Any], *,
+                             campaign_id: Optional[str] = None) -> Optional[str]:
+        """Why this contact must not be emailed, or None. Checked at enrollment and before every send."""
         if contact.get("unsubscribed"):
             return "unsubscribed"
-        if contact.get("status") in ("do_not_contact", "left_company", "archived", "merged"):
+        if contact.get("status") in _DISABLED_STATUSES:
             return f"contact status {contact.get('status')}"
         email = normalize_email(contact.get("email"))
         if not email:
             return "no valid email address"
         if contact.get("email_status") in _UNDELIVERABLE:
             return f"email status {contact.get('email_status')}"
-        hit = self.suppression_for(ctx, email)
+        hit = self.suppression_for(ctx, email, campaign_id=campaign_id)
         if hit is not None:
-            return f"suppressed ({hit['kind']} {hit['value']}: {hit['reason']})"
+            scope = "" if hit.get("scope", "workspace") == "workspace" else f"{hit['scope']} "
+            return f"suppressed ({scope}{hit['kind']} {hit['value']}: {hit['reason']})"
         return None
+
+    @staticmethod
+    def _block_status(reason: str) -> str:
+        if reason == "unsubscribed":
+            return "unsubscribed"
+        if reason.startswith("suppressed"):
+            return "suppressed"
+        if reason.startswith("email status"):
+            return "bounced" if "INVALID" in reason else "suppressed"
+        return "stopped"
 
     # --- sequences & steps -----------------------------------------------------------
 
@@ -363,7 +420,7 @@ class SequenceService:
             if contact is None:
                 results.append({"contact_id": contact_id, "status": "skipped", "reason": "contact not found"})
                 continue
-            reason = self.contact_block_reason(ctx, contact)
+            reason = self.contact_block_reason(ctx, contact, campaign_id=campaign_id)
             if reason is not None:
                 results.append({"contact_id": contact_id, "status": "skipped", "reason": reason})
                 continue
@@ -400,30 +457,162 @@ class SequenceService:
             approved.append(row)
         return approved
 
-    def stop_enrollment(self, ctx: Ctx, enrollment_id: str, status: str = "stopped") -> Dict[str, Any]:
-        row = self.store.update(ctx, "sequence_enrollments", enrollment_id, {"status": status, "next_step_at": None})
+    def stop_enrollment(self, ctx: Ctx, enrollment_id: str, status: str = "stopped",
+                        reason: Optional[str] = None) -> Dict[str, Any]:
+        row = self.store.update(ctx, "sequence_enrollments", enrollment_id, {
+            "status": status, "next_step_at": None, "stop_reason": (reason or "stopped by a user")[:300]})
+        self._cancel_queued(ctx, enrollment_id, reason or status)
         audit(self.store, ctx, f"sequence.{status}", entity_type="sequence_enrollments", entity_id=enrollment_id)
         return row
 
+    def _cancel_queued(self, ctx: Ctx, enrollment_id: str, reason: str) -> int:
+        cancelled = 0
+        for row in self.store.all(ctx, "outbound_messages", {"enrollment_id": enrollment_id,
+                                                             "status__in": ["queued", "scheduled"]}, cap=100):
+            self.store.update(ctx, "outbound_messages", row["id"], {"status": "cancelled",
+                                                                    "block_reason": reason[:500]})
+            cancelled += 1
+        return cancelled
+
+    # --- step editor -----------------------------------------------------------------------
+
+    def save_steps(self, ctx: Ctx, sequence_id: str, steps: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+        """Replace a sequence's steps in the given order (the step editor's Save).
+
+        Each step: ``channel`` (email/wait/task/call/linkedin_task), ``delay_days``,
+        ``step_type`` (initial/follow_up/final/wait/task), ``template_id`` (email),
+        ``subject_override``, ``instructions``, ``condition``.
+        """
+        ctx.require_write()
+        sequence = self.store.get(ctx, "sequences", sequence_id)
+        if sequence["status"] == "archived":
+            raise ValidationError("an archived sequence cannot be edited")
+        if len(steps) > 30:
+            raise ValidationError("a sequence can have at most 30 steps")
+        clean: List[Dict[str, Any]] = []
+        for i, step in enumerate(steps):
+            channel = str(step.get("channel") or "email")
+            if channel not in ("email", "wait", "task", "call", "linkedin_task"):
+                raise ValidationError(f"step {i + 1}: unknown channel {channel!r}")
+            template_id = step.get("template_id") or None
+            if channel == "email":
+                if not template_id:
+                    raise ValidationError(f"step {i + 1}: an email step needs a template")
+                self.store.get(ctx, "email_templates", template_id)
+            default_type = ("wait" if channel == "wait" else "task" if channel != "email"
+                            else "initial" if i == 0 else "follow_up")
+            step_type = str(step.get("step_type") or default_type)
+            if step_type not in ("initial", "follow_up", "final", "wait", "task"):
+                raise ValidationError(f"step {i + 1}: unknown step type {step_type!r}")
+            delay = int(step.get("delay_days") or 0)
+            if not 0 <= delay <= 365:
+                raise ValidationError(f"step {i + 1}: delay must be 0-365 days")
+            clean.append({"sequence_id": sequence_id, "position": i, "channel": channel, "delay_days": delay,
+                          "template_id": template_id if channel == "email" else None, "step_type": step_type,
+                          "subject_override": step.get("subject_override") or None,
+                          "instructions": step.get("instructions") or None,
+                          "condition": dict(step.get("condition") or {})})
+        for old in self.steps(ctx, sequence_id):
+            self.store.delete(ctx, "sequence_steps", old["id"])
+        rows = [self.store.insert(ctx, "sequence_steps", values) for values in clean]
+        audit(self.store, ctx, "sequence.save_steps", entity_type="sequences", entity_id=sequence_id,
+              changes={"steps": len(rows), "days": cadence_days([r["delay_days"] for r in rows])})
+        return rows
+
+    def apply_cadence(self, ctx: Ctx, sequence_id: str, template_ids: Sequence[str],
+                      days: Sequence[int] = tuple(d for d, _ in DEFAULT_CADENCE)) -> List[Dict[str, Any]]:
+        """Email steps on the given days (default Day 1, 3, 6, 10); templates are reused when fewer."""
+        if not template_ids:
+            raise ValidationError("choose at least one template")
+        days = [int(d) for d in days]
+        if not days or days != sorted(days) or days[0] < 1:
+            raise ValidationError("days must be increasing and start at 1 or later")
+        steps, previous = [], days[0]
+        for i, day in enumerate(days):
+            steps.append({"channel": "email", "template_id": template_ids[min(i, len(template_ids) - 1)],
+                          "delay_days": day - 1 if i == 0 else day - previous,
+                          "step_type": "initial" if i == 0 else ("final" if i == len(days) - 1 else "follow_up"),
+                          "condition": {"only_if_no_reply": i > 0}})
+            previous = day
+        return self.save_steps(ctx, sequence_id, steps)
+
+    def update_stop_conditions(self, ctx: Ctx, sequence_id: str, conditions: Mapping[str, Any]) -> Dict[str, Any]:
+        ctx.require_write()
+        sequence = self.store.get(ctx, "sequences", sequence_id)
+        clean = {k: bool(v) for k, v in conditions.items() if k in STOP_CONDITIONS and k not in LOCKED_STOP_CONDITIONS}
+        merged = {**(sequence.get("stop_conditions") or {}), **clean}
+        changes: Dict[str, Any] = {"stop_conditions": merged}
+        if "reply" in clean:
+            changes["stop_on_reply"] = clean["reply"]
+        row = self.store.update(ctx, "sequences", sequence_id, changes)
+        audit(self.store, ctx, "sequence.stop_conditions", entity_type="sequences", entity_id=sequence_id,
+              changes=clean)
+        return row
+
+    def overview(self, ctx: Ctx, sequence_id: str) -> Dict[str, Any]:
+        sequence = self.store.get(ctx, "sequences", sequence_id)
+        steps = self.steps(ctx, sequence_id)
+        enrollments = self.store.group_count(ctx, "sequence_enrollments", "status", {"sequence_id": sequence_id})
+        ids = [e["id"] for e in self.store.all(ctx, "sequence_enrollments", {"sequence_id": sequence_id}, cap=5000)]
+        events = self.store.group_count(ctx, "message_events", "event", {"enrollment_id__in": ids}) if ids else {}
+        return {"sequence": sequence, "steps": steps, "days": cadence_days([s["delay_days"] for s in steps]),
+                "stop_conditions": stop_conditions(sequence),
+                "locked_stop_conditions": sorted(LOCKED_STOP_CONDITIONS),
+                "enrollments": {str(k): v for k, v in enrollments.items()},
+                "events": {str(k): v for k, v in events.items()}}
+
     # --- sending -----------------------------------------------------------------------------
 
-    def _sender_for(self, campaign: Optional[Mapping[str, Any]]) -> Tuple[SenderProvider, Optional[str]]:
-        """Pick the sender, and say why mail is blocked when it is."""
+    def _sender_for(self, campaign: Optional[Mapping[str, Any]], ctx: Optional[Ctx] = None,
+                    enrollment: Optional[Mapping[str, Any]] = None, now: Optional[datetime] = None
+                    ) -> Tuple[SenderProvider, Optional[str]]:
+        """Pick the sender, and say why mail is blocked when it is.
+
+        Gates first (environment, campaign); then a test override; then a connected
+        mailbox (the enrollment's, the campaign's senders, or the default); and only
+        when no mailbox is connected at all, the server's SMTP relay.
+        """
+        self._last_mailbox = None
         if not self.platform.config.allow_email_sending:
             return NullSender("email sending is disabled in this environment"), "sending disabled"
         if campaign is None or not campaign.get("sending_enabled"):
             return NullSender("the campaign does not have sending enabled"), "campaign sending disabled"
         if self.sender_override is not None:
             return self.sender_override, None
+        if ctx is not None:
+            wants = (enrollment or {}).get("mailbox_id")
+            has_any = self.store.count(ctx, "mailboxes", {"status": "connected"}) > 0
+            if has_any or wants or campaign.get("mailbox_ids"):
+                mailboxes = self.platform.service("mailboxes")
+                mailbox, reason = mailboxes.pick(ctx, campaign, mailbox_id=wants, now=now)
+                if mailbox is None:
+                    return NullSender(reason), "deferred:" + reason
+                self._last_mailbox = mailbox
+                return mailboxes.sender(ctx, mailbox), None
         return SmtpSender.from_env(), None
 
     def _event(self, ctx: Ctx, enrollment: Mapping[str, Any], event: str, *, provider: Optional[str] = None,
-               provider_message_id: Optional[str] = None, data: Optional[Mapping[str, Any]] = None
-               ) -> Dict[str, Any]:
+               provider_message_id: Optional[str] = None, data: Optional[Mapping[str, Any]] = None,
+               mailbox_id: Optional[str] = None) -> Dict[str, Any]:
         return self.store.insert(ctx, "message_events", {
             "enrollment_id": enrollment.get("id"), "contact_id": enrollment.get("contact_id"),
             "campaign_id": enrollment.get("campaign_id"), "event": event, "provider": provider,
-            "provider_message_id": provider_message_id, "occurred_at": utcnow(), "data": dict(data or {})})
+            "provider_message_id": provider_message_id, "occurred_at": utcnow(), "data": dict(data or {}),
+            "mailbox_id": mailbox_id})
+
+    def _stop(self, ctx: Ctx, enrollment: Mapping[str, Any], status: str, reason: str) -> None:
+        self.store.update(ctx, "sequence_enrollments", enrollment["id"], {
+            "status": status, "next_step_at": None, "stop_reason": reason[:300]})
+        self._cancel_queued(ctx, enrollment["id"], reason)
+
+    def _defer(self, ctx: Ctx, enrollment: Mapping[str, Any], until: datetime, stats: Dict[str, int]) -> None:
+        self.store.update(ctx, "sequence_enrollments", enrollment["id"], {"next_step_at": until})
+        stats["deferred"] = stats.get("deferred", 0) + 1
+
+    def _campaign_sent_today(self, ctx: Ctx, campaign_id: str, now: datetime) -> int:
+        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return self.store.count(ctx, "outbound_messages", {"campaign_id": campaign_id, "status": "sent",
+                                                           "sent_at__gte": start})
 
     def process_due(self, ctx: Ctx, now: Optional[datetime] = None, *, limit: int = 200) -> Dict[str, Any]:
         """Advance active, approved enrollments whose next step is due."""
@@ -458,21 +647,50 @@ class SequenceService:
         contact = self.store.get(ctx, "contacts", enrollment["contact_id"])
         campaign = self.store.find(ctx, "campaigns", enrollment["campaign_id"]) if enrollment.get("campaign_id") \
             else None
+        sequence = self.store.find(ctx, "sequences", enrollment["sequence_id"])
+        conditions = stop_conditions(sequence)
 
-        if step["channel"] == "email":
-            reason = self.contact_block_reason(ctx, contact)
+        if campaign is not None and campaign.get("status") == "archived" and conditions["campaign_stopped"]:
+            self._stop(ctx, enrollment, "stopped", "campaign stopped")
+            stats["stopped"] += 1
+            return
+        if (campaign is not None and campaign.get("status") == "paused") or \
+                (sequence is not None and sequence.get("status") == "paused"):
+            self._defer(ctx, enrollment, now + timedelta(days=1), stats)
+            return
+        if conditions["contact_disabled"] and contact.get("status") in _DISABLED_STATUSES:
+            self._stop(ctx, enrollment, "stopped", f"contact disabled ({contact.get('status')})")
+            stats["stopped"] += 1
+            return
+        if (step.get("condition") or {}).get("only_if_no_reply") and conditions["reply"] and self.store.count(
+                ctx, "message_events", {"contact_id": contact["id"], "event": "replied"}) > 0:
+            self._stop(ctx, enrollment, "replied", "reply received before this follow-up")
+            stats["stopped"] += 1
+            return
+
+        if step["channel"] == "wait":
+            pass  # a pure delay: advance to the next step on schedule
+        elif step["channel"] == "email":
+            reason = self.contact_block_reason(ctx, contact, campaign_id=enrollment.get("campaign_id"))
             if reason is not None:
-                status = "unsubscribed" if reason == "unsubscribed" else "suppressed"
                 self._event(ctx, enrollment, "blocked", data={"reason": reason, "step": position})
-                self.store.update(ctx, "sequence_enrollments", enrollment["id"], {"status": status,
-                                                                                  "next_step_at": None})
+                self._stop(ctx, enrollment, self._block_status(reason), reason)
                 stats["blocked"] += 1
                 stats["stopped"] += 1
+                return
+            schedule = (campaign or {}).get("schedule") or (sequence or {}).get("schedule") or {}
+            window = next_send_window(now, schedule)
+            if window is not None:
+                self._defer(ctx, enrollment, window, stats)
+                return
+            cap = int(schedule.get("daily_cap") or 0)
+            if cap and campaign is not None and self._campaign_sent_today(ctx, campaign["id"], now) >= cap:
+                self._defer(ctx, enrollment, now + timedelta(days=1), stats)
                 return
             template = self.store.get(ctx, "email_templates", step["template_id"])
             variables = self.variables_for(ctx, contact, enrollment=enrollment)
             try:
-                subject = render_template(template["subject"], variables)
+                subject = render_template(step.get("subject_override") or template["subject"], variables)
                 body = render_template(template["body"], variables)
             except TemplateError as error:
                 self._event(ctx, enrollment, "failed", data={"reason": str(error), "step": position})
@@ -480,17 +698,28 @@ class SequenceService:
                                                                                   "next_step_at": None})
                 stats["failed"] += 1
                 return
+            sender, blocked_reason = self._sender_for(campaign, ctx, enrollment, now)
+            mailbox = getattr(self, "_last_mailbox", None)
+            if blocked_reason and blocked_reason.startswith("deferred:"):
+                # Sending is allowed but no mailbox has capacity: wait; nothing was sent.
+                self._defer(ctx, enrollment, now + timedelta(hours=1), stats)
+                return
             self._event(ctx, enrollment, "rendered", data={"step": position, "subject": subject[:300]})
-            sender, blocked_reason = self._sender_for(campaign)
             headers = {}
             if "unsubscribe" in variables:
                 headers["List-Unsubscribe"] = f"<{variables['unsubscribe']['url']}>"
+                headers["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+            queued = self._queue(ctx, enrollment, position, contact["email"], subject, body, mailbox, now)
             outcome = sender.send(OutboundMessage(to=contact["email"], subject=subject, body=body, headers=headers,
                                                   campaign_id=enrollment.get("campaign_id"),
                                                   enrollment_id=enrollment["id"]))
             self._event(ctx, enrollment, outcome["event"], provider=sender.name,
                         provider_message_id=outcome.get("provider_message_id"),
-                        data={"step": position, "detail": outcome.get("detail") or blocked_reason})
+                        data={"step": position, "detail": outcome.get("detail") or blocked_reason},
+                        mailbox_id=(mailbox or {}).get("id"))
+            self._settle(ctx, queued, outcome, sender.name, blocked_reason, now)
+            if outcome["event"] == "sent" and mailbox is not None:
+                self.platform.service("mailboxes").record_send(ctx, mailbox, now)
             stats[outcome["event"] if outcome["event"] in stats else "failed"] += 1
             if outcome["event"] == "sent":
                 record_activity(self.store, ctx, "email_sent", f"Sequence email: {subject[:200]}",
@@ -514,13 +743,39 @@ class SequenceService:
                 "source": "sequence"})
             stats["tasks"] += 1
         next_position = position + 1
-        changes: Dict[str, Any] = {"current_step": next_position}
+        changes: Dict[str, Any] = {"current_step": next_position, "last_event_at": now}
         if next_position >= len(steps):
             changes.update({"status": "completed", "next_step_at": None})
             stats["completed"] += 1
         else:
             changes["next_step_at"] = now + timedelta(days=steps[next_position]["delay_days"])
         self.store.update(ctx, "sequence_enrollments", enrollment["id"], changes)
+
+    def _queue(self, ctx: Ctx, enrollment: Mapping[str, Any], step: int, to: str, subject: str, body: str,
+               mailbox: Optional[Mapping[str, Any]], now: datetime) -> Dict[str, Any]:
+        """One outbound row per enrollment step; a retried step reuses its row."""
+        existing = self.store.first(ctx, "outbound_messages", {
+            "enrollment_id": enrollment["id"], "step": step, "status__in": ["queued", "blocked", "failed"]})
+        values = {"to_email": to, "subject": subject[:1000], "body": body[:50000], "status": "sending",
+                  "mailbox_id": (mailbox or {}).get("id"), "scheduled_for": now}
+        if existing is not None:
+            return self.store.update(ctx, "outbound_messages", existing["id"],
+                                     {**values, "attempts": existing["attempts"] + 1})
+        return self.store.insert(ctx, "outbound_messages", {
+            **values, "campaign_id": enrollment.get("campaign_id"), "sequence_id": enrollment.get("sequence_id"),
+            "enrollment_id": enrollment["id"], "step": step, "contact_id": enrollment.get("contact_id"),
+            "attempts": 1})
+
+    def _settle(self, ctx: Ctx, queued: Mapping[str, Any], outcome: Mapping[str, Any], provider: str,
+                blocked_reason: Optional[str], now: datetime) -> None:
+        event = outcome.get("event")
+        status = event if event in ("sent", "blocked", "failed") else "failed"
+        detail = outcome.get("detail") or blocked_reason
+        self.store.update(ctx, "outbound_messages", queued["id"], {
+            "status": status, "provider": provider[:60], "provider_message_id": outcome.get("provider_message_id"),
+            "sent_at": now if status == "sent" else None,
+            "block_reason": (detail or None) and str(detail)[:500] if status == "blocked" else None,
+            "error": (detail or None) and str(detail)[:2000] if status == "failed" else None})
 
     # --- inbound events -------------------------------------------------------------------------
 
@@ -555,12 +810,15 @@ class SequenceService:
             if enrollment["status"] in _TERMINAL and kind == "reply":
                 continue
             sequence = self.store.find(ctx, "sequences", enrollment["sequence_id"])
-            if kind == "reply" and sequence is not None and not sequence.get("stop_on_reply"):
+            if kind == "reply" and sequence is not None and not stop_conditions(sequence)["reply"]:
                 continue
             if enrollment["status"] in ("unsubscribed",) and kind != "unsubscribe":
                 continue
-            changed.append(self.store.update(ctx, "sequence_enrollments", enrollment["id"],
-                                             {"status": event_name, "next_step_at": None}))
+            changed.append(self.store.update(ctx, "sequence_enrollments", enrollment["id"], {
+                "status": event_name, "next_step_at": None, "last_event_at": utcnow(),
+                "stop_reason": {"reply": "reply received", "bounce": "permanent bounce",
+                                "unsubscribe": "unsubscribed"}[kind]}))
+            self._cancel_queued(ctx, enrollment["id"], event_name)
         if contact is not None:
             if kind == "reply":
                 record_activity(self.store, ctx, "email_reply", f"{contact['full_name']} replied",

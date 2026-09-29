@@ -1,0 +1,25 @@
+/* Workflows (advanced builder): steps, branches, run history, templates. */
+.wf-grow { flex: 1 1 auto; }
+.wf-mode { display: flex; flex-wrap: wrap; gap: 16px; margin-top: 12px; }
+.wf-steps { display: flex; flex-direction: column; gap: 8px; }
+.wf-step { border: 1px solid var(--border); border-radius: var(--radius-small); padding: 8px; background: var(--surface); display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.wf-step--branch { border-left: 3px solid var(--accent); }
+.wf-step--delay, .wf-step--approval { border-left: 3px solid var(--text-muted); }
+.wf-step__head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.wf-step__num { display: inline-flex; width: 22px; height: 22px; border-radius: 50%; align-items: center; justify-content: center; background: var(--surface-2); font-size: 12px; }
+.wf-inline { display: flex; flex-wrap: wrap; gap: 12px; }
+.wf-narrow { max-width: 160px; }
+.wf-branches { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 8px; }
+.wf-branch { border: 1px dashed var(--border); border-radius: var(--radius-small); padding: 8px; min-width: 0; }
+.wf-branch h5 { margin: 0 0 6px; font-size: 12px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--text-muted); }
+.wf-history { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 2px; }
+.wf-history__item--failed { color: var(--failed); }
+.wf-history__item--waiting { color: var(--text-muted); }
+.wf-templates { display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; margin-top: 12px; }
+.wf-template h3 { margin: 0 0 6px; font-size: 15px; }
+.wf-approvals { display: flex; flex-direction: column; gap: 16px; margin-top: 12px; }
+.wf-approvals h3 { margin: 0 0 8px; font-size: 15px; }
+.wf-notice { color: var(--text-muted); }
+@media (max-width: 640px) {
+  .wf-narrow { max-width: none; flex: 1 1 120px; }
+}

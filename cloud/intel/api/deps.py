@@ -41,7 +41,8 @@ def workspace_ctx(workspace_id: str, request: Request, principal: Principal = De
         raise HTTPException(status.HTTP_404_NOT_FOUND, "workspace not found")
     return Ctx(workspace_id=membership["workspace_id"], user_id=principal.user_id, role=membership["role"],
                request_id=request.headers.get("x-request-id"),
-               ai_external_allowed=bool(membership.get("ai_external_allowed")))
+               ai_external_allowed=bool(membership.get("ai_external_allowed")),
+               actor_label=(principal.email or None) and str(principal.email)[:320])
 
 
 def write_ctx(ctx: Ctx = Depends(workspace_ctx)) -> Ctx:

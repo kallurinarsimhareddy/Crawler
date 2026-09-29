@@ -55,6 +55,9 @@ class Col:
     #: creating migration keeps the original list (applied files never change);
     #: the named migration replaces the check constraint with ``choices``.
     widened: Optional[Tuple[str, Tuple[str, ...]]] = None
+    #: The migration that added this column to a table an earlier migration
+    #: created (``alter table ... add column``). The creating migration leaves it out.
+    added: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.kind not in PG_TYPES:
@@ -1010,6 +1013,310 @@ entity("ai_usage", "ai", {
     "run_id": _t(40, index=True),
 }, migration="0005", append_only=True, system_write=True,
    description="One row per external AI call: provider, model, tokens, estimated cost and request id.")
+
+
+# ---------------------------------------------------------------------------
+# SANA GTM completion (migration 0007)
+# ---------------------------------------------------------------------------
+
+_M7 = {"migration": "0007"}
+
+
+def _add(entity_name: str, columns: Mapping[str, Col]) -> None:
+    """Add columns to a table an earlier migration created (``alter table ... add column``)."""
+    from dataclasses import replace
+
+    spec = ENTITIES[entity_name]
+    for name, col in columns.items():
+        if name in spec.columns or name in COMMON_COLUMNS:
+            raise ValueError(f"{entity_name}.{name} already exists")
+        spec.columns[name] = replace(col, added="0007")  # type: ignore[index]
+
+
+def _widen(entity_name: str, column: str, *extra: str) -> None:
+    """Widen a column's choices in 0007; earlier migrations keep the original list."""
+    from dataclasses import replace
+
+    spec = ENTITIES[entity_name]
+    col = spec.columns[column]
+    if col.widened:
+        raise ValueError(f"{entity_name}.{column} was already widened")
+    spec.columns[column] = replace(col, choices=tuple(col.choices) + tuple(extra),  # type: ignore[index]
+                                   widened=("0007", tuple(col.choices)))
+
+
+EMAIL_STATUSES = ("VALID", "INVALID", "RISKY", "UNKNOWN", "DISPOSABLE", "ROLE", "FREE_PROVIDER")
+
+# --- widened choices ------------------------------------------------------------
+_widen("platform_tasks", "kind", "email_validation_job", "email_send", "workflow_resume", "scoring",
+       "internal_data", "integration")
+#: TaskService.submit validates against this name; keep it equal to the widened column.
+TASK_KINDS = ENTITIES["platform_tasks"].columns["kind"].choices
+_widen("provider_connections", "kind", "integration", "calendar", "messaging", "webhook", "mailbox")
+_widen("message_events", "event", "deferred", "clicked", "complained", "scheduled", "cancelled")
+_widen("suppressions", "reason", "hard_bounce", "invalid", "blocked", "role_policy")
+_widen("sequence_steps", "channel", "wait")
+_widen("sequence_enrollments", "status", "failed")
+_widen("workflow_runs", "status", "waiting", "awaiting_approval", "cancelled")
+_widen("import_rows", "status", "conflict", "needs_review")
+
+# --- added columns --------------------------------------------------------------
+_add("campaigns", {
+    "audience": _j(),                       # {"list_ids": [...], "segment_id": ..., "contact_ids": [...]}
+    "mailbox_ids": _tags(),                 # connected senders, rotated in order
+    "template_ids": _tags(),
+    "schedule": _j(),                       # {"timezone", "days": [1..7], "start_hour", "end_hour", "daily_cap"}
+    "approval_policy": _choice("manual", "auto_after_review", index=False),
+    "list_id": _t(40),
+    "stats": _j(),
+    "owner_id": Col("uuid", index=True),
+})
+_add("sequences", {
+    "stop_conditions": _j(),                # reply, unsubscribe, bounce, contact_disabled, campaign_stopped, suppressed
+    "schedule": _j(),
+    "mailbox_id": _t(40),
+})
+_add("sequence_steps", {
+    "step_type": _choice("initial", "follow_up", "final", "wait", "task", index=False),
+    "subject_override": _t(500),
+    "condition": _j(),                      # {"only_if_no_reply": true, ...}
+})
+_add("sequence_enrollments", {
+    "mailbox_id": _t(40),
+    "stop_reason": _t(300),
+    "last_event_at": Col("ts"),
+})
+_add("message_events", {
+    "mailbox_id": _t(40, index=True),
+    "normalized_from": _t(60),              # the provider event name before normalization
+})
+_add("suppressions", {
+    "scope": _choice("workspace", "campaign", index=False),
+    "campaign_id": _t(40, index=True),
+    "expires_at": Col("ts"),
+    "note": _t(1000),
+})
+_add("workflows", {
+    "graph": _j(),                          # {"start": node_id, "nodes": {id: {type, ...}}}
+    "retry_policy": _j(),                   # {"max_attempts", "backoff_seconds"}
+    "failure_policy": _choice("stop", "continue", "retry", index=False),
+    "template_key": _t(80),
+    "last_run_at": Col("ts"),
+})
+_add("workflow_runs", {
+    "current_node": _t(80),
+    "resume_at": Col("ts", index=True),
+    "history": _j([]),
+    "approved_by": Col("uuid"),
+    "approved_at": Col("ts"),
+})
+_add("companies", {
+    "technology_score": _score(),
+    "buying_stage": _t(40, index=True),
+    "buying_stage_score": _score(),
+    "scored_at": Col("ts"),
+})
+_add("contacts", {"scored_at": Col("ts")})
+_add("audit_log", {"actor_label": _t(320)})
+_add("import_batches", {
+    "schema_report": _j(),                  # per-file column comparison against the batch union schema
+    "conflict_count": Col("int", required=True, default=0, minimum=0),
+})
+_add("import_files", {
+    "mapping": _j(),                        # per-file column -> field mapping (never guessed when ambiguous)
+    "schema_signature": _t(64),
+})
+_add("import_rows", {"conflicts": _j([])})
+
+# --- new tables -----------------------------------------------------------------
+
+entity("email_validation_jobs", "evj", {
+    "name": _t(200, required=True, search=True),
+    "source_type": _choice("upload", "list", "contacts", "scrape", "manual"),
+    "source_id": _t(40),
+    "filename": _t(255),
+    "format": _choice("none", "csv", "xlsx"),
+    "size_bytes": Col("bigint", minimum=0),
+    "storage_key": _t(512),
+    "columns": _tags(),
+    "email_column": _t(200),
+    "preview": _j([]),
+    "row_count": Col("int", required=True, default=0, minimum=0),
+    "processed": Col("int", required=True, default=0, minimum=0),
+    "counts": _j(),
+    "settings": _j(),
+    "status": _choice("uploaded", "ready", "queued", "running", "paused", "completed", "cancelled", "failed"),
+    "task_id": _t(40),
+    "error": _t(2000),
+    "started_at": Col("ts"),
+    "finished_at": Col("ts"),
+}, **_M7, description="One email validation run over an uploaded file, a list, contacts or a scrape.")
+
+entity("email_validation_items", "evi", {
+    "job_id": _t(40, required=True, index=True),
+    "row_number": Col("int", required=True, minimum=0),
+    "email": _t(320, index=True),
+    "domain": _t(253, index=True),
+    "status": Col("text", choices=EMAIL_STATUSES + ("PENDING",), required=True, default="PENDING", index=True),
+    "score": _score(),
+    "provider": _t(60),
+    "checks": _j(),
+    "cached": Col("bool", required=True, default=False),
+    "validated_at": Col("ts"),
+    "row": _j(),
+    "contact_id": _t(40),
+}, unique=(("job_id", "row_number"),), default_order="row_number asc", **_M7,
+   description="One row of a validation job: the original row, its email and the result.")
+
+entity("mailboxes", "mb", {
+    "provider": _choice("google", "microsoft365", "smtp", "api"),
+    "address": _t(320, required=True, search=True),
+    "display_name": _t(200),
+    "status": _choice("pending", "connected", "error", "disconnected", "paused"),
+    "scopes": _tags(),
+    "daily_limit": Col("int", required=True, default=50, minimum=0, maximum=10000),
+    "hourly_limit": Col("int", required=True, default=10, minimum=0, maximum=1000),
+    "sent_today": Col("int", required=True, default=0, minimum=0),
+    "sent_day": Col("date"),
+    "last_test_at": Col("ts"),
+    "last_test_result": _j(),
+    "health": _choice("unknown", "healthy", "warning", "failing", index=False),
+    "is_default": Col("bool", required=True, default=False),
+    "secret_ciphertext": _t(8000),           # OAuth refresh token or API key, Fernet-encrypted; never a password
+    "secret_hint": _t(40),
+    "settings": _j(),
+    "last_error": _t(2000),
+}, unique=(("provider", "address"),), **_M7,
+   description="A connected sending mailbox (OAuth or API/SMTP relay). Mailbox passwords are never stored.")
+
+entity("oauth_states", "oas", {
+    "provider": _t(60, required=True),
+    "purpose": _t(60, required=True),
+    "state_hash": _t(64, required=True),
+    "code_verifier_ciphertext": _t(2000),
+    "redirect_to": _t(500),
+    "expires_at": Col("ts", required=True),
+    "used_at": Col("ts"),
+}, unique=(("state_hash",),), **_M7, description="One pending OAuth authorization (state + PKCE), single use.")
+
+entity("outbound_messages", "om", {
+    "campaign_id": _t(40, index=True),
+    "sequence_id": _t(40),
+    "enrollment_id": _t(40, index=True),
+    "step": Col("int", minimum=0),
+    "contact_id": _t(40, index=True),
+    "mailbox_id": _t(40, index=True),
+    "to_email": _t(320, required=True),
+    "subject": _t(1000, required=True),
+    "body": _t(50000, required=True),
+    "status": _choice("queued", "scheduled", "sending", "sent", "blocked", "failed", "cancelled"),
+    "scheduled_for": Col("ts", index=True),
+    "sent_at": Col("ts"),
+    "provider": _t(60),
+    "provider_message_id": _t(300, index=True),
+    "attempts": Col("int", required=True, default=0, minimum=0),
+    "block_reason": _t(500),
+    "error": _t(2000),
+    "test": Col("bool", required=True, default=False),
+}, **_M7, description="The outbound queue: every message rendered for sending, and what happened to it.")
+
+entity("inbound_events", "ine", {
+    "provider": _t(60, required=True, index=True),
+    "provider_event_id": _t(300, required=True),
+    "kind": _choice("delivered", "bounced", "deferred", "opened", "clicked", "replied", "unsubscribed",
+                    "complained", "unknown"),
+    "bounce_type": _choice("none", "hard", "soft", index=False),
+    "email": _t(320, index=True),
+    "provider_message_id": _t(300),
+    "occurred_at": Col("ts", required=True),
+    "processed": Col("bool", required=True, default=False),
+    "result": _j(),
+    "raw": _j(),
+}, unique=(("provider", "provider_event_id"),), **_M7,
+   description="Provider webhook events, normalized and de-duplicated before they change anything.")
+
+entity("teams", "tm", {
+    "name": _t(120, required=True, search=True),
+    "description": _t(1000),
+    "lead_user_id": Col("uuid"),
+}, unique=(("name",),), **_M7)
+
+entity("team_members", "tmm", {
+    "team_id": _t(40, required=True, index=True),
+    "user_id": Col("uuid", required=True, index=True),
+    "role": _choice("member", "lead"),
+}, unique=(("team_id", "user_id"),), **_M7)
+
+entity("workspace_invitations", "inv", {
+    "email": _t(320, required=True, search=True),
+    "role": _choice("member", "manager", "admin", "viewer"),
+    "status": _choice("pending", "accepted", "revoked", "expired"),
+    "token_hash": _t(64, required=True),
+    "expires_at": Col("ts", required=True),
+    "accepted_at": Col("ts"),
+    "accepted_by": Col("uuid"),
+}, unique=(("token_hash",),), **_M7)
+
+entity("notifications", "nf", {
+    "user_id": Col("uuid", index=True),      # null = everyone in the workspace
+    "kind": _t(60, required=True, index=True),
+    "title": _t(300, required=True),
+    "body": _t(2000),
+    "link": _t(500),
+    "severity": _choice("info", "success", "warning", "error"),
+    "entity_type": _t(40),
+    "entity_id": _t(40),
+    "read_at": Col("ts"),
+}, **_M7)
+
+entity("saved_reports", "rpt", {
+    "name": _t(200, required=True, search=True),
+    "report": _t(60, required=True, index=True),
+    "filters": _j(),
+    "date_range": _j(),
+    "shared": Col("bool", required=True, default=True),
+}, **_M7)
+
+entity("score_snapshots", "scs", {
+    "entity_type": _choice("company", "contact"),
+    "entity_id": _t(40, required=True, index=True),
+    "kind": _choice("account", "contact", "hiring", "technology", "opportunity", "buying_stage"),
+    "score": _score(),
+    "label": _t(60),
+    "factors": _j([]),                       # [{"name", "weight", "value", "points", "reason"}]
+    "evidence": _j([]),                      # [{"type", "id", "summary", "observed_at"}]
+    "model": _t(60, required=True),
+    "computed_at": Col("ts", required=True),
+}, append_only=True, default_order="computed_at desc", **_M7,
+   description="Explainable score history: the score, every factor and the evidence behind it.")
+
+entity("integration_deliveries", "idl", {
+    "provider": _t(60, required=True, index=True),
+    "event": _t(100, required=True),
+    "target": _t(500),
+    "status": _choice("queued", "delivered", "failed", "skipped", "mocked"),
+    "attempts": Col("int", required=True, default=0, minimum=0),
+    "response_code": Col("int"),
+    "error": _t(2000),
+    "payload": _j(),
+}, **_M7, description="Outbound integration calls (Slack, webhooks, calendar) and their outcome.")
+
+# Agent D (workflows): CRM changes a workflow proposes. Applied only after review.
+entity("workflow_proposals", "wpr", {
+    "workflow_id": _t(40, required=True, index=True),
+    "run_id": _t(40, required=True, index=True),
+    "node": _t(80, required=True),
+    "action": _choice("update_company", "update_contact"),
+    "entity_type": _choice("companies", "contacts"),
+    "entity_id": _t(40, required=True),
+    "changes": _j(),
+    "reason": _t(1000),
+    "status": _choice("proposed", "approved", "rejected", "applied", "failed"),
+    "reviewed_by": Col("uuid"),
+    "reviewed_at": Col("ts"),
+    "error": _t(1000),
+}, unique=(("run_id", "node"),), **_M7,
+   description="CRM changes proposed by workflows (PROPOSE -> REVIEW -> APPLY).")
 
 
 def entities() -> Iterable[EntitySpec]:

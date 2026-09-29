@@ -357,7 +357,9 @@ class ImportService:
 
     # --- merge -------------------------------------------------------------------------
 
-    def merge(self, ctx: Ctx, batch_id: str) -> Dict[str, Any]:
+    def merge(self, ctx: Ctx, batch_id: str, *, conflict_review: bool = False) -> Dict[str, Any]:
+        """Start the merge task. With ``conflict_review`` a row whose values disagree with the
+        matched CRM record is left ``conflict`` for a person (see ``imports.internal``)."""
         ctx.require_write()
         batch = self.store.get(ctx, "import_batches", batch_id)
         if batch["status"] != "mapped" or not batch["mapping"]:
@@ -365,7 +367,10 @@ class ImportService:
         report = self.validate(ctx, batch_id)
         if report["compatible"] == 0:
             raise ConflictError("no file in this batch is compatible; nothing to merge")
-        task = self.platform.tasks.submit(ctx, "import_merge", {"batch_id": batch_id},
+        params: Dict[str, Any] = {"batch_id": batch_id}
+        if conflict_review:
+            params["conflict_review"] = True
+        task = self.platform.tasks.submit(ctx, "import_merge", params,
                                           idempotency_key=f"import_merge:{batch_id}:{batch['version']}",
                                           entity_type="import_batches", entity_id=batch_id)
         self.store.update(ctx, "import_batches", batch_id, {"status": "merging"})
@@ -482,8 +487,11 @@ def run_merge_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: A
     if not mapping:
         raise PermanentTaskError("the batch has no explicit mapping")
     checkpoint = reporter.checkpoint
+    conflict_review = bool(task["params"].get("conflict_review"))
     stats = {"rows": 0, "created": 0, "merged": 0, "duplicates": 0, "needs_review": 0, "rejected": 0,
              "contacts_created": 0, "contacts_matched": 0, **(batch["stats"] or {}), **checkpoint.get("stats", {})}
+    if conflict_review:
+        stats.setdefault("conflicts", 0)
     files = [f for f in service.files(ctx, batch_id) if f["status"] == "compatible"]
     start_file = int(checkpoint.get("file_index", 0))
     start_row = int(checkpoint.get("row", 0))
@@ -495,6 +503,8 @@ def run_merge_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: A
         data = _load(platform, f["storage_key"])
         prov = dict(source_kind="import", source_name=f["filename"], import_batch_id=batch_id,
                     import_file_id=f["id"])
+        # A per-file mapping (internal data) overrides the batch mapping for this file's columns.
+        file_mapping = {**mapping, **(f.get("mapping") or {})}
         for row_number, original in iter_rows(f["format"], data, sheet=f["sheet"],
                                               max_rows=service.max_rows_per_file):
             if file_index == start_file and row_number <= start_row:
@@ -510,7 +520,8 @@ def run_merge_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: A
             if store.first(ctx, "import_rows", {"file_id": f["id"], "row_number": row_number}) is not None:
                 continue  # already processed before a restart
             stats["rows"] += 1
-            company_values, contact_values, problems = service.normalize_row(target, mapping, original)
+            company_values, contact_values, problems = service.normalize_row(target, file_mapping, original)
+            conflicts: List[Dict[str, Any]] = []
             record = {"batch_id": batch_id, "file_id": f["id"], "row_number": row_number, "original": dict(original),
                       "normalized": {"company": company_values, "contact": contact_values}, "problems": problems}
             company_id = contact_id = None
@@ -533,6 +544,10 @@ def run_merge_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: A
                             status = "merged"
                         else:
                             stats["duplicates"] += 1
+                            if conflict_review:
+                                from cloud.intel.imports.internal import merge_conflicts
+
+                                conflicts += merge_conflicts(crm, ctx, "company", result["company"], company_values)
                 if target != "companies" and status != "pending":
                     if not (contact_values.get("full_name") or contact_values.get("first_name")):
                         raise ValidationError("the contact name is empty")
@@ -545,6 +560,10 @@ def run_merge_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: A
                         status = "merged"
                     else:
                         stats["contacts_matched"] += 1
+                        if conflict_review:
+                            from cloud.intel.imports.internal import merge_conflicts
+
+                            conflicts += merge_conflicts(crm, ctx, "contact", result["contact"], contact_values)
                 if status == "merged" and not company_id and not contact_id:
                     status = "duplicate"
             except ValidationError as error:
@@ -553,7 +572,12 @@ def run_merge_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: A
                 problems.append(str(error))
             if status == "merged":
                 stats["merged"] += 1
+            if conflicts and status in ("merged", "duplicate"):
+                status = "conflict"
+                stats["conflicts"] += 1
             record.update(status=status, company_id=company_id, contact_id=contact_id, problems=problems)
+            if conflicts:
+                record["conflicts"] = conflicts
             try:
                 store.insert(ctx, "import_rows", record)
             except ConflictError:
@@ -561,6 +585,14 @@ def run_merge_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: A
         store.update(ctx, "import_files", f["id"], {"status": "merged"})
         start_row = 0
 
-    store.update(ctx, "import_batches", batch_id, {"status": "merged", "stats": stats})
+    final: Dict[str, Any] = {"status": "merged", "stats": stats}
+    if conflict_review:
+        final["conflict_count"] = store.count(ctx, "import_rows", {"batch_id": batch_id, "status": "conflict"})
+    store.update(ctx, "import_batches", batch_id, final)
     audit(store, ctx, "imports.merged", entity_type="import_batches", entity_id=batch_id, changes=stats)
+    try:  # workflows on "import_completed"; best-effort, never fails the merge
+        platform.service("automation").emit(ctx, "import_completed", f"import:{batch_id}",
+                                            {"batch_id": batch_id, "stats": dict(stats)})
+    except Exception:  # noqa: BLE001
+        log.debug("import_completed emit skipped", exc_info=True)
     return {"batch_id": batch_id, **stats}

@@ -1,0 +1,46 @@
+/* Email Validation page (pages/EmailValidation.tsx). */
+.ev-drop {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 28px 16px;
+  border: 2px dashed var(--border-strong);
+  border-radius: 10px;
+  text-align: center;
+  cursor: pointer;
+  color: var(--text-muted);
+}
+.ev-drop p { margin: 0; }
+.ev-drop:focus-visible, .ev-drop--over { border-color: var(--accent); background: var(--accent-soft); }
+.ev-providers { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 16px; }
+.ev-providers--compact { margin: 8px 0 12px; }
+.ev-providers--compact .card { box-shadow: none; }
+.ev-provider__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.ev-provider__head h3 { margin: 0; }
+.ev-checks { list-style: none; padding: 0; margin: 0 0 8px; display: grid; gap: 4px; }
+.ev-checks li { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.ev-inline { display: flex; gap: 8px; flex-wrap: wrap; }
+.ev-inline select { flex: 1 1 220px; min-width: 0; }
+.ev-columns { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin: 8px 0 16px; }
+.ev-columns input { margin-right: 8px; }
+.ev-subhead { margin: 12px 0 6px; font-size: 13px; }
+th.ev-col--chosen, td.ev-col--chosen { background: var(--accent-soft); font-weight: 600; }
+.ev-paid, .ev-create { margin: 8px 0; align-items: flex-start; }
+.ev-age { max-width: 320px; }
+.ev-run__head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.ev-run__head h3 { margin: 0; }
+.ev-stats { grid-template-columns: repeat(auto-fill, minmax(130px, 1fr)); margin-top: 12px; }
+.ev-results__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; padding: 8px 12px 0; }
+.ev-results__head .tabs { overflow-x: auto; max-width: 100%; }
+.ev-filters { flex-wrap: wrap; }
+.ev-filters .input { flex: 1 1 150px; min-width: 0; }
+.ev-date { display: inline-flex; align-items: center; gap: 4px; }
+.ev-statuses { display: flex; flex-wrap: wrap; gap: 12px; margin: 8px 0; }
+.ev-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
+.ev-actions > div { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
+.ev-actions .button { align-self: flex-start; }
+@media (max-width: 640px) {
+  .ev-results__head { padding: 8px; }
+  .ev-date { flex: 1 1 100%; }
+}

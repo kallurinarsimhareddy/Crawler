@@ -150,7 +150,7 @@ class SchemaChecks(unittest.TestCase):
             store.close()
             self.assertEqual(report["missing_tables"], [])
             self.assertEqual(report["tables_verified"], len(expected_tables()))
-            self.assertEqual(report["tables_verified"], 2 + 47 + 9 + 1 + 3)   # tenancy + 0003 + 0004 + 0005 + 0006
+            self.assertEqual(report["tables_verified"], 2 + 47 + 9 + 1 + 3 + 14)   # tenancy + 0003 + 0004 + 0005 + 0006 + 0007
         finally:
             drop_database(url)
 

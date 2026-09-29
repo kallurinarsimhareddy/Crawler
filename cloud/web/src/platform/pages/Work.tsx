@@ -1,7 +1,7 @@
 // Dashboard, analytics, the opportunity pipeline and list detail.
 
 import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
 import { CreateForm } from "../ResourcePage";
@@ -177,6 +177,7 @@ export function ListDetail() {
   const list = useLoad((signal) => client.get<Row>(`/lists/${listId}`, undefined, signal), client.base + listId);
   const members = useLoad((signal) => client.list(`/lists/${listId}/members`, { limit: 200 }, signal), client.base + listId + "m");
   const action = useAction();
+  const navigate = useNavigate();
   if (list.error) return <div className="page"><ErrorBanner error={list.error} /></div>;
   if (!list.data) return <div className="page"><Loading /></div>;
   return (
@@ -185,7 +186,15 @@ export function ListDetail() {
       <PageHeader
         title={String(list.data.name)}
         subtitle={`${fmt(list.data.member_count)} ${String(list.data.entity_type).replace(/_/g, " ")}`}
-        actions={<button className="button button--ghost" disabled={action.busy} onClick={() => action.run(() => client.post("/exports", { entity_type: "list", filters: { list_id: listId }, format: "xlsx" }))}>Export XLSX</button>}
+        actions={<>
+          {String(list.data.entity_type) === "contacts" && (
+            <button className="button button--ghost" disabled={action.busy} title="Check every contact's email address (nothing is sent)" onClick={() => action.run(async () => {
+              const job = await client.post<Row>("/email/jobs", { source: "list", list_id: listId, name: `List: ${String(list.data!.name)}` });
+              navigate(`/email-validation/${job.id}`);
+            })}>Validate emails</button>
+          )}
+          <button className="button button--ghost" disabled={action.busy} onClick={() => action.run(() => client.post("/exports", { entity_type: "list", filters: { list_id: listId }, format: "xlsx" }))}>Export XLSX</button>
+        </>}
       />
       {action.error && <ErrorBanner error={action.error} />}
       <KeyValues items={[["Description", fmt(list.data.description)], ["Source", fmt(list.data.source)]]} />
