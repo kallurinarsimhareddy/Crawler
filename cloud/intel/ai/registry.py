@@ -323,6 +323,13 @@ class AIRegistry:
             return "workspace"
         return "server" if all(os.environ.get(v) for v in PROVIDERS[name]["env"]) else None
 
+    def _verified(self, ctx: Ctx, name: str) -> bool:
+        """The workspace key for ``name`` passed a live provider check (Settings → Test connection)."""
+        try:
+            return bool(self.platform.service("providers").enabled(ctx.as_system(), name))
+        except Exception:  # noqa: BLE001 - no key store configured
+            return False
+
     def _named(self, name: str, model: Optional[str], ctx: Optional[Ctx] = None, *,
                free_only: bool = False) -> AIProvider:
         name = (name or "rules").lower()
@@ -357,10 +364,11 @@ class AIRegistry:
     def _provider(self) -> AIProvider:
         return self._named(self.configured, self.platform.config.ai_model)
 
-    def month_spend(self, ctx: Ctx) -> float:
+    def month_spend(self, ctx: Ctx, *, providers: Optional[frozenset] = None) -> float:
         start = datetime.now(timezone.utc).replace(day=1, hour=0, minute=0, second=0, microsecond=0)
         rows = self.platform.store.all(ctx.as_system(), "ai_usage", {"created_at__gte": start}, cap=100_000)
-        return round(sum(float(r["estimated_cost_usd"] or 0) for r in rows), 6)
+        return round(sum(float(r["estimated_cost_usd"] or 0) for r in rows
+                         if providers is None or r["provider"] in providers), 6)
 
     def for_ctx(self, ctx: Ctx, purpose: str, *, run_id: Optional[str] = None) -> AIProvider:
         config = self.workspace_config(ctx)
@@ -385,7 +393,9 @@ class AIRegistry:
             if paused is not None and action != "describe":
                 return RulesProvider(f"{FREE_QUOTA_EXHAUSTED} — using the rule-based planner until "
                                      f"{paused.strftime('%Y-%m-%d %H:%M UTC')}")
-            if action != "describe" and self.month_spend(ctx) > 0:
+            # Only a charge on the free-tier provider itself means the free tier is billing; a deliberate
+            # paid test of another provider (e.g. verifying a Claude key) must not switch Gemini off.
+            if action != "describe" and self.month_spend(ctx, providers=FREE_TIER_PROVIDERS) > 0:
                 return RulesProvider("free-only AI mode stopped: a paid AI charge was recorded this month")
             provider = self._resolve(name, model, ctx, free_only=True)
             if not provider.external:
@@ -403,6 +413,28 @@ class AIRegistry:
         if not provider.external:
             return provider
         return _Tracked(provider, self, ctx, action, run_id=run_id)
+
+    def test_provider(self, ctx: Ctx, name: str, model: Optional[str] = None) -> Dict[str, Any]:
+        """One tiny real request to ``name`` with the workspace's key, recorded in ``ai_usage``.
+
+        Independent of the workspace's chosen provider and of free-only mode (which counts only
+        free-tier spend), but still gated by the workspace's external-AI data policy.
+        """
+        if name not in PROVIDERS:
+            raise AIUnavailable(f"unknown AI provider {name!r}")
+        if not ctx.ai_external_allowed:
+            return {"ok": False, "provider": name, "reason": "external AI providers are not allowed for this workspace"}
+        provider = self._resolve(name, model, ctx)
+        if not provider.external:
+            return {"ok": False, "provider": name, "reason": getattr(provider, "reason", "not configured")}
+        tracked = _Tracked(provider, self, ctx, "provider_test")
+        try:
+            result = tracked.generate("Reply with the single word: ok", "ping", max_tokens=64)
+        except AIError as error:
+            return {"ok": False, "provider": name, "model": provider.model, "error": str(error)[:300]}
+        usage = result.usage.as_dict() if result.usage is not None else None
+        return {"ok": bool(result.text), "provider": name, "model": (usage or {}).get("model") or provider.model,
+                "reply": (result.text or "")[:40], "usage": usage}
 
     def status(self, ctx: Ctx) -> Dict[str, Any]:
         """What the workspace would get and why — safe to show in the UI (no key values)."""
@@ -430,7 +462,8 @@ class AIRegistry:
             "allowed_actions": config["allowed_actions"],
             "actions": AI_ACTIONS,
             "providers": {k: {"label": v["label"], "default_model": v["default_model"],
-                              "key_present": self.key_source(ctx, k) is not None} for k, v in PROVIDERS.items()},
+                              "key_present": self.key_source(ctx, k) is not None,
+                              "verified": self._verified(ctx, k)} for k, v in PROVIDERS.items()},
         }
 
     def describe(self, ctx: Ctx) -> Dict[str, Any]:

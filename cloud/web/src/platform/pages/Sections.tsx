@@ -18,6 +18,7 @@ import { Companies } from "./Companies";
 import { Contacts, Discovery, HiringIntel, Postings } from "./Intel";
 import { Credits, Research, Settings } from "./Tools";
 import { Analytics, BackgroundTasks, Dashboard } from "./Work";
+import { ZoomInfoSearch } from "./ZoomInfo";
 
 type Dash = Record<string, unknown>;
 
@@ -121,6 +122,7 @@ export function CompaniesSection() {
         { key: "lists", label: "Lists", render: () => <ResourcePage config={LISTS} query={{ entity_type: "companies" }} emptyTitle="No company lists yet" /> },
         { key: "segments", label: "Segments", render: () => <ResourcePage config={SEGMENTS} query={{ entity_type: "companies" }} emptyTitle="No company segments yet" /> },
         { key: "signals", label: "Signals", render: () => <HiringIntel /> },
+        { key: "zoominfo", label: "ZoomInfo", render: () => <ZoomInfoSearch /> },
         { key: "activities", label: "Activities", render: () => <ResourcePage config={ACTIVITIES} /> },
       ]}
     />
@@ -233,6 +235,7 @@ export function ProspectingSection() {
       tabs={[
         { key: "search", label: "Search", render: () => <CompanySearch /> },
         { key: "discover", label: "Discover", render: () => <Discovery /> },
+        { key: "zoominfo", label: "ZoomInfo", render: () => <ZoomInfoSearch /> },
         { key: "saved", label: "Saved Searches", render: () => <SavedSearches /> },
         { key: "lists", label: "Lists", render: () => <ResourcePage config={LISTS} /> },
       ]}

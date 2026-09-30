@@ -111,6 +111,25 @@ def verify_provider(provider: str, body: Dict[str, Any] = Body(default={}), ctx:
         raise _fail(error) from error
 
 
+@router.post("/providers/zoominfo/company-search")
+def zoominfo_company_search(body: Dict[str, Any] = Body(default={}), ctx: Ctx = Depends(write_ctx),
+                            platform: Platform = Depends(get_platform)):
+    """Credit-free ZoomInfo company search (CompanySearch attributes, e.g. companyName). Returns records only;
+    nothing is saved — send them to Discovery to review and import."""
+    registry = platform.service("providers")
+    if not registry.configured(ctx, "zoominfo"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "ZoomInfo is not connected for this workspace")
+    filters = body.get("filters") or {}
+    if not isinstance(filters, dict) or not any(v not in (None, "", []) for v in filters.values()):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "give at least one filter, e.g. companyName")
+    try:
+        connector = registry.enrichment(ctx, "zoominfo")
+        rows = connector.search_companies(filters, limit=max(1, min(int(body.get("limit") or 25), 100)))
+    except _HANDLED as error:
+        raise _fail(error) from error
+    return {"items": rows, "meta": connector.last_search, "credits_used": connector.credit_consuming_calls}
+
+
 # --- credits ----------------------------------------------------------------------------------
 
 

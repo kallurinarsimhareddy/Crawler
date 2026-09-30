@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
 import uuid
+from unittest import mock
 
 from cloud.intel.core.context import Ctx, ForbiddenError
 from cloud.intel.providers.base import PaidCallRefused, ProviderNotConfigured
@@ -64,9 +66,100 @@ class RegistryTests(unittest.TestCase):
 
     def test_verify_seamless_spends_nothing_without_allow_paid(self) -> None:
         self.registry.set_credentials(self.ctx, "seamless", {"api_key": "seamless-key-abcdef"})
-        result = self.registry.verify(self.ctx, "seamless")
-        self.assertEqual(result["status"], "configured_unverified")
-        self.assertIn("costs 1", result["detail"])
+        session = FakeSession({"/contacts/research/poll": FakeResponse(200, {"data": []},
+                                                                       headers={"X-PublicAPI-Credits": "4321"})})
+        result = self.registry.verify(self.ctx, "seamless", session=session)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["credits_used"], 0)
+        self.assertEqual(result["credits_remaining"], 4321)
+        # only the free poll endpoint was called; never a search or research call
+        self.assertEqual([(m, u.rsplit("/v1", 1)[1]) for m, u, _ in session.calls], [("GET", "/contacts/research/poll")])
+        row = {c["provider"]: c for c in self.registry.list_connections(self.ctx)}["seamless"]
+        self.assertEqual((row["configured"], row["verified"], row["enabled"]), (True, True, True))
+        self.assertEqual(row["masked_credential"], "••••cdef")
+        self.assertEqual(row["last_result"]["credits_used"], 0)
+
+    def test_verify_seamless_marks_a_rejected_key_as_error(self) -> None:
+        self.registry.set_credentials(self.ctx, "seamless", {"api_key": "seamless-key-abcdef"})
+        session = FakeSession({"/contacts/research/poll": FakeResponse(401, {"error": "unauthorized"})})
+        result = self.registry.verify(self.ctx, "seamless", session=session)
+        self.assertEqual((result["status"], result["connection_status"]), ("error", "error"))
+        row = {c["provider"]: c for c in self.registry.list_connections(self.ctx)}["seamless"]
+        self.assertEqual((row["configured"], row["verified"], row["enabled"]), (True, False, False))
+        self.assertEqual(row["masked_credential"], "••••cdef")   # configuration kept, masked
+        self.assertNotIn("seamless-key-abcdef", json.dumps(row, default=str))
+
+    def test_unverified_credentials_are_configured_but_not_enabled(self) -> None:
+        self.registry.set_credentials(self.ctx, "emaillistverify", {"api_key": "elv-key-12345678"})
+        row = {c["provider"]: c for c in self.registry.list_connections(self.ctx)}["emaillistverify"]
+        self.assertEqual((row["configured"], row["verified"], row["enabled"]), (True, False, False))
+        self.assertTrue(self.registry.configured(self.ctx, "emaillistverify"))
+        self.assertFalse(self.registry.enabled(self.ctx, "emaillistverify"))
+
+    def test_verify_emaillistverify_reads_the_free_credit_balance(self) -> None:
+        self.registry.set_credentials(self.ctx, "emaillistverify", {"api_key": "elv-key-12345678"})
+        session = FakeSession({"/api/credits": FakeResponse(200, {"onDemand": {"available": 1500}, "subscription": None})})
+        result = self.registry.verify(self.ctx, "emaillistverify", session=session)
+        self.assertEqual((result["status"], result["credits"], result["credits_used"]), ("ok", 1500, 0))
+        self.assertTrue(all("verifyEmail" not in u for _, u, _ in session.calls))
+        self.assertTrue(self.registry.enabled(self.ctx, "emaillistverify"))
+        row = {c["provider"]: c for c in self.registry.list_connections(self.ctx)}["emaillistverify"]
+        self.assertNotIn("elv-key-12345678", json.dumps(row, default=str))
+
+    def test_verify_redacts_a_key_quoted_in_a_transport_error(self) -> None:
+        key = "elv-key-12345678"
+        self.registry.set_credentials(self.ctx, "emaillistverify", {"api_key": key})
+
+        def boom(method, url, kwargs):
+            raise ConnectionError(f"could not reach {url} with {kwargs['headers']}")
+
+        result = self.registry.verify(self.ctx, "emaillistverify", session=FakeSession({"/api/credits": boom}))
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn(key, result["detail"])
+        stored = self.platform.store.first(self.ctx, "provider_connections", {"provider": "emaillistverify"})
+        self.assertNotIn(key, stored["last_error"])
+        self.assertNotIn(key, json.dumps(stored["settings"], default=str))
+
+    def test_pasted_whitespace_is_trimmed_on_save_and_on_read(self) -> None:
+        self.registry.set_credentials(self.ctx, "claude", {"api_key": "  sk-ant-test-key-UQAA\r\n"})
+        self.assertEqual(self.registry.get_secrets(self.ctx, "claude")["api_key"], "sk-ant-test-key-UQAA")
+        # a row stored before trimming existed still reads back clean
+        row = self.registry.connection(self.ctx, "claude")
+        legacy = self.registry._fernet().encrypt(json.dumps({"api_key": "sk-ant-old-key-ABCD\n"}).encode()).decode()  # noqa: SLF001
+        self.platform.store.update(self.ctx, "provider_connections", row["id"], {"secret_ciphertext": legacy})
+        self.assertEqual(self.registry.get_secrets(self.ctx, "claude")["api_key"], "sk-ant-old-key-ABCD")
+
+    def test_verify_claude_uses_the_free_models_api(self) -> None:
+        self.registry.set_credentials(self.ctx, "claude", {"api_key": "sk-ant-test-key-UQAA"})
+
+        class Models:
+            calls = 0
+
+            def list(self, **kwargs):
+                Models.calls += 1
+                return type("Page", (), {"data": [type("M", (), {"id": "claude-haiku-4-5-20251001"})()]})()
+
+        client = type("Client", (), {"models": Models()})()
+        result = self.registry.verify(self.ctx, "claude", ai_client=client)
+        self.assertEqual((result["status"], result["cost_usd"], result["tokens"]), ("ok", 0, 0))
+        self.assertEqual(Models.calls, 1)
+        self.assertTrue(self.registry.enabled(self.ctx, "claude"))
+        row = {c["provider"]: c for c in self.registry.list_connections(self.ctx)}["claude"]
+        self.assertEqual(row["masked_credential"], "••••UQAA")
+
+    def test_verify_claude_marks_a_rejected_key_as_error(self) -> None:
+        self.registry.set_credentials(self.ctx, "claude", {"api_key": "sk-ant-test-key-UQAA"})
+
+        class Denied(Exception):
+            status_code = 401
+
+        class Models:
+            def list(self, **kwargs):
+                raise Denied("authentication_error")
+
+        result = self.registry.verify(self.ctx, "claude", ai_client=type("C", (), {"models": Models()})())
+        self.assertEqual(result["connection_status"], "error")
+        self.assertFalse(self.registry.enabled(self.ctx, "claude"))
 
     def test_ats_public_is_available_without_credentials(self) -> None:
         statuses = {c["provider"]: c["status"] for c in self.registry.list_connections(self.ctx)}
@@ -86,6 +179,7 @@ class ZoomInfoTests(unittest.TestCase):
                                session=session, sleep=sleeps.append)
         return zi, session, sleeps
 
+    @mock.patch.dict(os.environ, {"ZOOMINFO_CLIENT_ID": "", "ZOOMINFO_CLIENT_SECRET": ""})
     def test_unconfigured_reports_browser_mode_honestly(self) -> None:
         health = ZoomInfoConnector({}, session=FakeSession()).health()
         self.assertEqual(health["status"], "not_configured")
@@ -102,7 +196,15 @@ class ZoomInfoTests(unittest.TestCase):
         self.assertEqual(rows[0]["zoominfo_id"], "42")
         method, url, kwargs = session.calls[-1]
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer tok-1")
-        self.assertEqual(kwargs["json"]["data"]["type"], "CompanySearchRequest")
+        self.assertEqual(kwargs["json"]["data"]["type"], "CompanySearch")
+        self.assertEqual(kwargs["headers"]["Content-Type"], "application/vnd.api+json")
+        self.assertEqual(kwargs["headers"]["Accept"], "application/vnd.api+json")
+        self.assertTrue(kwargs["headers"]["User-Agent"].startswith("SANA-GTM/"))
+        _, token_url, token_kwargs = session.calls[0]
+        self.assertTrue(token_url.endswith("/oauth/v1/token"))
+        self.assertEqual(token_kwargs["data"], {"grant_type": "client_credentials", "client_id": "id",
+                                                "client_secret": "secret"})
+        self.assertIn("User-Agent", token_kwargs["headers"])
         self.assertEqual(zi.credit_consuming_calls, 0)
         self.assertEqual(zi.estimate_cost("search_companies", 100), 0.0)
 
@@ -129,6 +231,14 @@ class ZoomInfoTests(unittest.TestCase):
         with self.assertRaises(PaidCallRefused):
             zi.enrich_contacts([{"personId": "1"}])
         self.assertEqual(session.calls, [])
+
+    @mock.patch.dict(os.environ, {"ZOOMINFO_CLIENT_ID": "env-id", "ZOOMINFO_CLIENT_SECRET": "env-secret"})
+    def test_credentials_fall_back_to_environment(self) -> None:
+        session = FakeSession(_token_route())
+        zi = ZoomInfoConnector({}, session=session)
+        self.assertTrue(zi.configured)
+        zi.verify()
+        self.assertEqual(session.calls[0][2]["data"]["client_secret"], "env-secret")
 
     def test_verify_only_requests_a_token(self) -> None:
         zi, session, _ = self.connector({})

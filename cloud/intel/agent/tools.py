@@ -840,7 +840,13 @@ def _provider_estimate(provider: str):
     return estimate
 
 
-@tool("query_zoominfo", risk="paid", modes=("research", "prospecting"), estimator=_provider_estimate("zoominfo"),
+def _zoominfo_search_estimate(platform: Any, params: Dict[str, Any], counts: Dict[str, int]) -> Dict[str, Any]:
+    limit = int(params.get("limit") or 25)
+    return {"credits": {}, "affected": limit,
+            "explain": f"ZoomInfo company search is credit-free (at most {limit} records); only enrichment uses credits"}
+
+
+@tool("query_zoominfo", risk="paid", modes=("research", "prospecting"), estimator=_zoominfo_search_estimate,
       schema=_props(filters={"type": "object"}, limit=I))
 def query_zoominfo(call: ToolCall, params: Dict[str, Any]) -> Dict[str, Any]:
     """Search ZoomInfo through the workspace's authorized API connection (needs credentials and approval)."""

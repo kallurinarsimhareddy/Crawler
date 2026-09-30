@@ -82,6 +82,17 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(self.paid.calls, ["jane.doe@acme.com"])
         self.assertEqual(self.ledger.balance(self.ctx, "emaillistverify")["consumed"], 1)
 
+    def test_emaillistverify_is_used_only_once_verified(self) -> None:
+        service = EmailValidationService(self.platform, local=LocalValidator(resolver=resolver))
+        registry = self.platform.service("providers")
+        registry.set_credentials(self.ctx, "emaillistverify", {"api_key": "elv-key-12345678"})
+        self.assertIsNone(service._paid(self.ctx))  # noqa: SLF001 - stored but never checked
+        row = registry.connection(self.ctx, "emaillistverify")
+        self.platform.store.update(self.ctx, "provider_connections", row["id"], {"status": "verified"})
+        self.assertIsNotNone(service._paid(self.ctx))  # noqa: SLF001
+        self.platform.store.update(self.ctx, "provider_connections", row["id"], {"status": "error"})
+        self.assertIsNone(service._paid(self.ctx))  # noqa: SLF001
+
     def test_paid_needs_a_known_balance(self) -> None:
         from cloud.intel.providers.credits import CreditError
 
@@ -111,7 +122,9 @@ class ServiceTests(unittest.TestCase):
 class EmailListVerifyTests(unittest.TestCase):
     def provider(self, answer, status=200):
         session = FakeSession({"verifyEmail": FakeResponse(status, text=answer),
-                               "getCredit": FakeResponse(200, text="1234")})
+                               "/api/credits": FakeResponse(200, {"onDemand": {"available": 1000},
+                                                                  "subscription": {"available": 234,
+                                                                                   "expiresAt": "2026-12-01T00:00:00Z"}})})
         return EmailListVerifyProvider("elv-secret-key", session=session), session
 
     def test_result_code_mapping(self) -> None:
@@ -121,15 +134,31 @@ class EmailListVerifyTests(unittest.TestCase):
             result = provider.check("jane@acme.com")
             self.assertEqual(result.status, status, code)
             self.assertFalse(result.checks["mapping_verified"])
-            self.assertIn("secret=elv-secret-key", session.calls[0][1])
+            method, url, kwargs = session.calls[0]
+            self.assertTrue(url.startswith("https://api.emaillistverify.com/api/verifyEmail?"))
+            self.assertNotIn("elv-secret-key", url)   # the key travels in a header, never the URL
+            self.assertEqual(kwargs["headers"]["x-api-key"], "elv-secret-key")
 
     def test_errors_raise_and_health(self) -> None:
         provider, _ = self.provider("key_not_valid")
         with self.assertRaises(ProviderError):
             provider.check("jane@acme.com")
         self.assertEqual(provider.health()["status"], "configured_unverified")
-        self.assertEqual(provider.health(live=True)["credits"], 1234.0)
+        health = provider.health(live=True)
+        self.assertEqual((health["credits"], health["credits_on_demand"], health["credits_subscription"]),
+                         (1234, 1000, 234))
         self.assertEqual(EmailListVerifyProvider("").health()["status"], "not_configured")
+
+    def test_error_credit_raises_and_a_rejected_key_is_reported(self) -> None:
+        provider, _ = self.provider("error_credit")
+        with self.assertRaises(ProviderError):
+            provider.check("jane@acme.com")
+        denied = EmailListVerifyProvider("elv-secret-key", session=FakeSession(
+            {"/api/credits": FakeResponse(401, {"statusCode": 401, "message": "Invalid api key"})}))
+        self.assertEqual(denied.health(live=True)["status"], "error")
+        legacy_html = EmailListVerifyProvider("elv-secret-key", session=FakeSession(
+            {"/api/credits": FakeResponse(200, text="<!DOCTYPE html><html></html>")}))
+        self.assertEqual(legacy_html.health(live=True)["status"], "error")
 
 
 if __name__ == "__main__":

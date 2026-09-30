@@ -381,6 +381,18 @@ export function Credits() {
   );
 }
 
+/** The outcome of a provider's last live check, as stored by the server (never a secret). */
+function connectionResult(r: Row): string {
+  const last = (r.last_result ?? null) as Record<string, unknown> | null;
+  if (!last) return r.last_error ? String(r.last_error) : "—";
+  const parts = [String(last.detail ?? last.status ?? "")];
+  if (last.credits_used !== undefined) parts.push(`${fmt(last.credits_used)} credits used`);
+  if (last.credits !== undefined) parts.push(`balance ${fmt(last.credits)}`);
+  else if (last.credits_remaining !== undefined) parts.push(`balance ${fmt(last.credits_remaining)}`);
+  if (r.status === "error" && r.last_error) parts.push(String(r.last_error));
+  return parts.filter(Boolean).join(" · ");
+}
+
 export function Settings() {
   const client = useWs();
   const { current, reload } = useWorkspace();
@@ -389,8 +401,13 @@ export function Settings() {
   const ai = useLoad((signal) => client.get<Record<string, unknown>>("/ai/providers", undefined, signal).catch(() => null), client.base + "ai");
   const action = useAction();
   const [provider, setProvider] = useState("zoominfo");
-  const [secret, setSecret] = useState("");
+  const [fields, setFields] = useState<Record<string, string>>({});
   const providerRows = (Array.isArray(providers.data) ? providers.data : providers.data?.items ?? []) as Row[];
+  // One input per credential the provider needs (ZoomInfo: client_id + client_secret), from the server catalogue.
+  const requires = ((providerRows.find((p) => p.provider === provider)?.requires as string[] | undefined) ?? []).length
+    ? (providerRows.find((p) => p.provider === provider)?.requires as string[])
+    : ["api_key"];
+  const complete = requires.every((name) => (fields[name] ?? "").trim());
   return (
     <div className="page">
       <PageHeader title="Settings" subtitle={`Workspace ${current?.name ?? ""} · your role: ${current?.role ?? "—"}`} />
@@ -413,28 +430,36 @@ export function Settings() {
           rows={providerRows.map((p, i) => ({ ...p, id: String(p.id ?? i) }) as Row)}
           empty="No providers connected."
           columns={[
-            { key: "provider", label: "Provider" },
-            { key: "kind", label: "Kind" },
+            { key: "label", label: "Provider", render: (r) => String(r.label ?? r.provider) },
+            { key: "kind", label: "Category", render: (r) => String(r.kind ?? "").replace(/_/g, " ") },
             { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
-            { key: "access_method", label: "Access" },
-            { key: "secret_hint", label: "Secret", render: (r) => (r.secret_hint ? `••••${String(r.secret_hint)}` : "—") },
-            { key: "last_error", label: "Last error" },
+            { key: "flags", label: "State", render: (r) => <Tags values={[r.configured ? "Configured" : "", r.verified ? "Verified" : "", r.enabled ? "Enabled" : ""].filter(Boolean)} /> },
+            { key: "last_checked_at", label: "Last checked", render: (r) => fmtDate(r.last_checked_at) },
+            { key: "masked_credential", label: "Credential", className: "mono small", render: (r) => String(r.masked_credential ?? "—") },
+            { key: "last_result", label: "Connection result", render: (r) => connectionResult(r) },
+            { key: "test", label: "", render: (r) => (r.configured
+              ? <button className="button button--ghost button--small" disabled={action.busy} onClick={() => action.run(async () => { await client.post(`/providers/${String(r.provider)}/verify`); providers.refresh(); })}>Test connection</button>
+              : null) },
           ]}
         />
         <div className="field-row">
           <label className="field"><span className="field__label">Provider</span>
-            <select className="input" value={provider} onChange={(e) => setProvider(e.target.value)}>
+            <select className="input" value={provider} onChange={(e) => { setProvider(e.target.value); setFields({}); }}>
               {["zoominfo", "seamless", "emaillistverify", "claude", "gemini", "openai_compatible", "usajobs", "adzuna"].map((p) => <option key={p}>{p}</option>)}
             </select>
           </label>
-          <label className="field"><span className="field__label">API key / secret (JSON for multi-part credentials)</span><input className="input" type="password" autoComplete="off" value={secret} onChange={(e) => setSecret(e.target.value)} /></label>
+          {requires.map((name) => (
+            <label className="field" key={name}>
+              <span className="field__label">{name.replace(/_/g, " ")}</span>
+              <input className="input" type={/secret|key|token|password/.test(name) ? "password" : "text"} autoComplete="off" value={fields[name] ?? ""} onChange={(e) => setFields({ ...fields, [name]: e.target.value })} />
+            </label>
+          ))}
         </div>
         <div className="form__actions">
-          <button className="button button--primary" disabled={action.busy || !secret} onClick={() => action.run(async () => {
-            let secrets: Record<string, string>;
-            try { secrets = JSON.parse(secret); } catch { secrets = { api_key: secret }; }
+          <button className="button button--primary" disabled={action.busy || !complete} onClick={() => action.run(async () => {
+            const secrets = Object.fromEntries(requires.map((name) => [name, (fields[name] ?? "").trim()]));
             await client.post(`/providers/${provider}/credentials`, { secrets });
-            setSecret("");
+            setFields({});
             providers.refresh();
           })}>Save credentials</button>
           <button className="button button--ghost" disabled={action.busy} onClick={() => action.run(async () => { await client.post(`/providers/${provider}/verify`); providers.refresh(); })}>Verify</button>

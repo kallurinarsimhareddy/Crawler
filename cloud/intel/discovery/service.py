@@ -103,6 +103,23 @@ class JobPostingSource(CandidateSource):
         return out
 
 
+class ZoomInfoCompanySource(CandidateSource):
+    """Companies from the workspace's ZoomInfo connection (credit-free company search). Results enter the
+    discovery review queue like any other candidate; nothing is written to the CRM until approved."""
+
+    kind = "zoominfo"
+    name = "zoominfo"
+
+    def __init__(self, connector: Any, filters: Mapping[str, Any]) -> None:
+        self.connector, self.filters = connector, dict(filters or {})
+
+    def candidates(self, ctx: Ctx, limit: int = 500) -> List[Dict[str, Any]]:
+        return [{"name": r.get("name"), "website": r.get("website"), "city": r.get("city"), "state": r.get("state"),
+                 "country": r.get("country"), "source_ref": f"zoominfo:{r['zoominfo_id']}" if r.get("zoominfo_id")
+                 else None}
+                for r in self.connector.search_companies(self.filters, limit=limit) if r.get("name")]
+
+
 # --- scoring ------------------------------------------------------------------------
 
 
@@ -427,7 +444,8 @@ class DiscoveryService:
 
 
 def run_discovery_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: Any) -> Dict[str, Any]:
-    """Params: ``candidate_ids`` (verify these), or ``source`` in {"job_postings", "urls"} with ``urls``;
+    """Params: ``candidate_ids`` (verify these), or ``source`` in {"job_postings", "urls", "zoominfo"} with
+    ``urls`` / ``filters`` (ZoomInfo CompanySearch attributes, credit-free);
     with neither, verifies every open, unverified candidate."""
     service: DiscoveryService = platform.service("discovery")
     params = task.get("params") or {}
@@ -436,6 +454,12 @@ def run_discovery_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporte
         submitted = service.submit_from_source(ctx, JobPostingSource(platform.store), limit=int(params.get("limit", 500)))
     elif params.get("source") == "urls":
         submitted = service.submit_from_source(ctx, UrlListSource(params.get("urls") or []))
+    elif params.get("source") == "zoominfo":
+        registry = platform.service("providers")
+        if not registry.configured(ctx, "zoominfo"):
+            raise ValidationError("ZoomInfo is not connected for this workspace; add its credentials in Settings")
+        source = ZoomInfoCompanySource(registry.enrichment(ctx, "zoominfo"), params.get("filters") or {})
+        submitted = service.submit_from_source(ctx, source, limit=min(int(params.get("limit", 100)), 1000))
     ids = params.get("candidate_ids") or [c["id"] for c in submitted] or [
         c["id"] for c in platform.store.all(ctx, "discovery_candidates", {"status__in": list(_OPEN)}, cap=5000)
         if not (c.get("steps") or {}).get("verified")]

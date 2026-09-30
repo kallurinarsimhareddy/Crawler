@@ -637,6 +637,27 @@ class FreeOnlyMode(Base):
         self.assertFalse(chosen.external)
         self.assertIn("paid AI charge", chosen.reason)
 
+    def test_a_paid_test_of_another_provider_does_not_stop_free_only_gemini(self) -> None:
+        self.store.insert(self.ctx.as_system(), "ai_usage", {"provider": "claude", "model": "claude-haiku-4-5",
+                                                             "purpose": "provider_test", "success": True,
+                                                             "estimated_cost_usd": 0.0001})
+        self.assertTrue(self.registry.for_ctx(self.ctx, "extraction").external)
+
+    def test_a_named_provider_test_is_one_tracked_call_and_leaves_gemini_free_only(self) -> None:
+        result = self.registry.test_provider(self.ctx, "claude")
+        self.assertTrue(result["ok"])
+        self.assertEqual((result["provider"], result["usage"]["prompt_tokens"]), ("claude", 120))
+        rows = self.store.all(self.ctx, "ai_usage")
+        self.assertEqual([(r["provider"], r["purpose"]) for r in rows], [("claude", "provider_test")])
+        self.assertGreater(float(rows[0]["estimated_cost_usd"]), 0)
+        self.assertTrue(self.registry.for_ctx(self.ctx, "extraction").external, "Gemini free-only still runs")
+        self.assertEqual(self.registry.workspace_config(self.ctx)["provider"], "gemini")
+
+    def test_a_named_provider_test_respects_the_data_policy(self) -> None:
+        no_policy = Ctx(self.ctx.workspace_id, self.owner, "owner", ai_external_allowed=False)
+        self.assertFalse(self.registry.test_provider(no_policy, "claude")["ok"])
+        self.assertEqual(self.store.all(self.ctx, "ai_usage"), [])
+
     def test_free_only_is_gemini_only(self) -> None:
         self.configure(provider="claude")
         self.assertIn("supports gemini only", self.registry.for_ctx(self.ctx, "extraction").reason)

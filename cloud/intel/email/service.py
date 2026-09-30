@@ -49,7 +49,7 @@ class EmailValidationService:
         if self.paid_factory is not None:
             return self.paid_factory(ctx)
         registry = self.platform.service("providers")
-        if not registry.configured(ctx, "emaillistverify"):
+        if not registry.enabled(ctx, "emaillistverify"):  # stored AND verified by a live check
             return None
         return EmailListVerifyProvider(registry.get_secrets(ctx, "emaillistverify").get("api_key", ""))
 

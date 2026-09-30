@@ -174,9 +174,9 @@ def submit_candidates(request: Request, body: Dict[str, Any] = Body(...), ctx: C
 @router.post("/w/{workspace_id}/discovery/run", status_code=status.HTTP_201_CREATED, tags=["discovery"])
 def run_discovery(request: Request, body: Dict[str, Any] = Body(default={}), ctx: Ctx = Depends(write_ctx),
                   platform: Platform = Depends(get_platform)):
-    params = {k: body[k] for k in ("candidate_ids", "source", "urls", "limit") if k in body}
-    if params.get("source") not in (None, "job_postings", "urls"):
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "source must be job_postings or urls")
+    params = {k: body[k] for k in ("candidate_ids", "source", "urls", "filters", "limit") if k in body}
+    if params.get("source") not in (None, "job_postings", "urls", "zoominfo"):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "source must be job_postings, urls or zoominfo")
     try:
         return _task(platform, ctx, request, "discovery", params)
     except PlatformError as error:

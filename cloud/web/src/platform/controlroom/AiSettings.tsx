@@ -24,7 +24,7 @@ interface AiStatus {
   spent_this_month_usd: number;
   allowed_actions: string[];
   actions: Record<string, string>;
-  providers: Record<string, { label: string; default_model: string | null; key_present: boolean }>;
+  providers: Record<string, { label: string; default_model: string | null; key_present: boolean; verified?: boolean }>;
 }
 
 interface AiConfig {
@@ -210,7 +210,7 @@ export function AiProviderSettings() {
         <thead><tr><th>Provider</th><th>Key</th></tr></thead>
         <tbody>
           {realProviders.map((p) => (
-            <tr key={p}><td>{status.providers[p]?.label ?? p}</td><td>{status.providers[p]?.key_present ? <Pill value="configured" /> : <Pill value="not_configured" />}</td></tr>
+            <tr key={p}><td>{status.providers[p]?.label ?? p}</td><td>{status.providers[p]?.verified ? <Pill value="verified" /> : status.providers[p]?.key_present ? <Pill value="configured" /> : <Pill value="not_configured" />}</td></tr>
           ))}
         </tbody>
       </table>

@@ -50,7 +50,9 @@ def plan_enrichment(platform: Any, ctx: Ctx, needs: Mapping[str, Any]) -> Dict[s
     company_ids: Sequence[str] = list(needs.get("company_ids") or [])
     wanted: Sequence[str] = [n for n in (needs.get("needs") or NEEDS) if n in NEEDS]
     functions: Sequence[str] = list(needs.get("functions") or DEFAULT_FUNCTIONS)
-    connected = {p: registry.configured(ctx, p) for p in ("seamless", "zoominfo", "emaillistverify")}
+    connected = {p: registry.configured(ctx, p) for p in ("seamless", "zoominfo")}
+    # Paid email validation is offered only once a live check verified the key (as the email service does).
+    connected["emaillistverify"] = registry.enabled(ctx, "emaillistverify")
     fresh_after = utcnow() - timedelta(days=int(needs.get("max_age_days") or 30))
 
     steps: List[Dict[str, Any]] = []

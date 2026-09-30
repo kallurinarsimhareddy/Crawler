@@ -167,13 +167,17 @@ ELV_STATUS: Dict[str, tuple] = {
     "spamtrap": ("INVALID", 0.0),
     "role": ("ROLE", 40.0),
 }
-_ELV_ERRORS = ("key_not_valid", "missing_parameters", "insufficient_credits", "no_credits", "error")
+_ELV_ERRORS = ("key_not_valid", "missing_parameters", "insufficient_credits", "no_credits", "error", "error_credit")
 
 
 class EmailListVerifyProvider(EmailValidationProvider):
+    """The current EmailListVerify API (OpenAPI at https://api.emaillistverify.com/api-doc-json, read
+    2026-09-29): the key travels in the ``x-api-key`` header, never the URL. The legacy
+    ``apps.emaillistverify.com/api/getCredit?secret=`` endpoints now serve the web app's HTML."""
+
     name = "emaillistverify"
     paid = True
-    BASE = "https://apps.emaillistverify.com/api"
+    BASE = "https://api.emaillistverify.com/api"
 
     def __init__(self, api_key: str, *, session: Any = None, timeout: float = 30.0) -> None:
         self._key = api_key or ""
@@ -190,19 +194,31 @@ class EmailListVerifyProvider(EmailValidationProvider):
             return {"status": "not_configured", "detail": "an EmailListVerify API key is not connected"}
         if not live:
             return {"status": "configured_unverified", "detail": "key stored; not yet verified"}
-        response = self._session.get(f"{self.BASE}/getCredit?{urlencode({'secret': self._key})}", timeout=self.timeout)
-        text = (response.text or "").strip()
-        if response.status_code == 200 and text.replace(".", "", 1).isdigit():
-            return {"status": "ok", "detail": "credit balance read (free call)", "credits": float(text)}
-        return {"status": "error", "detail": f"unexpected reply (HTTP {response.status_code})"}
+        response = self._session.get(f"{self.BASE}/credits", headers=self._headers(), timeout=self.timeout)
+        if response.status_code in (401, 403):
+            return {"status": "error", "detail": f"EmailListVerify rejected the key (HTTP {response.status_code})"}
+        try:
+            payload = response.json() if response.status_code == 200 else None
+        except ValueError:
+            payload = None
+        if not isinstance(payload, dict) or not isinstance(payload.get("onDemand"), dict):
+            return {"status": "error", "detail": f"unexpected reply (HTTP {response.status_code})"}
+        on_demand = int(payload["onDemand"].get("available") or 0)
+        subscription = payload.get("subscription") if isinstance(payload.get("subscription"), dict) else {}
+        from_subscription = int(subscription.get("available") or 0)
+        return {"status": "ok", "detail": "credit balance read (free call)", "credits": on_demand + from_subscription,
+                "credits_on_demand": on_demand, "credits_subscription": from_subscription}
+
+    def _headers(self) -> Dict[str, str]:
+        return {"x-api-key": self._key, "Accept": "application/json"}
 
     def check(self, email: str) -> ValidationResult:
         if not self._key:
             raise ProviderNotConfigured("EmailListVerify is not connected for this workspace")
         started = time.monotonic()
         self.calls += 1
-        response = self._session.get(f"{self.BASE}/verifyEmail?{urlencode({'secret': self._key, 'email': email})}",
-                                     timeout=self.timeout)
+        response = self._session.get(f"{self.BASE}/verifyEmail?{urlencode({'email': email})}",
+                                     headers={**self._headers(), "Accept": "text/html"}, timeout=self.timeout)
         code = (response.text or "").strip().lower()
         if response.status_code != 200 or code in _ELV_ERRORS:
             raise ProviderError(f"EmailListVerify refused the request ({code or response.status_code})")

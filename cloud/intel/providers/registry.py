@@ -58,7 +58,7 @@ def _catalog() -> Dict[str, Dict[str, Any]]:
     catalog["emaillistverify"] = {
         "provider": "emaillistverify", "kind": "email_validation", "label": "EmailListVerify",
         "access_method": "api", "requires": ["api_key"], "paid": True,
-        "requirement": "an EmailListVerify API key (apps.emaillistverify.com) with purchased credits"}
+        "requirement": "an EmailListVerify API key (api.emaillistverify.com) with purchased credits"}
     # AI model providers: the key is stored encrypted per workspace and used server-side only;
     # without one, the server's environment variable (if any) is used.
     catalog["claude"] = {
@@ -122,14 +122,21 @@ class ProviderRegistry:
     @staticmethod
     def _public(row: Optional[Mapping[str, Any]], info: Mapping[str, Any]) -> Dict[str, Any]:
         out = {**info, "status": "not_configured", "secret_hint": None, "settings": {}, "last_checked_at": None,
-               "last_error": None, "connected": False}
+               "last_error": None, "connected": False, "masked_credential": None, "last_result": None}
         if row is not None:
-            out.update({"status": row["status"], "secret_hint": row["secret_hint"],
-                        "settings": {k: v for k, v in (row["settings"] or {}).items() if k != "verified"},
+            settings = {k: v for k, v in (row["settings"] or {}).items() if k not in ("verified", "last_check")}
+            hint = str(row["secret_hint"] or "").lstrip("…")
+            out.update({"status": row["status"], "secret_hint": row["secret_hint"], "settings": settings,
                         "last_checked_at": row["last_checked_at"], "last_error": row["last_error"],
-                        "connected": bool(row["secret_ciphertext"]), "label": row["label"] or info.get("label")})
+                        "connected": bool(row["secret_ciphertext"]), "label": row["label"] or info.get("label"),
+                        "masked_credential": f"••••{hint}" if row["secret_ciphertext"] and hint else None,
+                        "last_result": (row["settings"] or {}).get("last_check")})
         if not info.get("requires") and out["status"] == "not_configured":
             out["status"] = "available"
+        # Flags come only from the stored row: a credential is present, a live check passed, usable.
+        out["configured"] = out["connected"]
+        out["verified"] = out["connected"] and out["status"] == "verified"
+        out["enabled"] = out["verified"]
         return out
 
     def list_connections(self, ctx: Ctx, *, kind: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -141,7 +148,8 @@ class ProviderRegistry:
                         settings: Optional[Mapping[str, Any]] = None, label: Optional[str] = None) -> Dict[str, Any]:
         ctx.require_admin()
         info = self.describe(provider)
-        clean = {str(k): str(v) for k, v in (secrets or {}).items() if v not in (None, "")}
+        # Pasted keys often carry a trailing newline/space, which HTTP clients reject as a header value.
+        clean = {str(k): str(v).strip() for k, v in (secrets or {}).items() if str(v or "").strip()}
         missing = [name for name in info["requires"] if name not in clean]
         if missing:
             raise ValidationError(f"{info['label']} needs: {', '.join(missing)}")
@@ -197,7 +205,9 @@ class ProviderRegistry:
         from cryptography.fernet import InvalidToken
 
         try:
-            return json.loads(self._fernet().decrypt(row["secret_ciphertext"].encode()))
+            stored = json.loads(self._fernet().decrypt(row["secret_ciphertext"].encode()))
+            # Rows saved before values were trimmed on save.
+            return {k: v.strip() if isinstance(v, str) else v for k, v in stored.items()}
         except InvalidToken as error:
             raise SecretsUnavailable(f"{provider} credentials cannot be decrypted with the configured key") from error
 
@@ -234,10 +244,41 @@ class ProviderRegistry:
         row = self.connection(ctx, name)
         return bool(row and row["secret_ciphertext"] and row["status"] in ("configured", "verified"))
 
+    def enabled(self, ctx: Ctx, name: str) -> bool:
+        """Stored and verified by a live check — what a provider must be before it is offered as active."""
+        row = self.connection(ctx, name)
+        return bool(row and row["secret_ciphertext"] and row["status"] == "verified")
+
+    @staticmethod
+    def _verify_claude(api_key: str, client: Any = None) -> Dict[str, Any]:
+        """Authenticate an Anthropic key with the Models API: no tokens, no cost."""
+        if not api_key and client is None:
+            return {"status": "not_configured", "detail": "no key saved"}
+        if client is None:
+            import anthropic
+
+            client = anthropic.Anthropic(api_key=api_key, timeout=30.0, max_retries=1)
+        try:
+            page = client.models.list(limit=1)
+        except Exception as error:  # noqa: BLE001 - the SDK's typed errors, mapped to a result
+            code = getattr(error, "status_code", None)
+            if code in (401, 403):
+                return {"status": "error", "detail": f"Anthropic rejected the key (HTTP {code})", "cost_usd": 0}
+            # The SDK's "Connection error." hides why; name the underlying transport failure.
+            causes, cause = [], error.__cause__ or error.__context__
+            while cause is not None and len(causes) < 3:
+                causes.append(f"{type(cause).__name__}: {str(cause)[:160]}")
+                cause = cause.__cause__ or cause.__context__
+            return {"status": "error", "cost_usd": 0,
+                    "detail": f"{type(error).__name__}: {error}" + (f" <- {' <- '.join(causes)}" if causes else "")}
+        models = [getattr(m, "id", None) for m in getattr(page, "data", None) or []]
+        return {"status": "ok", "detail": "key authenticated by the Models API (no tokens used)", "cost_usd": 0,
+                "tokens": 0, "models_visible": [m for m in models if m][:1]}
+
     # --- verification --------------------------------------------------------------
 
     def verify(self, ctx: Ctx, provider: str, *, allow_paid: bool = False, session: Any = None,
-               fetcher: Any = None) -> Dict[str, Any]:
+               fetcher: Any = None, ai_client: Any = None) -> Dict[str, Any]:
         """Check a connection against the live provider, spending nothing unless allowed."""
         ctx.require_write()
         info = self.describe(provider)
@@ -255,8 +296,10 @@ class ProviderRegistry:
             elif provider == "emaillistverify":
                 from cloud.intel.email.providers import EmailListVerifyProvider
 
-                result = EmailListVerifyProvider(self.get_secrets(ctx, provider).get("api_key", ""),
-                                                 session=session).health(live=True)
+                result = {**EmailListVerifyProvider(self.get_secrets(ctx, provider).get("api_key", ""),
+                                                    session=session).health(live=True), "credits_used": 0}
+            elif provider == "claude":
+                result = self._verify_claude(self.get_secrets(ctx, provider).get("api_key", ""), ai_client)
             elif info["kind"] == "ai":
                 # Configuration only: an AI call costs tokens, so the live test is the separate,
                 # explicit "Test connection" action in AI settings (POST /agent/ai/test).
@@ -268,12 +311,27 @@ class ProviderRegistry:
                 result = {"status": "error", "detail": "no verification available"}
         except Exception as error:  # noqa: BLE001 - verification failures are results
             result = {"status": "error", "detail": f"{type(error).__name__}: {error}"[:500]}
+        # A transport error can quote the request URL (EmailListVerify puts the key in the query string).
+        try:
+            values = [v for v in self.get_secrets(ctx, provider).values() if len(v) >= 6]
+        except Exception:  # noqa: BLE001
+            values = []
+        for field in ("detail",):
+            text = str(result.get(field) or "")
+            for value in values:
+                text = text.replace(value, "••••")
+            if field in result:
+                result[field] = text
         status = {"ok": "verified", "not_configured": "not_configured", "configured_unverified": "configured",
                   "blocked": "error", "error": "error"}.get(result.get("status"), "error")
         row = self.connection(ctx, provider)
         if row is not None:
+            # The outcome (never a secret) is kept for the settings page's "connection result" column.
+            last_check = {k: result[k] for k in ("status", "detail", "credits_used", "credits_remaining", "credits",
+                                                 "cost_usd", "tokens") if result.get(k) is not None}
             self.store.update(ctx, "provider_connections", row["id"], {
                 "status": status, "last_checked_at": utcnow(),
+                "settings": {**(row["settings"] or {}), "last_check": last_check},
                 "last_error": None if status in ("verified", "configured") else str(result.get("detail"))[:2000]})
         audit(self.store, ctx, "provider.verify", entity_type="provider_connections",
               entity_id=row["id"] if row else None, summary=f"{provider}: {result.get('status')}")

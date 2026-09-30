@@ -355,6 +355,10 @@ def test_ai(body: Dict[str, Any] = Body(default={}), ctx: Ctx = Depends(write_ct
     if not ctx.can_admin:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "workspace admin rights required")
     registry = platform.service("ai")
+    if body.get("provider"):
+        # One tiny, tracked request to a named provider's saved key (e.g. to check Claude while the
+        # workspace itself stays on free-only Gemini). Never retried, never a research job.
+        return jsonable_encoder(registry.test_provider(ctx, str(body["provider"]), body.get("model")))
     ai = registry.for_ctx(ctx, "intent_interpretation")
     if not ai.external:
         return {"ok": False, "configured": False, "reason": getattr(ai, "reason", "AI provider not configured")}

@@ -112,14 +112,25 @@ class SeamlessConnector(EnrichmentProvider):
         return {"status": "configured_unverified", "detail": "key stored; not yet verified"}
 
     def verify(self, *, allow_paid: bool = False) -> Dict[str, Any]:
-        """Seamless has no free authenticated endpoint: verifying costs one search credit."""
+        """Check the key for free; ``allow_paid`` instead runs a 1-credit search."""
         if not self.configured:
             return self.health()
-        if not allow_paid:
-            return {"status": "configured_unverified",
-                    "detail": "verifying Seamless costs 1 search credit; re-run verify with allow_paid to confirm"}
-        self.search_companies({"companyDomain": ["seamless.ai"]}, limit=1, allow_paid=True)
-        return {"status": "ok", "detail": "a 1-credit search succeeded", "credits_remaining": self.credits_remaining}
+        if allow_paid:
+            self.search_companies({"companyDomain": ["seamless.ai"]}, limit=1, allow_paid=True)
+            return {"status": "ok", "detail": "a 1-credit search succeeded", "credits_used": 1,
+                    "credits_remaining": self.credits_remaining}
+        # Seamless has no account/status endpoint, but polling is free (measured, see
+        # seamless_credits.CREDITS_PER_POLL_CALL) and authenticated: a poll for a request id that does
+        # not exist is answered 401/403 for a bad key and 2xx/400/404 for a good one.
+        try:
+            self._request("GET", POLL_CONTACTS, params={"requestIds": "sanagtm-auth-check"}, allow_paid=False)
+        except SeamlessError as error:
+            if error.status in (401, 403):
+                return {"status": "error", "detail": str(error), "credits_used": 0}
+            if error.status not in (400, 404):
+                raise
+        return {"status": "ok", "detail": "key authenticated by a zero-credit poll", "credits_used": 0,
+                "credits_remaining": self.credits_remaining}
 
     def estimate_cost(self, operation: str, n: int) -> float:
         if operation in ("search_contacts", "search_companies"):
