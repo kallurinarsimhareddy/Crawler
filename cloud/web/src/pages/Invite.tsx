@@ -61,7 +61,9 @@ export function Invite() {
       .then((result) => {
         if (cancelled) return;
         setPreview(result);
-        if (result.status !== "pending") clearPendingInvite();
+        // Remember whom it is for, so only that account is sent back here after signing in.
+        if (result.status === "pending") savePendingInvite(token, result.email);
+        else clearPendingInvite();
       })
       .catch((error: Error) => {
         if (cancelled) return;
@@ -103,7 +105,7 @@ export function Invite() {
   }, [ready, matches, preview?.status]);
 
   const toLogin = (create: boolean) => {
-    if (token) savePendingInvite(token);
+    if (token) savePendingInvite(token, preview?.email ?? null);
     navigate("/login", { state: { from: "/invite", email: preview?.email, create } });
   };
 
@@ -178,6 +180,16 @@ export function Invite() {
               You're signed in as {session.email ?? "another account"}, but this invitation is for {preview.email}. Sign out, then sign in as {preview.email}.
             </p>
             <button type="button" className="button button--primary" onClick={() => void signOut()}>Sign out</button>
+            <button
+              type="button"
+              className="button button--ghost"
+              onClick={() => {
+                clearPendingInvite();
+                navigate("/", { replace: true });
+              }}
+            >
+              Not now
+            </button>
           </div>
         )}
         {preview.status === "pending" && matches && (

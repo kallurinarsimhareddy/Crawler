@@ -11,6 +11,7 @@ import {
   isInviteToken,
   memberLabel,
   pendingInvite,
+  pendingInviteFor,
   sameEmail,
   savePendingInvite,
   statusLabel,
@@ -104,15 +105,27 @@ test("the pending invitation survives sign-in and is removed once used", () => {
     removeItem: (k: string) => void data.delete(k),
   };
   assert.equal(pendingInvite(storage), null);
-  savePendingInvite("not a token", storage);
+  savePendingInvite("not a token", null, storage);
   assert.equal(pendingInvite(storage), null);
-  savePendingInvite(TOKEN, storage);
+  savePendingInvite(TOKEN, null, storage);
   assert.equal(pendingInvite(storage), TOKEN);
+  // before the invite page has looked the email up, nobody is redirected back to it
+  assert.equal(pendingInviteFor("nia@example.com", storage), null);
+  savePendingInvite(TOKEN, "Nia@Example.com", storage);
+  assert.equal(pendingInviteFor("nia@example.com", storage), TOKEN);
+  // another signed-in account (e.g. the admin testing the link) is never trapped on /invite
+  assert.equal(pendingInviteFor("owner@example.com", storage), null);
+  assert.equal(pendingInviteFor(null, storage), null);
   clearPendingInvite(storage);
   assert.equal(pendingInvite(storage), null);
+  data.set("sana.pending-invite", "{not json");
+  assert.equal(pendingInvite(storage), null);
+  data.set("sana.pending-invite", TOKEN); // the earlier plain-token format is ignored, not trusted
+  assert.equal(pendingInvite(storage), null);
   const broken = { getItem: () => { throw new Error("blocked"); }, setItem: () => { throw new Error("blocked"); }, removeItem: () => { throw new Error("blocked"); } };
-  assert.doesNotThrow(() => savePendingInvite(TOKEN, broken));
+  assert.doesNotThrow(() => savePendingInvite(TOKEN, "a@b.co", broken));
   assert.equal(pendingInvite(broken), null);
+  assert.equal(pendingInviteFor("a@b.co", broken), null);
   assert.doesNotThrow(() => clearPendingInvite(broken));
   assert.equal(pendingInvite(null), null);
 });

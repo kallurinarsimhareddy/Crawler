@@ -121,21 +121,43 @@ function browserStorage(): KeyValueStore | null {
   }
 }
 
-export function savePendingInvite(token: string, storage: KeyValueStore | null = browserStorage()): void {
+interface Pending {
+  token: string;
+  /** The invited address, once the invite page has looked it up. */
+  email: string | null;
+}
+
+function readPending(storage: KeyValueStore | null): Pending | null {
   try {
-    if (isInviteToken(token)) storage?.setItem(PENDING_KEY, token);
+    const raw = storage?.getItem(PENDING_KEY) ?? null;
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<Pending>;
+    return isInviteToken(value.token) ? { token: value.token as string, email: typeof value.email === "string" ? value.email : null } : null;
+  } catch {
+    return null;
+  }
+}
+
+export function savePendingInvite(token: string, email: string | null = null, storage: KeyValueStore | null = browserStorage()): void {
+  try {
+    if (isInviteToken(token)) storage?.setItem(PENDING_KEY, JSON.stringify({ token, email }));
   } catch {
     // blocked storage: the invitee just opens the link again after signing in
   }
 }
 
 export function pendingInvite(storage: KeyValueStore | null = browserStorage()): string | null {
-  try {
-    const value = storage?.getItem(PENDING_KEY) ?? null;
-    return isInviteToken(value) ? value : null;
-  } catch {
-    return null;
-  }
+  return readPending(storage)?.token ?? null;
+}
+
+/**
+ * The pending invitation to finish for this signed-in address, or null. Only the invited
+ * account is sent back to /invite, so someone signed in as another account (an admin
+ * testing their own link, say) is never trapped there.
+ */
+export function pendingInviteFor(email: string | null | undefined, storage: KeyValueStore | null = browserStorage()): string | null {
+  const pending = readPending(storage);
+  return pending && sameEmail(pending.email, email) ? pending.token : null;
 }
 
 export function clearPendingInvite(storage: KeyValueStore | null = browserStorage()): void {
