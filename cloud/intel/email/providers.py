@@ -107,6 +107,26 @@ class LocalValidator(EmailValidationProvider):
             raise ValueError("SMTP probing is disabled on this platform: it risks the worker IP's reputation. "
                              "Use a validation provider instead.")
 
+    def prime_domains(self, domains, *, max_workers: int = 16) -> None:
+        """Resolve many domains' mail records concurrently (same resolver and timeouts), so the
+        per-address :meth:`check` calls hit the cache instead of waiting on DNS one by one.
+        Transient failures are not cached, exactly as in :meth:`_mail_domain`."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        todo = sorted({d for d in domains if d and d not in self._mx_cache})
+        if not todo:
+            return
+        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, len(todo)))) as pool:
+            for domain, result in zip(todo, pool.map(self._safe_resolve, todo)):
+                if result is not None:
+                    self._mx_cache[domain] = result
+
+    def _safe_resolve(self, domain: str) -> Optional[bool]:
+        try:
+            return self._resolver(domain)
+        except Exception:  # noqa: BLE001 - treated like a transient DNS failure
+            return None
+
     def _mail_domain(self, domain: str) -> Optional[bool]:
         if domain not in self._mx_cache:
             result = self._resolver(domain)

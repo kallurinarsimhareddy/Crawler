@@ -64,6 +64,10 @@ PROGRESS_SECONDS = 3.0
 INLINE_INGEST_BYTES = 2 * 1024 * 1024
 #: Rows per bulk insert while reading a file into a job.
 INGEST_CHUNK = 1000
+#: Rows validated and saved together inside a batch: a restart loses at most this many.
+WRITE_CHUNK = 100
+#: Concurrent DNS lookups when a chunk brings new domains (same resolvers and timeouts).
+DNS_WORKERS = 16
 PREVIEW_ROWS = 8
 #: Evidence cache lifetimes (days), per check type.
 EVIDENCE_TTL_DAYS = {"dns": 1, "smtp": 7, "public": 14, "catch_all": 30, "mailbox": 30}
@@ -292,15 +296,37 @@ class _EvidenceRun:
         except Exception:  # noqa: BLE001
             log.debug("evidence cache write skipped")
 
-    def domain(self, domain: str) -> Dict[str, Any]:
-        cached = self._cached("dns", domain)
-        if cached is not None:
-            return cached
-        info = engine.inspect_domain(domain, self.dns)
+    def resolve_domains(self, domains: Iterable[str]) -> None:
+        """Inspect every domain not yet known this run concurrently (DNS_WORKERS at a time), so
+        the per-row :meth:`domain` calls hit memory instead of waiting on DNS one by one."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        todo = sorted({d for d in domains if d and self.memory.get(("dns", d)) is None})
+        if not todo:
+            return
+
+        def inspect(domain: str) -> Dict[str, Any]:
+            try:
+                return engine.inspect_domain(domain, self.dns)
+            except Exception:  # noqa: BLE001 - treated as a transient DNS failure
+                return {"domain": domain, "exists": None, "dns_error": "error", "mail": None, "mx": [],
+                        "spf": "unknown", "dmarc": "unknown", "verdict": "unknown"}
+
+        with ThreadPoolExecutor(max_workers=max(1, min(DNS_WORKERS, len(todo)))) as pool:
+            for domain, info in zip(todo, pool.map(inspect, todo)):
+                self._store_domain(domain, info)
+
+    def _store_domain(self, domain: str, info: Dict[str, Any]) -> Dict[str, Any]:
         if info.get("dns_error") in ("servfail", "timeout", "error"):
             self.memory[("dns", domain)] = info  # transient: reuse within this run only
             return info
         return self.remember("dns", domain, "domain", info)
+
+    def domain(self, domain: str) -> Dict[str, Any]:
+        cached = self._cached("dns", domain)
+        if cached is not None:
+            return cached
+        return self._store_domain(domain, engine.inspect_domain(domain, self.dns))
 
     def smtp_check(self, host: str) -> Optional[Dict[str, Any]]:
         if self.smtp is None:
@@ -962,7 +988,9 @@ class EmailValidationJobService:
                                     order="row_number", limit=BATCH).rows
             if not batch:
                 break
-            self._process(ctx, email_service, batch, column, settings, task_id=task.get("id"), evidence=evidence)
+            for start in range(0, len(batch), WRITE_CHUNK):  # saved every WRITE_CHUNK rows
+                self._process(ctx, email_service, batch[start:start + WRITE_CHUNK], column, settings,
+                              task_id=task.get("id"), evidence=evidence)
             if time.monotonic() - last_progress >= PROGRESS_SECONDS:  # counting a huge job every batch is waste
                 last_progress = time.monotonic()
                 counts = self.counts(ctx, job_id)
@@ -998,6 +1026,14 @@ class EmailValidationJobService:
             originals[item["id"]] = original
             emails[item["id"]] = engine.to_ascii_email(original)[0] if original else ""  # IDN -> punycode
         wanted = [e for e in emails.values() if e]
+        # All DNS for this chunk up front and concurrently: the evidence engine's domain records
+        # (one cache read, then parallel lookups for new domains) and the built-in MX check.
+        domains = sorted({_key(e).rpartition("@")[2] for e in wanted if "@" in _key(e)})
+        evidence.prime(domains)
+        evidence.resolve_domains(domains)
+        local = getattr(email_service, "local", None)
+        if hasattr(local, "prime_domains"):
+            local.prime_domains(domains, max_workers=DNS_WORKERS)
         results = {}
         if wanted:
             paid_statuses = tuple(settings.get("paid_statuses") or ("UNKNOWN",))
@@ -1010,7 +1046,6 @@ class EmailValidationJobService:
         if lookup:  # one query per batch rather than one per row
             for contact in self.store.all(ctx, "contacts", {"email__in": lookup}, cap=len(lookup) * 2):
                 known_contacts.setdefault(contact["email"], contact["id"])
-        evidence.prime(_key(e).rpartition("@")[2] for e in wanted if "@" in e)  # one cache read per batch
         now = utcnow()
         writes: List[Tuple[str, Dict[str, Any]]] = []
         for item in batch:

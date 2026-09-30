@@ -479,7 +479,7 @@ class BackgroundIngestTests(unittest.TestCase):
         task = self.platform.tasks.get(self.ctx, job["settings"]["ingest"]["task_id"])
         self.assertEqual(task["status"], "cancelled")
 
-    def test_results_are_written_back_in_one_bulk_update_per_batch(self) -> None:
+    def test_results_are_written_back_in_bulk_every_write_chunk(self) -> None:
         job = self.ingest(self.jobs.create_upload(self.ctx, "big.csv", self.csv(1200)))
         store = self.platform.store
         calls = {"update_many_items": 0, "update_items": 0}
@@ -498,9 +498,105 @@ class BackgroundIngestTests(unittest.TestCase):
         store.update_many, store.update = many, one
         job = self.jobs.start(self.ctx, job["id"])
         run_task_inline(self.platform, self.ctx.workspace_id, job["task_id"])
-        self.assertEqual(calls, {"update_many_items": 3, "update_items": 0})  # BATCH=500: 500 + 500 + 200
+        # One bulk write per WRITE_CHUNK (100) rows, never one per row: a restart loses at most 100.
+        self.assertEqual(calls, {"update_many_items": 12, "update_items": 0})
         self.assertEqual(self.jobs.get(self.ctx, job["id"])["counts"]["processed"], 1200)
 
+
+
+class ConcurrencyTests(unittest.TestCase):
+    def test_worker_presence_keeps_beating_during_a_long_task(self) -> None:
+        import threading
+        import time as _time
+
+        from cloud.intel.tasks.worker import PlatformWorker
+
+        beats = []
+
+        class Queue:
+            def heartbeat_worker(self, worker_id):
+                beats.append(_time.monotonic())
+
+            def forget_worker(self, worker_id):
+                pass
+
+        class FakePlatform:
+            queue = Queue()
+
+        worker = PlatformWorker(FakePlatform(), worker_id="w1", maintenance_seconds=0.05)
+        started, finished = [], threading.Event()
+
+        def long_task():
+            if not started:
+                started.append(_time.monotonic())
+                _time.sleep(0.6)  # a task far longer than the beat interval
+                finished.set()
+                return True
+            return False
+
+        worker.process_next = long_task
+        worker.maintain = lambda: None
+        with mock.patch.object(PlatformWorker, "presence_interval", lambda self: 0.05):
+            thread = threading.Thread(target=worker.run, daemon=True)
+            thread.start()
+            finished.wait(5)
+            worker.stop()
+            thread.join(5)
+        during = [b for b in beats if started[0] < b < started[0] + 0.6]
+        self.assertGreaterEqual(len(during), 5, "presence must be reported while a task is running")
+
+    def test_presence_interval_stays_inside_the_staleness_window(self) -> None:
+        from cloud.intel.tasks.worker import PlatformWorker
+        from cloud.shared.queue import DEFAULT_WORKER_STALE_AFTER
+
+        class FakePlatform:
+            queue = object()
+
+        interval = PlatformWorker(FakePlatform(), worker_id="w").presence_interval()
+        self.assertLessEqual(interval * 3, DEFAULT_WORKER_STALE_AFTER)
+
+    def test_domains_are_resolved_concurrently(self) -> None:
+        import threading
+        import time as _time
+
+        from cloud.intel.email.providers import LocalValidator
+
+        active, peak, lock = [0], [0], threading.Lock()
+
+        def slow_resolver(domain):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            _time.sleep(0.05)
+            with lock:
+                active[0] -= 1
+            return None if domain.startswith("flaky") else domain != "nomail.example"
+
+        validator = LocalValidator(resolver=slow_resolver)
+        started = _time.monotonic()
+        validator.prime_domains([f"d{i}.example" for i in range(32)] + ["nomail.example", "flaky.example"])
+        self.assertLess(_time.monotonic() - started, 0.6)  # 34 lookups x 50 ms sequentially would be 1.7 s
+        self.assertGreater(peak[0], 4)
+        self.assertEqual(validator._mx_cache["nomail.example"], False)  # noqa: SLF001
+        self.assertNotIn("flaky.example", validator._mx_cache)  # transient failures are not cached  # noqa: SLF001
+
+    def test_a_chunk_resolves_its_domains_before_validating(self) -> None:
+        platform, ctx, _ = make_platform()
+        jobs = platform.service("email_jobs")
+        calls = []
+
+        class RecordingDns:
+            def lookup(self, name, rtype):
+                calls.append(name)
+                return DnsAnswer([f"10 mx.{name}."] if rtype == "MX" else ["v=spf1 -all"])
+
+        jobs.dns_client = RecordingDns()
+        rows = [{"email": f"user{i}@domain{i % 7}.example"} for i in range(40)]
+        job = jobs.create_from_rows(ctx, name="t", rows=rows, email_field="email", start=True)
+        self.assertEqual(run_task_inline(platform, ctx.workspace_id, job["task_id"])["status"], "completed")
+        mx_lookups = [c for c in calls if not c.startswith("_dmarc.")]
+        self.assertEqual(len({c for c in mx_lookups}), 7)  # each of the 7 domains once, not once per row
+        self.assertEqual(jobs.get(ctx, job["id"])["counts"]["processed"], 40)
 
 if __name__ == "__main__":
     unittest.main()

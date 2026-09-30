@@ -241,6 +241,8 @@ class PlatformWorker:
         """Process tasks until stopped. ``concurrency`` > 1 runs that many tasks at once
         (e.g. several scraper runs), each on its own thread; maintenance stays on this one."""
         log.info("platform worker %s started (concurrency %s)", self.worker_id, concurrency)
+        presence = threading.Thread(target=self._presence_loop, name="platform-worker-presence", daemon=True)
+        presence.start()
         extra = [threading.Thread(target=self._loop, name=f"platform-worker-{n}", daemon=True)
                  for n in range(1, max(1, concurrency))]
         for thread in extra:
@@ -249,14 +251,34 @@ class PlatformWorker:
             now = time.monotonic()
             if now - self._last_maintenance >= self.maintenance_seconds:
                 self._last_maintenance = now
-                self.queue.heartbeat_worker(self.worker_id)
                 self.maintain()
             if not self.process_next():
                 self._stopping.wait(self.poll_seconds)
         for thread in extra:
             thread.join(timeout=self.lease_seconds)
+        presence.join(timeout=5)
         self.queue.forget_worker(self.worker_id)
         log.info("platform worker %s stopped", self.worker_id)
+
+    def presence_interval(self) -> float:
+        """How often the worker announces itself: well inside the staleness window, so a
+        monitor never mistakes a long-running task for a dead worker."""
+        from cloud.shared.queue import DEFAULT_WORKER_STALE_AFTER
+
+        return max(1.0, min(self.maintenance_seconds, DEFAULT_WORKER_STALE_AFTER / 3))
+
+    def _presence_loop(self) -> None:
+        """Worker presence on its own thread. Before this, the beat ran between tasks on
+        the main loop, so any task longer than the staleness window (90 s) made a healthy
+        worker look dead and the supervisor restarted it mid-task."""
+        interval = self.presence_interval()
+        while True:
+            try:
+                self.queue.heartbeat_worker(self.worker_id)
+            except Exception:  # noqa: BLE001 - a missed beat must never stop the worker
+                log.warning("worker presence heartbeat failed", exc_info=True)
+            if self._stopping.wait(interval):
+                return
 
     def _loop(self) -> None:
         while not self._stopping.is_set():
