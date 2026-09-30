@@ -5,15 +5,17 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import tempfile
 import unittest
 import uuid
+from datetime import timedelta
 from pathlib import Path
 
 from cryptography.fernet import Fernet
 
-from cloud.intel.core.context import ConflictError, Ctx, ValidationError
-from cloud.intel.email.jobs import detect_email_columns, extract_email, reason_for
+from cloud.intel.core.context import ConflictError, Ctx, ValidationError, utcnow
+from cloud.intel.email.jobs import detect_email_columns, extract_email, reason_for, result_source
 from cloud.intel.email.providers import EmailListVerifyProvider, EmailProviderError, LocalValidator, ValidationResult
 from cloud.intel.email.service import EmailValidationService
 from cloud.intel.platform import Platform, PlatformConfig
@@ -23,6 +25,23 @@ from cloud.tests._platform_intel_helpers import RecordingAutomation
 from cloud.tests.test_platform_sources_support import FakeResponse, FakeSession
 
 NO_MX = {"nomx.example"}
+
+
+class FakeDns:
+    """Offline DNS for the evidence layer, consistent with :func:`resolver`: every domain has an
+    MX, SPF and DMARC record except the ones in NO_MX, which exist but take no mail."""
+
+    def lookup(self, name, rtype):
+        from cloud.intel.email.engine import DnsAnswer
+
+        domain = name.removeprefix("_dmarc.")
+        if domain in NO_MX:
+            return DnsAnswer(error="no_answer")
+        if rtype == "MX":
+            return DnsAnswer([f"10 mx.{domain}."])
+        if rtype == "TXT":
+            return DnsAnswer(["v=DMARC1; p=none"] if name.startswith("_dmarc.") else ["v=spf1 -all"])
+        return DnsAnswer(["192.0.2.1"])
 
 
 def resolver(domain):
@@ -55,6 +74,7 @@ def make_platform():
     platform.override("automation", RecordingAutomation())
     email = EmailValidationService(platform, local=LocalValidator(resolver=resolver))
     platform.override("email", email)
+    platform.service("email_jobs").dns_client = FakeDns()  # the evidence layer never touches the network
     owner = str(uuid.uuid4())
     ws = store.create_workspace(owner, "Acme", f"acme-{uuid.uuid4().hex[:8]}")
     return platform, Ctx(ws["id"], owner, "owner"), email
@@ -301,6 +321,154 @@ class ProviderRetryTests(unittest.TestCase):
         self.assertEqual(EmailListVerifyProvider("k", session=session).check("a@x.example").status, "RISKY")
 
 
+#: EmailListVerify's answer per local part (the fake session matches the URL-encoded address).
+ELV_ANSWERS = {"ann": "ok", "bob": "email_disabled", "cara": "ok_for_all", "dan": "unknown", "eve": "ok",
+               "fay": "ok", "info": "role"}
+
+
+class VerifyUnknownsTests(unittest.TestCase):
+    """Built-in checks first; only unresolved UNKNOWNs go to EmailListVerify, after confirmation."""
+
+    def setUp(self) -> None:
+        self.platform, self.ctx, self.email = make_platform()
+        self.jobs = self.platform.service("email_jobs")
+        self.ledger = self.platform.service("credits")
+        registry = self.platform.service("providers")
+        registry.set_credentials(self.ctx, "emaillistverify", {"api_key": "elv-test-key"})
+        registry.verify(self.ctx, "emaillistverify", session=FakeSession(
+            {"/api/credits": FakeResponse(200, {"onDemand": {"available": 1000}, "subscription": None})}))
+        self.ledger.sync(self.ctx, "emaillistverify", 100, source="test")
+        self.session = FakeSession({f"email={local}%40": FakeResponse(200, text=code)
+                                    for local, code in ELV_ANSWERS.items()})
+        self.email.paid_factory = lambda ctx: EmailListVerifyProvider("elv-test-key", session=self.session,
+                                                                      sleep=lambda s: None)
+
+    def sent(self):
+        return [url.split("email=", 1)[1].split("%40", 1)[0] for _, url, _ in self.session.calls
+                if "verifyEmail" in url]
+
+    def built_in_job(self, locals_, extra=(), settings=None):
+        rows = [{"email": f"{name}@acme-test.example"} for name in locals_] + [{"email": e} for e in extra]
+        job = self.jobs.create_from_rows(self.ctx, name="t", rows=rows, email_field="email", source_type="manual")
+        job = self.jobs.start(self.ctx, job["id"], settings=settings)
+        self.assertEqual(run_task_inline(self.platform, self.ctx.workspace_id, job["task_id"])["status"], "completed")
+        return self.jobs.get(self.ctx, job["id"])
+
+    def verify(self, job):
+        estimate = self.jobs.unknowns_estimate(self.ctx, job["id"])
+        queued = self.jobs.verify_unknowns(self.ctx, job["id"], confirm=True, expected_credits=estimate["credits"])
+        self.assertEqual(run_task_inline(self.platform, self.ctx.workspace_id, queued["task_id"])["status"],
+                         "completed")
+        return estimate, {i["email"].split("@")[0]: i for i in
+                          self.jobs.items(self.ctx, job["id"], limit=500).rows}
+
+    def test_unknowns_are_resolved_by_emaillistverify(self) -> None:
+        job = self.built_in_job(["ann", "bob", "cara", "dan"], extra=["info@acme-test.example", "x@mailinator.com"])
+        self.assertEqual(self.sent(), [])  # the built-in run never spends
+        self.assertEqual((job["counts"]["UNKNOWN"], job["counts"]["unknown_builtin"]), (4, 4))
+        estimate, items = self.verify(job)
+        # Every NOT VERIFIED address the built-in checks answered is a candidate (the role inbox too);
+        # the disposable one is not: a verifier would only confirm it is throw-away.
+        self.assertEqual((estimate["unresolved"], estimate["to_check"], estimate["credits"]), (5, 5, 5.0))
+        self.assertEqual(estimate["skipped_disposable"], 1)
+        self.assertEqual(sorted(self.sent()), ["ann", "bob", "cara", "dan", "info"])
+        self.assertEqual({k: items[k]["status"] for k in ("ann", "bob", "cara", "dan", "info", "x")},
+                         {"ann": "VALID", "bob": "INVALID", "cara": "RISKY", "dan": "UNKNOWN", "info": "ROLE",
+                          "x": "DISPOSABLE"})
+        self.assertEqual(result_source(items["ann"]["provider"], items["ann"]["checks"]), "Built-in + EmailListVerify")
+        self.assertEqual(items["ann"]["checks"]["builtin_status"], "UNKNOWN")
+        self.assertEqual(result_source(items["x"]["provider"], items["x"]["checks"]), "Built-in")
+        # EmailListVerify's own "unknown" is final (inconclusive), not a built-in unknown.
+        self.assertEqual(items["dan"]["provider"], "emaillistverify")
+        self.assertIn("EmailListVerify could not confirm", reason_for("UNKNOWN", items["dan"]["checks"]))
+        self.assertEqual(self.ledger.balance(self.ctx, "emaillistverify")["consumed"], 5)
+        done = self.jobs.get(self.ctx, job["id"])
+        self.assertEqual((done["status"], done["settings"]["allow_paid"]), ("completed", False))
+        self.assertEqual((done["counts"]["provider_emaillistverify"], done["counts"]["unknown_builtin"]), (5, 0))
+        self.assertEqual((done["counts"]["final_valid"], done["counts"]["final_invalid"],
+                          done["counts"]["final_not_verified"]), (1, 1, 4))
+        # Recheck: nothing unresolved is left, so nothing is sent or charged again.
+        again = self.jobs.unknowns_estimate(self.ctx, job["id"])
+        self.assertEqual((again["unresolved"], again["credits"], again["can_verify"]), (0, 0, False))
+        with self.assertRaises(ValidationError):
+            self.jobs.verify_unknowns(self.ctx, job["id"], confirm=True, expected_credits=0)
+        self.assertEqual(len(self.sent()), 5)
+
+    def test_paid_run_needs_the_exact_confirmed_estimate(self) -> None:
+        job = self.built_in_job(["ann", "bob"])
+        for confirm, expected in ((False, 2), (True, None), (True, 1), (True, "3")):
+            with self.assertRaises(ConflictError):
+                self.jobs.verify_unknowns(self.ctx, job["id"], confirm=confirm, expected_credits=expected)
+        self.assertEqual(self.sent(), [])
+        self.assertEqual(self.jobs.get(self.ctx, job["id"])["status"], "completed")
+
+    def test_already_resolved_emails_are_not_sent_again(self) -> None:
+        first = self.built_in_job(["ann", "fay"])
+        self.verify(first)
+        self.assertEqual(sorted(self.sent()), ["ann", "fay"])
+        # A new job: ann's VALID comes from the cache, only eve is unresolved.
+        second = self.built_in_job(["ann", "eve"])
+        self.assertEqual(second["counts"]["VALID"], 1)
+        estimate, items = self.verify(second)
+        self.assertEqual((estimate["unresolved"], estimate["credits"]), (1, 1.0))
+        self.assertEqual(sorted(self.sent()), ["ann", "eve", "fay"])  # ann was not sent a second time
+        self.assertEqual(items["eve"]["status"], "VALID")
+
+    def test_estimate_counts_only_unresolved_and_reuses_fresh_answers(self) -> None:
+        stale = self.built_in_job(["fay", "dan", "dan"])  # dan twice: one address, one credit
+        before = self.jobs.unknowns_estimate(self.ctx, stale["id"])
+        self.assertEqual((before["unresolved"], before["to_check"], before["credits"]), (2, 2, 2.0))
+        self.verify(self.built_in_job(["fay"]))  # another job resolves fay
+        after = self.jobs.unknowns_estimate(self.ctx, stale["id"])
+        self.assertEqual((after["unresolved"], after["reused_from_cache"], after["to_check"], after["credits"]),
+                         (2, 1, 1, 1.0))
+        _, items = self.verify(stale)
+        self.assertEqual(items["fay"]["status"], "VALID")
+        self.assertEqual(self.sent().count("fay"), 1)
+
+    def test_blockers_unknown_balance_and_no_provider(self) -> None:
+        platform, ctx, _ = make_platform()
+        jobs = platform.service("email_jobs")
+        job = jobs.create_from_rows(ctx, name="t", rows=[{"email": "ann@acme-test.example"}], email_field="email")
+        job = jobs.start(ctx, job["id"])
+        run_task_inline(platform, ctx.workspace_id, job["task_id"])
+        self.assertIn("not configured", jobs.unknowns_estimate(ctx, job["id"])["blocker"])
+        registry = platform.service("providers")
+        registry.set_credentials(ctx, "emaillistverify", {"api_key": "elv-test-key"})
+        registry.verify(ctx, "emaillistverify", session=FakeSession(
+            {"/api/credits": FakeResponse(200, {"onDemand": {"available": 50}, "subscription": None})}))
+        self.assertIn("balance is unknown", jobs.unknowns_estimate(ctx, job["id"])["blocker"])
+        # "Test connection" is the same free call; it now records the balance it reads.
+        registry.verify = lambda c, name, **kw: {"status": "ok", "credits": 50}
+        jobs.test_provider(ctx)
+        estimate = jobs.unknowns_estimate(ctx, job["id"])
+        self.assertEqual((estimate["credits_known"], estimate["credits_remaining"], estimate["can_verify"]),
+                         (True, 50.0, True))
+
+    def test_strict_mode_keeps_valid_for_external_verification(self) -> None:
+        # A legacy cached VALID that EmailListVerify never produced.
+        self.platform.store.insert(self.ctx, "email_validations", {
+            "email": "legacy@acme-test.example", "status": "VALID", "score": 90.0, "checks": {}, "provider": "local",
+            "validated_at": utcnow(), "expires_at": utcnow() + timedelta(days=30)})
+        strict = self.built_in_job([], extra=["legacy@acme-test.example"])
+        self.assertEqual((strict["counts"]["VALID"], strict["counts"]["UNKNOWN"]), (0, 1))
+        item = self.jobs.items(self.ctx, strict["id"]).rows[0]
+        self.assertTrue(item["checks"]["strict_demoted"])
+        self.assertEqual(reason_for("UNKNOWN", item["checks"]), "Not externally verified (strict validation)")
+        loose = self.built_in_job([], extra=["legacy@acme-test.example"], settings={"strict_validation": False})
+        self.assertEqual(loose["counts"]["VALID"], 1)
+        self.assertTrue(self.jobs.set_strict(self.ctx, loose["id"], True)["settings"]["strict_validation"])
+        # Exports of VALID contain only VALID rows, with their source.
+        _, content, _ = self.jobs.export(self.ctx, strict["id"], "csv", ["VALID"])
+        self.assertEqual(len(list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))), 1)  # header only
+        self.verify(self.built_in_job(["ann", "cara", "dan"]))
+        latest = self.platform.store.list(self.ctx, "email_validation_jobs", {}, order="-created_at", limit=1).rows[0]
+        _, content, _ = self.jobs.export(self.ctx, latest["id"], "csv", ["VALID"], provider="emaillistverify")
+        rows = list(csv.DictReader(io.StringIO(content.decode("utf-8-sig"))))
+        self.assertEqual([(r["validation_email"], r["validation_status"], r["validation_source"]) for r in rows],
+                         [("ann@acme-test.example", "VALID", "Built-in + EmailListVerify")])
+
+
 class EmailJobApiTests(unittest.TestCase):
     def setUp(self) -> None:
         from fastapi.testclient import TestClient
@@ -317,6 +485,7 @@ class EmailJobApiTests(unittest.TestCase):
         self.platform = Platform(MemoryStore(), storage=LocalFileStorage(root / "platform"),
                                  config=PlatformConfig(files_dir=root / "platform"))
         self.platform.override("email", EmailValidationService(self.platform, local=LocalValidator(resolver=resolver)))
+        self.platform.service("email_jobs").dns_client = FakeDns()
         issuer = DevTokenIssuer("email-jobs-tests-secret-0123456789abcdef")
         app = create_app(Settings(auth_mode="dev", results_dir=root / "results"),
                          storage=LocalFileStorage(root / "results"), token_verifier=issuer,
@@ -392,6 +561,31 @@ class EmailJobApiTests(unittest.TestCase):
         r = self.client.post(self.base + "/email/jobs/upload", files={"files": ("leads.csv", SAMPLE, "text/csv")})
         self.assertEqual(r.status_code, 201, r.text)
         self.assertEqual(r.json()["email_column"], "Work Email")
+
+    def test_unknowns_estimate_verify_and_strict_routes(self) -> None:
+        r = self.client.post(self.base + "/email/jobs", json={
+            "source": "rows", "source_type": "manual", "email_field": "email", "name": "Pasted emails (1)",
+            "rows": [{"email": "ann.test@acme-test.example"}], "start": True})
+        job = r.json()
+        run_task_inline(self.platform, self.ws, job["task_id"])
+        estimate = self.client.get(f"{self.base}/email/jobs/{job['id']}/unknowns").json()
+        self.assertEqual((estimate["unresolved"], estimate["can_verify"]), (1, False))
+        self.assertIn("not configured", estimate["blocker"])
+        self.assertNotIn("api_key", json.dumps(estimate))
+        r = self.client.post(f"{self.base}/email/jobs/{job['id']}/verify-unknowns",
+                             json={"confirm": True, "expected_credits": 1})
+        self.assertEqual(r.status_code, 422, r.text)
+        r = self.client.post(f"{self.base}/email/jobs/{job['id']}/strict", json={"enabled": False})
+        self.assertEqual((r.status_code, r.json()["settings"]["strict_validation"]), (200, False))
+        r = self.client.get(f"{self.base}/email/jobs/{job['id']}/export",
+                            params={"format": "csv", "status_filter": "UNKNOWN", "provider_filter": "local"})
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("validation_source", r.text.splitlines()[0])
+        self.assertIn("Built-in", r.text.splitlines()[1])
+        r = self.client.get(f"{self.base}/email/jobs/{job['id']}/export", params={"provider_filter": "bogus"})
+        self.assertEqual(r.status_code, 422)
+        counts = self.client.get(f"{self.base}/email/jobs/{job['id']}").json()["counts"]
+        self.assertEqual((counts["provider_local"], counts["unknown_builtin"]), (1, 1))
 
     def test_bad_uploads_are_422(self) -> None:
         r = self.client.post(self.base + "/email/jobs/upload", files={"files": ("x.pdf", b"%PDF", "application/pdf")})

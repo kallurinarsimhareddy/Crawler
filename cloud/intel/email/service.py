@@ -4,7 +4,10 @@
 
 1. normalise; unparseable input is ``INVALID`` immediately;
 2. **cache** — an ``email_validations`` row newer than ``max_age_days`` is
-   returned as-is (``cached: True``); nothing is re-checked or re-paid;
+   returned as-is (``cached: True``); nothing is re-checked or re-paid. The one
+   exception: with ``allow_paid``, a cached *built-in* ``UNKNOWN`` (never answered
+   by EmailListVerify, see :func:`is_unresolved`) is checked again so the paid
+   provider can resolve it; an EmailListVerify answer is never paid for twice;
 3. **local** — :class:`~cloud.intel.email.providers.LocalValidator`; a decisive
    answer (INVALID, DISPOSABLE, ROLE, FREE_PROVIDER, no MX) is final and never
    goes to a paid provider;
@@ -30,7 +33,7 @@ from cloud.intel.core.normalize import normalize_email
 from cloud.intel.email.providers import FATAL_CODES, EmailListVerifyProvider, elv_enabled, LocalValidator, ValidationResult
 from cloud.intel.providers.base import PaidCallRefused, ProviderError
 
-__all__ = ["EmailValidationService", "run_validation_task"]
+__all__ = ["EmailValidationService", "is_unresolved", "run_validation_task"]
 
 log = logging.getLogger(__name__)
 
@@ -38,6 +41,13 @@ CACHE_DAYS = 30
 MAX_SYNC = 25
 #: Addresses per paid batch (one ledger reservation each).
 PAID_BATCH = 50
+
+
+def is_unresolved(row: Optional[Dict[str, Any]], paid_statuses: Iterable[str] = ("UNKNOWN",)) -> bool:
+    """A result only the built-in checks produced, with a status a paid check may settle
+    (``paid_statuses``): EmailListVerify has not answered it (not asked, skipped, or the paid
+    call failed). An EmailListVerify answer, even an inconclusive one, is not sent again."""
+    return bool(row) and row.get("status") in tuple(paid_statuses) and row.get("provider") != "emaillistverify"
 
 
 class EmailValidationService:
@@ -65,7 +75,11 @@ class EmailValidationService:
         return row
 
     def validate(self, ctx: Ctx, emails: Iterable[str], *, allow_paid: bool = False, max_age_days: int = CACHE_DAYS,
-                 task_id: Optional[str] = None) -> List[Dict[str, Any]]:
+                 task_id: Optional[str] = None, paid_statuses: Iterable[str] = ("UNKNOWN",)) -> List[Dict[str, Any]]:
+        """``paid_statuses``: built-in results a paid check may settle. The default sends only
+        undecided (UNKNOWN) addresses; a confirmed "verify" run may add ROLE and FREE_PROVIDER.
+        DISPOSABLE and INVALID are never sent."""
+        paid_statuses = tuple(s for s in paid_statuses if s not in ("DISPOSABLE", "INVALID", "VALID"))
         ctx.require_write()
         results: List[Dict[str, Any]] = []
         undecided: List[ValidationResult] = []
@@ -76,14 +90,14 @@ class EmailValidationService:
                 continue
             seen.add(email)
             hit = self.cached(ctx, email, max_age_days=max_age_days) if normalize_email(email) else None
-            if hit is not None:
+            if hit is not None and not (allow_paid and is_unresolved(hit, paid_statuses)):
                 results.append(self._out(hit, cached=True))
                 continue
             local = self.local.check(email)
-            if local.decisive:
-                results.append(self._save(ctx, local))
-            else:
+            if not local.decisive or (allow_paid and local.status in paid_statuses):
                 undecided.append(local)
+            else:
+                results.append(self._save(ctx, local))
 
         if undecided:
             provider = self._paid(ctx) if allow_paid else None
@@ -127,7 +141,8 @@ class EmailValidationService:
                     try:
                         result = provider.check(local.email)
                         used += 1
-                        result.checks = {**local.checks, **result.checks}
+                        # Provenance: the built-in verdict this external answer replaces.
+                        result.checks = {**local.checks, **result.checks, "builtin_status": local.status}
                         ledger.record_usage(ctx, "emaillistverify", "verify_email", task_id=task_id, units=1,
                                             latency_ms=round((time.monotonic() - started) * 1000, 1))
                     except (ProviderError, PaidCallRefused) as error:

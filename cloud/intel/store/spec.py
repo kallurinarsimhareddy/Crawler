@@ -1319,6 +1319,25 @@ entity("workflow_proposals", "wpr", {
    description="CRM changes proposed by workflows (PROPOSE -> REVIEW -> APPLY).")
 
 
+# ---------------------------------------------------------------------------
+# Email evidence cache (migration 0008)
+# ---------------------------------------------------------------------------
+
+entity("email_check_cache", "ecc", {
+    "subject_hash": _t(64, required=True, index=True),
+    "subject_kind": _choice("email", "domain", "host"),
+    "check_type": _t(40, required=True, index=True),
+    "result": _j(),
+    "source": _t(60),
+    "provider": _t(60),
+    "provider_ref": _t(200),
+    "checked_at": Col("ts", required=True),
+    "expires_at": Col("ts", required=True, index=True),
+}, unique=(("subject_hash", "check_type"),), migration="0008",
+   description="Reusable email-validation evidence (DNS, SPF/DMARC, SMTP preflight, public evidence, "
+               "catch-all) keyed by a SHA-256 of the address, domain or host, with a per-check expiry.")
+
+
 def entities() -> Iterable[EntitySpec]:
     return ENTITIES.values()
 

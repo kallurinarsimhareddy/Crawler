@@ -1,8 +1,8 @@
-// Email Validation: paste addresses (or upload a CSV/XLSX, or validate a contact list),
-// run the built-in checks (plus EmailListVerify only when it is configured AND verified),
-// watch progress, filter results, export or copy them, and — only on request — add the
-// results to a list, a draft campaign or a sequence (pending approval). Pasted addresses
-// become an ordinary rows job, so every input goes through the same job pipeline.
+// Email Validation: paste addresses or contacts (or upload a CSV/XLSX, or validate a contact
+// list). Free layered checks run first; addresses that stay Not Verified can then be sent to
+// EmailListVerify after the user confirms the exact credit cost. Users see three statuses only
+// — Valid, Invalid, Not verified — and every signal behind them in a details drawer. Every
+// input becomes an ordinary job, so all of them go through the same pipeline.
 
 import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
@@ -11,28 +11,38 @@ import { Icon } from "../../shell/Icon";
 import type { PageOf, Row } from "../api";
 import { fileSize } from "../logic/format";
 import {
+  ACTION_GROUPS,
   COPY_GROUPS,
+  FINAL_LABELS,
   MAX_PASTED,
+  MAX_UPLOAD_ROWS,
   RESULT_TABS,
+  SUMMARY_LABELS,
   collectEmails,
+  copyTarget,
   emailsToText,
-  estimatedCredits,
   exportPath,
+  finalStatus,
   initialColumn,
   isActive,
   itemQuery,
+  parseContactRows,
   parsePastedEmails,
   pastedRows,
   progressPercent,
   providerState,
   reasonFor,
+  signalTone,
+  sourceLabel,
   tabCount,
   uploadProblem,
   type Candidate,
   type Counts,
+  type EvidenceSummary,
+  type FinalStatus,
   type ItemFilters,
 } from "../logic/emailValidation";
-import { DataTable, KeyValues, PageHeader, Pill, ResourceList, Score, Stat, Tabs, fmt, fmtDate, useAction, useLoad } from "../ui";
+import { DataTable, KeyValues, PageHeader, Pill, ResourceList, Stat, Tabs, fmt, fmtDate, useAction, useLoad } from "../ui";
 import { useWs } from "../workspace";
 import "../styles/emailValidation.css";
 
@@ -52,6 +62,8 @@ interface ProviderStatus {
   };
 }
 
+type ContactColumns = Partial<Record<"first_name" | "last_name" | "full_name" | "company" | "title" | "website", string>>;
+
 type Job = Row & {
   name: string;
   status: string;
@@ -63,10 +75,22 @@ type Job = Row & {
   filename?: string | null;
   source_type: string;
   counts: Counts;
-  settings: { candidates?: Candidate[]; problems?: string[]; allow_paid?: boolean; max_age_days?: number };
+  settings: {
+    candidates?: Candidate[];
+    problems?: string[];
+    allow_paid?: boolean;
+    max_age_days?: number;
+    last_recheck_at?: string;
+    contact_mode?: boolean;
+    contact_columns?: ContactColumns;
+    public_evidence?: boolean;
+    smtp_preflight?: boolean;
+  };
   task?: { status: string; progress?: Record<string, unknown>; error?: string | null } | null;
   error?: string | null;
 };
+
+type Item = Row & { final_status?: FinalStatus; summary?: EvidenceSummary; checks?: Record<string, unknown> };
 
 // --- provider panel ------------------------------------------------------------------
 
@@ -90,6 +114,8 @@ function ProviderPanel({ compact = false }: { compact?: boolean }) {
           {data.local.checks.map((c) => (
             <li key={c.key}><Icon name="check" size={14} /> <strong>{c.label}</strong> <span className="muted small">— {c.detail}</span></li>
           ))}
+          <li><Icon name="check" size={14} /> <strong>SPF / DMARC</strong> <span className="muted small">— the domain's email security records (supporting signals)</span></li>
+          <li><Icon name="check" size={14} /> <strong>Contact match</strong> <span className="muted small">— is it this person's address at this company, or a shared inbox?</span></li>
         </ul>
         <p className="muted small">{data.local.note}</p>
       </div>
@@ -104,7 +130,7 @@ function ProviderPanel({ compact = false }: { compact?: boolean }) {
           <KeyValues items={[
             ["Key", elv.secret_hint ? `…${elv.secret_hint}` : "stored"],
             ["Cost", `${elv.cost_per_check} credit per checked address`],
-            ["Credits left", elv.credits?.known ? fmt(elv.credits.remaining) : "unknown — sync the balance under Settings → Credits"],
+            ["Credits left", elv.credits?.known ? fmt(elv.credits.remaining) : "unknown — use Test connection (free) to read it"],
             ["Checks run", fmt(elv.usage?.calls ?? 0)],
             ["Last verified", fmt(elv.last_checked_at)],
           ]} />
@@ -112,7 +138,7 @@ function ProviderPanel({ compact = false }: { compact?: boolean }) {
           <p className="muted small">
             {elv.configured
               ? "A key is stored but has not been verified, so no paid checks run. Test the connection to verify it."
-              : `Not connected. Mailbox-level checks (the only way to mark an address VALID) need ${elv.requirement}. Built-in validation works without it.`}
+              : `Not connected. Mailbox-level checks (the only way to mark an address Valid) need ${elv.requirement}. Built-in validation works without it.`}
           </p>
         )}
         {elv.last_error && !state.active && <p className="error-text small">{elv.last_error}</p>}
@@ -154,66 +180,110 @@ async function copyText(text: string): Promise<void> {
   if (!ok) throw new Error("The browser blocked clipboard access.");
 }
 
+const PIPELINE_NOTE = "Free checks run first: format, domain and MX, SPF/DMARC, risk signals and (for contacts) name and company match. Addresses that stay Not Verified can then be checked by EmailListVerify — only after you confirm the exact credit cost.";
+
 const plural = (n: number, what = "email") => `${fmt(n)} ${what}${n === 1 ? "" : what.endsWith("s") ? "es" : "s"}`;
+
+// --- options shared by paste and upload ---------------------------------------------------
+
+interface EvidenceOptions {
+  public_evidence: boolean;
+  smtp_preflight: boolean;
+}
+
+function OptionsBox({ value, onChange, contact }: { value: EvidenceOptions; onChange: (v: EvidenceOptions) => void; contact: boolean }) {
+  return (
+    <fieldset className="ev-options">
+      <legend className="small muted">Optional, slower checks</legend>
+      <label className="check">
+        <input type="checkbox" checked={value.public_evidence} onChange={(e) => onChange({ ...value, public_evidence: e.target.checked })} />
+        <span>Look for public evidence <span className="muted small">— the exact address on the company's own website (team, leadership, contact pages; robots.txt respected). Supporting evidence only{contact ? "" : "; most useful for contacts"}.</span></span>
+      </label>
+      <label className="check">
+        <input type="checkbox" checked={value.smtp_preflight} onChange={(e) => onChange({ ...value, smtp_preflight: e.target.checked })} />
+        <span>Mail server check <span className="muted small">— connect and greet each mail server once (no mailbox probing, nothing sent). Often blocked by internet providers; then reported as unknown.</span></span>
+      </label>
+    </fieldset>
+  );
+}
 
 // --- landing: paste, upload, list validation, history ----------------------------------
 
 function PastePanel() {
   const client = useWs();
   const navigate = useNavigate();
-  const provider = useLoad((signal) => client.get<ProviderStatus>("/email/provider", undefined, signal), client.base + "/email/provider/paste");
+  const [mode, setMode] = useState<"emails" | "contacts">("emails");
   const [text, setText] = useState("");
-  const [allowPaid, setAllowPaid] = useState(false);
+  const [options, setOptions] = useState<EvidenceOptions>({ public_evidence: false, smtp_preflight: false });
   const action = useAction();
-  const parsed = useMemo(() => parsePastedEmails(text), [text]);
-  const elv = provider.data?.emaillistverify;
-  const paidActive = providerState(elv).active;
-  const paid = allowPaid && paidActive;
-  const toValidate = parsed.emails.length;
-  const credits = estimatedCredits(toValidate, elv?.cost_per_check, paid);
+  const emails = useMemo(() => (mode === "emails" ? parsePastedEmails(text) : null), [text, mode]);
+  const contacts = useMemo(() => (mode === "contacts" ? parseContactRows(text) : null), [text, mode]);
+  const toValidate = emails ? emails.emails.length : contacts?.rows.length ?? 0;
+  const rows: Record<string, string>[] = emails ? pastedRows(emails) : (contacts?.rows ?? []).map((r) => ({ ...r }));
+  const hasInput = emails ? emails.total > 0 : (contacts?.total ?? 0) > 0;
+  const malformed = emails ? emails.malformed : contacts?.malformed ?? [];
+  const overLimit = emails ? emails.overLimit : contacts?.overLimit ?? 0;
   return (
     <div className="card pad ev-paste">
-      <h3>Paste emails</h3>
-      <p className="muted small">One per line, or separated by commas, semicolons, spaces or tabs. Duplicates are removed and addresses are lower-cased before checking.</p>
+      <div className="ev-paste__head">
+        <h3>Paste {mode === "emails" ? "emails" : "contacts"}</h3>
+        <div className="ev-mode" role="radiogroup" aria-label="What to paste">
+          <label className={`ev-mode__option${mode === "emails" ? " ev-mode__option--on" : ""}`}>
+            <input type="radio" name="paste-mode" checked={mode === "emails"} onChange={() => setMode("emails")} /> Emails
+          </label>
+          <label className={`ev-mode__option${mode === "contacts" ? " ev-mode__option--on" : ""}`}>
+            <input type="radio" name="paste-mode" checked={mode === "contacts"} onChange={() => setMode("contacts")} /> Validate Contact Emails
+          </label>
+        </div>
+      </div>
+      <p className="muted small">
+        {mode === "emails"
+          ? "One per line, or separated by commas, semicolons, spaces or tabs. Duplicates are removed and addresses are lower-cased before checking."
+          : "One contact per line: First Name, Last Name, Company, Title, Email (copy rows straight from a spreadsheet, or comma-separated). A header row is optional. SANA GTM then tells a person's own address (john.smith@company.com) from a shared inbox (info@company.com)."}
+      </p>
       <textarea
         className="input ev-paste__text"
         rows={8}
         value={text}
         onChange={(e) => setText(e.target.value)}
-        placeholder="Paste email addresses here, one per line..."
-        aria-label="Email addresses to validate"
+        placeholder={mode === "emails" ? "Paste email addresses here, one per line..." : "First Name\tLast Name\tCompany\tTitle\tEmail"}
+        aria-label={mode === "emails" ? "Email addresses to validate" : "Contacts to validate"}
         spellCheck={false}
         autoComplete="off"
       />
-      {parsed.total > 0 && (
+      {hasInput && (
         <>
           <div className="stats stats--wrap ev-paste__stats" aria-live="polite">
-            <Stat label="Pasted" value={fmt(parsed.total)} />
-            <Stat label="Unique" value={fmt(parsed.unique)} />
-            <Stat label="Duplicates" value={fmt(parsed.duplicates)} hint="removed" />
-            <Stat label="Invalid format" value={fmt(parsed.malformed.length)} hint="not sent" />
+            {emails ? (
+              <>
+                <Stat label="Pasted" value={fmt(emails.total)} />
+                <Stat label="Unique" value={fmt(emails.unique)} />
+                <Stat label="Duplicates" value={fmt(emails.duplicates)} hint="removed" />
+              </>
+            ) : (
+              <>
+                <Stat label="Contacts" value={fmt(contacts!.total)} hint={contacts!.hasHeader ? "header row detected" : "no header row"} />
+                <Stat label="Duplicates" value={fmt(contacts!.duplicates)} hint="same email, removed" />
+                <Stat label="No email" value={fmt(contacts!.missingEmail)} hint="skipped" />
+              </>
+            )}
+            <Stat label="Invalid format" value={fmt(malformed.length)} hint="not sent" />
             <Stat label="To validate" value={fmt(toValidate)} />
-            <Stat label="Est. credits" value={fmt(credits)} hint={paid ? "at most; built-in checks decide many" : "built-in checks only"} />
+            <Stat label="Credits now" value="0" hint="free checks only" />
           </div>
-          {parsed.malformed.length > 0 && (
+          {malformed.length > 0 && (
             <p className="muted small ev-paste__bad">
-              Invalid format: <span className="mono">{parsed.malformed.slice(0, 8).join(", ")}</span>
-              {parsed.malformed.length > 8 && ` and ${fmt(parsed.malformed.length - 8)} more`}
+              Invalid format: <span className="mono">{malformed.slice(0, 8).join(", ")}</span>
+              {malformed.length > 8 && ` and ${fmt(malformed.length - 8)} more`}
             </p>
           )}
-          {parsed.overLimit > 0 && (
-            <p className="alert alert--warning">Only the first {fmt(MAX_PASTED)} addresses are validated; {plural(parsed.overLimit, "address")} left out. Upload a file or split the list.</p>
+          {overLimit > 0 && (
+            <p className="alert alert--warning">Only the first {fmt(MAX_PASTED)} are validated here; {fmt(overLimit)} left out. Upload a file for larger lists — it is split into batches automatically.</p>
           )}
         </>
       )}
-      <label className="check ev-paid">
-        <input type="checkbox" checked={paid} disabled={!paidActive} onChange={(e) => setAllowPaid(e.target.checked)} />
-        <span>
-          Use EmailListVerify for addresses the built-in checks cannot decide
-          {!paidActive && <span className="muted small"> — unavailable: the provider is not configured and verified</span>}
-          {paidActive && <span className="muted small"> — spends about {elv?.cost_per_check ?? 1} credit per undecided address</span>}
-        </span>
-      </label>
+      <OptionsBox value={options} onChange={setOptions} contact={mode === "contacts"} />
+      <p className="muted small">{PIPELINE_NOTE}</p>
       <div className="actions">
         <button type="button" className="button button--primary" disabled={toValidate === 0 || action.busy}
           onClick={() => action.run(async () => {
@@ -221,14 +291,14 @@ function PastePanel() {
               source: "rows",
               source_type: "manual",
               email_field: "email",
-              name: `Pasted emails (${fmt(toValidate)})`,
-              rows: pastedRows(parsed),
+              name: `${mode === "emails" ? "Pasted emails" : "Pasted contacts"} (${fmt(toValidate)})`,
+              rows,
               start: true,
-              settings: { allow_paid: paid, max_age_days: 30 },
+              settings: { allow_paid: false, max_age_days: 30, ...options },
             });
             navigate(`/email-validation/${job.id}`);
           })}>
-          {action.busy ? "Starting…" : "Validate Emails"}
+          {action.busy ? "Starting…" : mode === "emails" ? "Validate Emails" : "Validate Contact Emails"}
         </button>
         {text && <button type="button" className="button button--ghost" disabled={action.busy} onClick={() => setText("")}>Clear</button>}
       </div>
@@ -266,7 +336,7 @@ function Dropzone({ onFile, busy }: { onFile: (file: File) => void; busy: boolea
     >
       <Icon name="upload" size={24} />
       <p><strong>{busy ? "Uploading…" : "Drop a CSV or XLSX file here"}</strong></p>
-      <p className="muted small">or <span className="link">browse</span> · up to 25 MB and 50,000 rows</p>
+      <p className="muted small">or <span className="link">browse</span> · up to 100 MB and {fmt(MAX_UPLOAD_ROWS)} rows, processed in batches</p>
       <input ref={input} type="file" accept=".csv,.xlsx" hidden onChange={(e) => { take(e.target.files?.[0]); e.target.value = ""; }} />
       {problem && <p className="error-text small">{problem}</p>}
     </div>
@@ -302,18 +372,25 @@ function ListValidation() {
   );
 }
 
+/** Valid / Invalid / Not verified for a job row (older jobs have only internal counts). */
+function finalCounts(c: Counts): [number, number, number] {
+  if (c.final_valid !== undefined) return [c.final_valid ?? 0, c.final_invalid ?? 0, c.final_not_verified ?? 0];
+  const valid = c.VALID ?? 0, invalid = c.INVALID ?? 0;
+  return [valid, invalid, Math.max(0, (c.processed ?? 0) - valid - invalid)];
+}
+
 export function EmailValidation() {
   const client = useWs();
   const navigate = useNavigate();
   const upload = useAction();
   return (
     <div className="page">
-      <PageHeader title="Email Validation" subtitle="Check addresses before they reach a campaign: syntax, domain/MX, disposable, role and free-provider checks, plus EmailListVerify when it is connected and verified. Nothing is ever sent." />
+      <PageHeader title="Email Validation" subtitle="Check addresses before they reach a campaign. Every result is Valid, Invalid or Not verified; the evidence behind it (format, domain, MX, SPF/DMARC, risk, contact match, EmailListVerify) is one click away. Nothing is ever sent." />
       <PastePanel />
       <div className="grid-2">
         <div className="card pad">
           <h3>Upload a file</h3>
-          <p className="muted small">For large lists, or spreadsheets with more columns to keep in the export.</p>
+          <p className="muted small">For large lists, or spreadsheets with more columns to keep in the export. Columns such as First Name, Last Name, Company and Title turn on contact matching automatically.</p>
           <Dropzone busy={upload.busy} onFile={(file) => upload.run(async () => {
             const job = await client.upload<Job>("/email/jobs/upload", [file], { name: file.name });
             navigate(`/email-validation/${job.id}`);
@@ -334,10 +411,10 @@ export function EmailValidation() {
           { key: "source_type", label: "Source", render: (r) => <Pill value={r.source_type} /> },
           { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
           { key: "row_count", label: "Rows", className: "tabular" },
-          { key: "counts", label: "Valid / Invalid / Unknown", render: (r) => { const c = (r.counts ?? {}) as Counts; return <span className="tabular">{fmt(c.VALID ?? 0)} / {fmt(c.INVALID ?? 0)} / {fmt(c.UNKNOWN ?? 0)}</span>; } },
+          { key: "counts", label: "Valid / Invalid / Not verified", render: (r) => { const [v, i, n] = finalCounts((r.counts ?? {}) as Counts); return <span className="tabular">{fmt(v)} / {fmt(i)} / {fmt(n)}</span>; } },
           { key: "created_at", label: "Created", render: (r) => fmtDate(r.created_at) },
         ]}
-        empty={{ title: "No validation jobs yet", description: "Paste addresses, upload a CSV or XLSX file, or validate a contact list, to see results here.", icon: "mailcheck" }}
+        empty={{ title: "No validation jobs yet", description: "Paste addresses or contacts, upload a CSV or XLSX file, or validate a contact list, to see results here.", icon: "mailcheck" }}
       />
     </div>
   );
@@ -345,15 +422,16 @@ export function EmailValidation() {
 
 // --- a job ----------------------------------------------------------------------------
 
+const CONTACT_FIELD_LABELS: Record<string, string> = { first_name: "First name", last_name: "Last name", full_name: "Name", company: "Company", title: "Title", website: "Website" };
+
 function ColumnStep({ job, onChanged }: { job: Job; onChanged: () => void }) {
   const client = useWs();
   const [column, setColumn] = useState(() => initialColumn(job.email_column, job.settings.candidates, job.columns));
-  const [allowPaid, setAllowPaid] = useState(false);
   const [maxAge, setMaxAge] = useState(30);
-  const provider = useLoad((signal) => client.get<ProviderStatus>("/email/provider", undefined, signal), client.base + "/email/provider/step");
+  const [options, setOptions] = useState<EvidenceOptions>({ public_evidence: false, smtp_preflight: false });
   const action = useAction();
   const candidates = job.settings.candidates ?? [];
-  const paidActive = providerState(provider.data?.emaillistverify).active;
+  const contactColumns = Object.entries(job.settings.contact_columns ?? {});
   return (
     <>
       <div className="card pad">
@@ -374,6 +452,11 @@ function ColumnStep({ job, onChanged }: { job: Job; onChanged: () => void }) {
             );
           })}
         </div>
+        {contactColumns.length > 0 && (
+          <p className="alert alert--info">
+            Contact matching {job.settings.contact_mode ? "is on" : "has partial data"}: {contactColumns.map(([field, col]) => `${CONTACT_FIELD_LABELS[field] ?? field} = “${col}”`).join(" · ")}
+          </p>
+        )}
         <h4 className="ev-subhead">Preview</h4>
         <div className="table-wrap">
           <table className="table">
@@ -390,14 +473,8 @@ function ColumnStep({ job, onChanged }: { job: Job; onChanged: () => void }) {
       <div className="card pad">
         <h3>2 · Checks</h3>
         <ProviderPanel compact />
-        <label className="check ev-paid">
-          <input type="checkbox" checked={allowPaid && paidActive} disabled={!paidActive} onChange={(e) => setAllowPaid(e.target.checked)} />
-          <span>
-            Use EmailListVerify for addresses the built-in checks cannot decide
-            {!paidActive && <span className="muted small"> — unavailable: the provider is not configured and verified</span>}
-            {paidActive && <span className="muted small"> — spends about {provider.data?.emaillistverify.cost_per_check ?? 1} credit per undecided address</span>}
-          </span>
-        </label>
+        <p className="muted small">{PIPELINE_NOTE}</p>
+        <OptionsBox value={options} onChange={setOptions} contact={Boolean(job.settings.contact_mode)} />
         <label className="field ev-age">
           <span className="field__label">Reuse results checked in the last (days)</span>
           <input className="input input--small" type="number" min={0} max={365} value={maxAge} onChange={(e) => setMaxAge(Number(e.target.value) || 0)} />
@@ -407,7 +484,7 @@ function ColumnStep({ job, onChanged }: { job: Job; onChanged: () => void }) {
           <button type="button" className="button button--primary" disabled={!column || action.busy}
             onClick={() => action.run(async () => {
               if (column !== job.email_column) await client.post(`/email/jobs/${job.id}/column`, { column });
-              await client.post(`/email/jobs/${job.id}/start`, { settings: { allow_paid: allowPaid && paidActive, max_age_days: maxAge } });
+              await client.post(`/email/jobs/${job.id}/start`, { settings: { allow_paid: false, max_age_days: maxAge, ...options } });
               onChanged();
             })}>
             Validate {fmt(job.row_count)} row{job.row_count === 1 ? "" : "s"}
@@ -424,8 +501,11 @@ function RunPanel({ job, onChanged }: { job: Job; onChanged: () => void }) {
   const action = useAction();
   const c = job.counts;
   const pct = progressPercent(c);
+  const [valid, invalid, notVerified] = finalCounts(c);
   const act = (verb: string) => action.run(async () => { await client.post(`/email/jobs/${job.id}/${verb}`); onChanged(); });
   const fill = job.status === "completed" ? "completed" : job.status === "cancelled" || job.status === "failed" ? "cancelled" : "running";
+  const signals = [["Role / shared inbox", c.ROLE], ["Free provider", c.FREE_PROVIDER], ["Disposable", c.DISPOSABLE], ["Catch-all or risky", c.RISKY]]
+    .filter(([, n]) => (n as number) > 0) as [string, number][];
   return (
     <div className="card pad">
       <div className="ev-run__head">
@@ -448,16 +528,190 @@ function RunPanel({ job, onChanged }: { job: Job; onChanged: () => void }) {
       <div className="stats stats--wrap ev-stats">
         <Stat label="Total" value={fmt(c.total ?? job.row_count)} />
         <Stat label="Processed" value={fmt(c.processed ?? 0)} />
-        <Stat label="Valid" value={fmt(c.VALID ?? 0)} hint="mailbox verified" />
-        <Stat label="Invalid" value={fmt(c.INVALID ?? 0)} />
-        <Stat label="Risky" value={fmt(c.RISKY ?? 0)} />
-        <Stat label="Role" value={fmt(c.ROLE ?? 0)} />
-        <Stat label="Disposable" value={fmt(c.DISPOSABLE ?? 0)} />
-        <Stat label="Free provider" value={fmt(c.FREE_PROVIDER ?? 0)} />
-        <Stat label="Unknown" value={fmt(c.UNKNOWN ?? 0)} hint="mail server OK, mailbox unchecked" />
+        <Stat label="Valid" value={fmt(valid)} hint="mailbox verified" />
+        <Stat label="Invalid" value={fmt(invalid)} hint="confirmed undeliverable" />
+        <Stat label="Not verified" value={fmt(notVerified)} hint="mailbox not confirmed" />
       </div>
+      {signals.length > 0 && (
+        <p className="muted small ev-signals">Signals inside Not verified: {signals.map(([label, n]) => `${label} ${fmt(n)}`).join(" · ")}</p>
+      )}
       {job.error && <p className="error-text">{job.error}</p>}
       {action.error && <ErrorBanner error={action.error} />}
+    </div>
+  );
+}
+
+interface UnknownsEstimate {
+  unresolved: number;
+  reused_from_cache: number;
+  to_check: number;
+  skipped_catch_all: number;
+  skipped_disposable: number;
+  cost_per_check: number;
+  credits: number;
+  provider_active: boolean;
+  credits_known: boolean;
+  credits_remaining?: number | null;
+  can_verify: boolean;
+  blocker: string | null;
+}
+
+function VerifyUnknowns({ job, onChanged }: { job: Job; onChanged: () => void }) {
+  const client = useWs();
+  const estimate = useLoad((signal) => client.get<UnknownsEstimate>(`/email/jobs/${job.id}/unknowns`, undefined, signal),
+    `${client.base}/unknowns/${job.id}/${job.counts.final_not_verified ?? 0}/${job.counts.provider_emaillistverify ?? 0}/${job.status}`);
+  const action = useAction();
+  const [confirming, setConfirming] = useState(false);
+  const e = estimate.data;
+  const recheck = Boolean(job.settings.last_recheck_at);
+  const title = recheck ? "Recheck Unknowns" : "Verify Not Verified emails with EmailListVerify";
+  if (!e) return estimate.error ? <ErrorBanner error={estimate.error} onRetry={estimate.refresh} /> : null;
+  if (e.unresolved === 0) {
+    return (job.counts.final_not_verified ?? 0) > 0 ? (
+      <div className="card pad ev-verify">
+        <h3>{title}</h3>
+        <p className="muted small">Nothing left to send: the remaining Not verified addresses were already checked by EmailListVerify (inconclusive, e.g. catch-all), are disposable, or sit on a known catch-all domain. They are not sent again.</p>
+      </div>
+    ) : null;
+  }
+  const balanceUnknown = e.provider_active && !e.credits_known && e.credits > 0;
+  return (
+    <div className="card pad ev-verify">
+      <h3>{title}</h3>
+      <p className="muted small">Only Not verified addresses the free checks could not settle are sent. Valid and Invalid results, disposable addresses, known catch-all domains and addresses EmailListVerify already answered are never sent again. Nothing is emailed.</p>
+      <div className="stats stats--wrap ev-verify__stats">
+        <Stat label="Unknown candidates" value={fmt(e.unresolved)} />
+        <Stat label="Previously verified and reusable" value={fmt(e.reused_from_cache)} hint="free" />
+        <Stat label="New ELV checks" value={fmt(e.to_check)} />
+        <Stat label="Estimated credits" value={fmt(e.credits)} hint={`${fmt(e.cost_per_check)} per address`} />
+        <Stat label="Credits available" value={e.credits_known ? fmt(e.credits_remaining ?? 0) : "unknown"} />
+      </div>
+      {(e.skipped_catch_all > 0 || e.skipped_disposable > 0) && (
+        <p className="muted small">Not sent: {[e.skipped_catch_all ? `${fmt(e.skipped_catch_all)} on known catch-all domains` : "", e.skipped_disposable ? `${fmt(e.skipped_disposable)} disposable` : ""].filter(Boolean).join(" · ")}.</p>
+      )}
+      {e.blocker && <p className="alert alert--warning">{e.blocker}</p>}
+      <div className="actions">
+        {balanceUnknown && (
+          <button type="button" className="button button--ghost" disabled={action.busy}
+            onClick={() => action.run(async () => { await client.post("/email/provider/test"); estimate.refresh(); })}>
+            Refresh balance (free)
+          </button>
+        )}
+        {!confirming ? (
+          <button type="button" className="button button--primary" disabled={!e.can_verify || action.busy} onClick={() => setConfirming(true)}>
+            {recheck ? "Recheck Unknowns" : "Verify with EmailListVerify"}
+          </button>
+        ) : (
+          <div className="ev-confirm" role="alertdialog" aria-label="Confirm paid verification">
+            <p><strong>Spend {fmt(e.credits)} EmailListVerify credit{e.credits === 1 ? "" : "s"} to verify {plural(e.to_check)}?</strong></p>
+            <div className="actions">
+              <button type="button" className="button button--primary" disabled={action.busy}
+                onClick={() => action.run(async () => {
+                  try {
+                    await client.post(`/email/jobs/${job.id}/verify-unknowns`, { confirm: true, expected_credits: e.credits });
+                    onChanged();
+                  } finally {
+                    setConfirming(false);
+                    estimate.refresh();
+                  }
+                })}>
+                Confirm and verify
+              </button>
+              <button type="button" className="button button--ghost" disabled={action.busy} onClick={() => setConfirming(false)}>Cancel</button>
+            </div>
+          </div>
+        )}
+      </div>
+      {action.error && <ErrorBanner error={action.error} />}
+    </div>
+  );
+}
+
+// --- results ----------------------------------------------------------------------------
+
+function FinalPill({ item }: { item: Item }) {
+  if (item.status === "PENDING") return <Pill value="PENDING" />;
+  const status = item.final_status ?? finalStatus(item.status, item.provider);
+  return <Pill value={status === "NOT_VERIFIED" ? "NOT_VERIFIED" : status} />;
+}
+
+function contactHint(item: Item): string {
+  const s = item.summary;
+  if (!s) return "";
+  if (s.role === "YES") return "Role / shared inbox";
+  if (s.disposable === "YES") return "Disposable";
+  if (s.person_match === "YES") return "Person's own address";
+  if (s.free_provider === "YES") return "Free mailbox";
+  return "";
+}
+
+function contactName(item: Item, cols: ContactColumns): string {
+  const row = (item.row ?? {}) as Record<string, unknown>;
+  const get = (k: keyof ContactColumns) => (cols[k] ? String(row[cols[k] as string] ?? "").trim() : "");
+  return [get("first_name"), get("last_name")].filter(Boolean).join(" ") || get("full_name");
+}
+
+function DetailsDrawer({ item, job, onClose }: { item: Item; job: Job; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const checks = (item.checks ?? {}) as Record<string, unknown>;
+  const ev = (checks.evidence ?? {}) as Record<string, Record<string, unknown>>;
+  const fmtEv = ev.format ?? {};
+  const dom = ev.domain ?? {};
+  const smtp = ev.smtp ?? {};
+  const pub = ev.public ?? {};
+  const contact = ev.contact ?? {};
+  const summary = item.summary;
+  const name = contactName(item, job.settings.contact_columns ?? {});
+  return (
+    <div className="ev-drawer" role="dialog" aria-modal="true" aria-label={`Evidence for ${String(item.email ?? "")}`}>
+      <button type="button" className="ev-drawer__scrim" aria-label="Close details" onClick={onClose} />
+      <aside className="ev-drawer__panel">
+        <div className="ev-drawer__head">
+          <div>
+            <p className="mono ev-drawer__email">{String(item.email ?? "—")}</p>
+            {name && <p className="muted small">{name}</p>}
+          </div>
+          <button type="button" className="button button--ghost button--small" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+        <p><FinalPill item={item} /> <span className="small">{reasonFor(String(item.status), checks)}</span></p>
+        {summary && (
+          <dl className="ev-evidence">
+            {SUMMARY_LABELS.map(([key, label]) => (
+              <div key={key} className="ev-evidence__row">
+                <dt>{label}</dt>
+                <dd className={`ev-signal ev-signal--${signalTone(key, summary[key])}`}>{summary[key]}</dd>
+              </div>
+            ))}
+          </dl>
+        )}
+        <h4 className="ev-subhead">Details</h4>
+        <ul className="ev-details small">
+          {Array.isArray(fmtEv.issues) && fmtEv.issues.length > 0 && <li>Format: {(fmtEv.issues as string[]).join(", ")}</li>}
+          {fmtEv.did_you_mean ? <li>Possible typo — did you mean <span className="mono">{String(fmtEv.did_you_mean)}</span>?</li> : null}
+          {fmtEv.idn ? <li>Internationalized domain (checked as punycode)</li> : null}
+          {dom.dns_error ? <li>DNS: {String(dom.dns_error)}</li> : null}
+          {dom.null_mx ? <li>The domain publishes a null MX: it accepts no email</li> : null}
+          {dom.a_fallback ? <li>No MX record; mail goes to the domain's own address (A/AAAA fallback)</li> : null}
+          {dom.mx_hosts ? <li>{fmt(dom.mx_hosts)} mail server{Number(dom.mx_hosts) === 1 ? "" : "s"} (MX)</li> : null}
+          {dom.spf_all ? <li>SPF policy {String(dom.spf_all)}</li> : null}
+          {dom.dmarc_policy ? <li>DMARC policy p={String(dom.dmarc_policy)}</li> : null}
+          {smtp.smtp ? <li>Mail server check: {String(smtp.smtp)}{smtp.starttls ? " · STARTTLS offered" : ""}{smtp.detail ? ` · ${String(smtp.detail)}` : ""}</li> : null}
+          {contact.person_name_match ? <li>Person match: {String(contact.person_name_match)}{contact.name_pattern ? ` (${String(contact.name_pattern)})` : ""} · company match: {String(contact.company_match)} · contact confidence {String(contact.contact_evidence_confidence)} ({String(contact.contact_confidence_label)})</li> : null}
+          {pub.public_email_evidence === true && (
+            <li>Published at <a className="link" href={String(pub.source_url)} target="_blank" rel="noopener noreferrer">{String(pub.source_type)}</a> ({String(pub.evidence_confidence)} confidence{pub.checked_at ? `, ${fmtDate(pub.checked_at)}` : ""}). Publication supports the address but does not prove the mailbox exists.</li>
+          )}
+          {pub.public_email_evidence === false && <li>Not found on the company's public pages ({fmt(pub.pages_read)} read)</li>}
+          {pub.reason && pub.public_email_evidence == null ? <li>Public evidence: {String(pub.reason)}</li> : null}
+          {checks.result_code ? <li>EmailListVerify answer: <span className="mono">{String(checks.result_code)}</span></li> : null}
+          {checks.paid_error ? <li>Paid check failed: {String(checks.paid_error)}</li> : null}
+          {item.cached ? <li>Reused from a recent check (no new cost)</li> : null}
+        </ul>
+        {item.contact_id ? <p><Link className="link" to={`/contacts/${String(item.contact_id)}`}>Open the CRM contact</Link></p> : null}
+      </aside>
     </div>
   );
 }
@@ -468,19 +722,22 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
   const [draft, setDraft] = useState<ItemFilters>({});
   const [filters, setFilters] = useState<ItemFilters>({});
   const [offset, setOffset] = useState(0);
+  const [open, setOpen] = useState<Item | null>(null);
   const tab = RESULT_TABS.find((t) => t.key === tabKey) ?? RESULT_TABS[0];
   const pageSize = 50;
   const query = itemQuery(tab, filters, pageSize, offset);
-  const items = useLoad((signal) => client.list<Row>(`/email/jobs/${job.id}/items`, query, signal), JSON.stringify(query) + job.id + reloadKey);
+  const items = useLoad((signal) => client.list<Item>(`/email/jobs/${job.id}/items`, query, signal), JSON.stringify(query) + job.id + reloadKey);
   const download = useAction();
   const copy = useAction();
   const [copied, setCopied] = useState<string | null>(null);
   const [selected, setSelected] = useState<Map<string, string>>(() => new Map());
   useEffect(() => setOffset(0), [tabKey, JSON.stringify(filters)]);
-  const page = items.data as PageOf<Row> | null;
+  const page = items.data as PageOf<Item> | null;
   const emailOf = (r: Row) => String(r.email ?? (r.row as Record<string, unknown>)?.[job.email_column ?? "email"] ?? "").trim();
   const pageRows = (page?.items ?? []).filter((r) => emailOf(r));
   const allOnPage = pageRows.length > 0 && pageRows.every((r) => selected.has(String(r.id)));
+  const contactMode = Boolean(job.settings.contact_mode);
+  const cols = job.settings.contact_columns ?? {};
   const toggle = (r: Row) => setSelected((cur) => {
     const next = new Map(cur);
     if (next.has(String(r.id))) next.delete(String(r.id));
@@ -502,7 +759,34 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
     if (count) await copyText(text);
     setCopied(count ? `${label}: ${plural(count)} copied to the clipboard.` : `${label}: nothing to copy.`);
   });
-  const groupCount = (statuses: string[]) => statuses.reduce((sum, s) => sum + (job.counts[s] ?? 0), 0);
+  const select = { key: "select", label: "", className: "ev-select", render: (r: Item) => (emailOf(r) ? (
+    <input type="checkbox" checked={selected.has(String(r.id))} onChange={() => toggle(r)} aria-label={`Select ${emailOf(r)}`} />
+  ) : null) };
+  const details = { key: "details", label: "Details", render: (r: Item) => (r.status === "PENDING" ? "" : (
+    <button type="button" className="button button--ghost button--small" onClick={() => setOpen(r)}>Details</button>
+  )) };
+  const source = { key: "source", label: "Source", render: (r: Item) => (r.status === "PENDING" ? "" : r.summary?.source ?? sourceLabel(r.provider, r.checks)) };
+  const email = { key: "email", label: "Email", render: (r: Item) => <span className="mono small">{emailOf(r) || "—"}</span> };
+  const status = { key: "status", label: "Status", render: (r: Item) => <FinalPill item={r} /> };
+  const columns = contactMode ? [
+    select,
+    { key: "contact", label: "Contact", render: (r: Item) => contactName(r, cols) || <span className="muted">—</span> },
+    email,
+    { key: "company", label: "Company", render: (r: Item) => (cols.company ? fmt((r.row as Record<string, unknown>)?.[cols.company]) : "—") },
+    status,
+    { key: "person", label: "Person Match", render: (r: Item) => r.summary?.person_match ?? "" },
+    { key: "public", label: "Public Evidence", render: (r: Item) => r.summary?.public_evidence ?? "" },
+    { key: "mailbox", label: "Mailbox Verification", render: (r: Item) => r.summary?.mailbox_verification ?? "" },
+    source,
+    details,
+  ] : [
+    select,
+    email,
+    status,
+    { key: "person", label: "Person/Contact", render: (r: Item) => <span className="small">{contactHint(r)}</span> },
+    source,
+    details,
+  ];
   return (
     <div className="card">
       <div className="ev-results__head">
@@ -519,9 +803,9 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
       <div className="ev-copy" role="group" aria-label="Copy email addresses">
         {COPY_GROUPS.map((g) => (
           <button key={g.key} type="button" className={`button button--small ${g.key === "valid" ? "button--primary" : "button--ghost"}`}
-            disabled={copy.busy || groupCount(g.statuses) === 0}
-            onClick={() => copyOut(g.label.replace(/^Copy /, ""), () => collectEmails((q) => client.list<Row>(`/email/jobs/${job.id}/items`, q), g.statuses))}>
-            <Icon name="copy" size={14} /> {g.label} <span className="tabular">({fmt(groupCount(g.statuses))})</span>
+            disabled={copy.busy || (job.counts[g.countKey] ?? 0) === 0}
+            onClick={() => copyOut(g.label.replace(/^Copy /, ""), () => collectEmails((q) => client.list<Row>(`/email/jobs/${job.id}/items`, q), copyTarget(g)))}>
+            <Icon name="copy" size={14} /> {g.label} <span className="tabular">({fmt(job.counts[g.countKey] ?? 0)})</span>
           </button>
         ))}
         <button type="button" className="button button--ghost button--small" disabled={copy.busy || selected.size === 0}
@@ -534,11 +818,11 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
       {copy.error && <ErrorBanner error={copy.error} />}
       <form className="filterbar" onSubmit={(e) => { e.preventDefault(); setFilters(draft); }}>
         <div className="filterbar__row ev-filters">
-          <input className="input input--small" placeholder="Email contains…" value={draft.email ?? ""} onChange={(e) => setDraft({ ...draft, email: e.target.value })} aria-label="Email contains" />
+          <input className="input input--small" placeholder="Search email…" value={draft.email ?? ""} onChange={(e) => setDraft({ ...draft, email: e.target.value })} aria-label="Email contains" />
           <input className="input input--small" placeholder="Domain (exact)" value={draft.domain ?? ""} onChange={(e) => setDraft({ ...draft, domain: e.target.value })} aria-label="Domain" />
-          <select className="input input--small" value={draft.provider ?? ""} onChange={(e) => setDraft({ ...draft, provider: e.target.value })} aria-label="Provider">
-            <option value="">Any provider</option>
-            <option value="local">Built-in</option>
+          <select className="input input--small" value={draft.provider ?? ""} onChange={(e) => setDraft({ ...draft, provider: e.target.value })} aria-label="Checked by">
+            <option value="">Checked by: any</option>
+            <option value="local">Built-in only</option>
             <option value="emaillistverify">EmailListVerify</option>
           </select>
           <label className="small muted ev-date">From <input className="input input--small" type="date" value={draft.from ?? ""} onChange={(e) => setDraft({ ...draft, from: e.target.value })} /></label>
@@ -553,20 +837,8 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
         <>
           <DataTable
             rows={page.items}
-            columns={[
-              { key: "select", label: "", className: "ev-select", render: (r) => (emailOf(r) ? (
-                <input type="checkbox" checked={selected.has(String(r.id))} onChange={() => toggle(r)} aria-label={`Select ${emailOf(r)}`} />
-              ) : null) },
-              { key: "row_number", label: "#", className: "tabular" },
-              { key: "email", label: "Email", render: (r) => <span className="mono small">{fmt(r.email ?? (r.row as Record<string, unknown>)?.[job.email_column ?? "email"])}</span> },
-              { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
-              { key: "score", label: "Score", render: (r) => <Score value={r.score} /> },
-              { key: "reason", label: "Why", render: (r) => <span className="small">{reasonFor(String(r.status), r.checks as Record<string, unknown>)}</span> },
-              { key: "provider", label: "Checked by", render: (r) => (r.provider === "emaillistverify" ? "EmailListVerify" : r.provider === "local" ? "Built-in" : fmt(r.provider)) },
-              { key: "cached", label: "Cached", render: (r) => (r.cached ? "Yes" : "") },
-              { key: "contact_id", label: "CRM", render: (r) => (r.contact_id ? <Link className="link" to={`/contacts/${r.contact_id}`}>contact</Link> : <span className="muted small">not in CRM</span>) },
-            ]}
-            empty={{ title: "No rows here", description: tab.statuses.length ? "No results have this status yet." : "Results appear as rows are checked.", icon: "mailcheck" }}
+            columns={columns}
+            empty={{ title: "No rows here", description: tab.statuses.length ? `No results are ${FINAL_LABELS[(tab.key === "valid" ? "VALID" : tab.key === "invalid" ? "INVALID" : "NOT_VERIFIED") as FinalStatus].toLowerCase()} yet.` : "Results appear as rows are checked.", icon: "mailcheck" }}
           />
           <div className="pager">
             <span className="muted small tabular">{page.total === 0 ? "0 results" : `${page.offset + 1}–${page.offset + page.items.length} of ${page.total.toLocaleString()}`}</span>
@@ -578,15 +850,14 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
           </div>
         </>
       )}
+      {open && <DetailsDrawer item={open} job={job} onClose={() => setOpen(null)} />}
     </div>
   );
 }
 
-const ACTION_STATUSES = ["VALID", "UNKNOWN", "RISKY", "ROLE", "FREE_PROVIDER"];
-
 function GtmActions({ job }: { job: Job }) {
   const client = useWs();
-  const [statuses, setStatuses] = useState<string[]>(() => ((job.counts.VALID ?? 0) > 0 ? ["VALID"] : ["VALID", "UNKNOWN"]));
+  const [groups, setGroups] = useState<FinalStatus[]>(["VALID"]);
   const [createContacts, setCreateContacts] = useState(false);
   const [listName, setListName] = useState(`${job.name} — validated`);
   const [listId, setListId] = useState("");
@@ -596,20 +867,24 @@ function GtmActions({ job }: { job: Job }) {
   const lists = useLoad((signal) => client.list("/lists", { entity_type: "contacts", limit: 200, order: "name" }, signal), client.base + "/lists/c" + job.id);
   const sequences = useLoad((signal) => client.list("/sequences", { limit: 200 }, signal), client.base + "/sequences" + job.id);
   const action = useAction();
-  const toggle = (s: string) => setStatuses((cur) => (cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s]));
-  const selected = statuses.reduce((sum, s) => sum + (job.counts[s] ?? 0), 0);
+  const [valid, , notVerified] = finalCounts(job.counts);
+  const countOf = (g: FinalStatus) => (g === "VALID" ? valid : notVerified);
+  const statuses = ACTION_GROUPS.filter((g) => groups.includes(g.key)).flatMap((g) => g.statuses);
+  const toggle = (g: FinalStatus) => setGroups((cur) => (cur.includes(g) ? cur.filter((x) => x !== g) : [...cur, g]));
+  const selected = groups.reduce((sum, g) => sum + countOf(g), 0);
   const common = { statuses, create_missing_contacts: createContacts };
   const summary = (r: { added?: number; not_in_crm?: number; created_contacts?: number }) =>
     `${fmt(r.added ?? 0)} added · ${fmt(r.not_in_crm ?? 0)} not in the CRM${r.created_contacts ? ` · ${fmt(r.created_contacts)} contacts created` : ""}`;
   return (
     <div className="card pad">
       <h3>Use the results</h3>
-      <p className="muted small">These are explicit actions. Nothing is added to the CRM, enrolled or sent automatically; sequence enrollments wait for approval and campaigns start as drafts with sending off.</p>
+      <p className="muted small">These are explicit actions. Nothing is added to the CRM, enrolled or sent automatically; sequence enrollments wait for approval and campaigns start as drafts with sending off. Invalid addresses are never offered.</p>
       <div className="ev-statuses" role="group" aria-label="Results to use">
-        {ACTION_STATUSES.map((s) => (
-          <label key={s} className="check"><input type="checkbox" checked={statuses.includes(s)} onChange={() => toggle(s)} /> <Pill value={s} /> <span className="muted small tabular">{fmt(job.counts[s] ?? 0)}</span></label>
+        {ACTION_GROUPS.map((g) => (
+          <label key={g.key} className="check"><input type="checkbox" checked={groups.includes(g.key)} onChange={() => toggle(g.key)} /> <Pill value={g.key} /> <span className="muted small tabular">{fmt(countOf(g.key))}</span></label>
         ))}
       </div>
+      {groups.includes("NOT_VERIFIED") && <p className="alert alert--warning">Not verified addresses have no mailbox confirmation; sending to them risks bounces.</p>}
       <label className="check ev-create">
         <input type="checkbox" checked={createContacts} onChange={(e) => setCreateContacts(e.target.checked)} />
         <span>Create CRM contacts for rows that are not in the CRM yet <span className="muted small">(off by default)</span></span>
@@ -679,7 +954,7 @@ export function EmailValidationJob() {
       <Link to="/email-validation" className="back">← Email Validation</Link>
       <PageHeader
         title={job.name}
-        subtitle={<>{job.filename ? `${job.filename} · ` : ""}{job.size_bytes ? `${fileSize(job.size_bytes)} · ` : ""}{fmt(job.row_count)} rows · source {job.source_type.replace(/_/g, " ")}</>}
+        subtitle={<>{job.filename ? `${job.filename} · ` : ""}{job.size_bytes ? `${fileSize(job.size_bytes)} · ` : ""}{fmt(job.row_count)} rows · source {job.source_type.replace(/_/g, " ")}{job.settings.contact_mode ? " · contact matching" : ""}</>}
         actions={<>
           <Pill value={job.status} />
           {(setup || done) && <button type="button" className="button button--ghost button--small" disabled={remove.busy} onClick={() => remove.run(async () => { await client.del(`/email/jobs/${job.id}`); navigate("/email-validation"); })}>Delete</button>}
@@ -687,6 +962,7 @@ export function EmailValidationJob() {
       />
       {remove.error && <ErrorBanner error={remove.error} />}
       {setup ? <ColumnStep job={job} onChanged={changed} /> : <RunPanel job={job} onChanged={changed} />}
+      {job.status === "completed" && processed > 0 && <VerifyUnknowns job={job} onChanged={changed} />}
       {!setup && processed > 0 && <Results job={job} reloadKey={isActive(job.status) ? String(job.counts.processed) : String(tick)} />}
       {!setup && processed === 0 && !done && <EmptyState title="Waiting to start" description="The background worker picks the job up shortly. Results appear here as rows are checked." icon="clock" />}
       {done && processed > 0 && <GtmActions job={job} />}

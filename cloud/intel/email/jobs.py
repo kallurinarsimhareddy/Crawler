@@ -17,6 +17,13 @@ Nothing here adds anything to the CRM on its own. :meth:`add_to_list`,
 contacts for rows that are not in the CRM yet needs ``create_missing_contacts``.
 Local checks never answer VALID (there is no SMTP probing): a well-formed
 address on a domain that receives mail is UNKNOWN until a paid mailbox check.
+
+Resolving those UNKNOWNs is a separate, confirmed step on a completed job:
+:meth:`unknowns_estimate` counts exactly the addresses EmailListVerify would be asked
+about (built-in UNKNOWNs it has not answered, minus fresh EmailListVerify answers in
+the cache) and :meth:`verify_unknowns` sends only those, after the caller confirms
+that exact credit figure. Strict validation (on by default) keeps VALID meaning
+"verified by EmailListVerify".
 """
 
 from __future__ import annotations
@@ -25,23 +32,38 @@ import csv
 import io
 import logging
 import re
+import time
+from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from cloud.intel.core.audit import audit
 from cloud.intel.core.context import ConflictError, Ctx, ValidationError, utcnow
 from cloud.intel.core.normalize import normalize_email
+from cloud.intel.email import engine
 from cloud.intel.email.providers import elv_enabled
 
-__all__ = ["EmailValidationJobService", "detect_email_columns", "extract_email", "reason_for",
-           "run_validation_job_task", "STATUSES", "MAX_ROWS", "MAX_BYTES"]
+__all__ = ["EmailValidationJobService", "detect_email_columns", "extract_email", "reason_for", "result_source",
+           "run_validation_job_task", "STATUSES", "MAX_ROWS", "MAX_BYTES", "SOURCES"]
+
+#: Result provenance labels (see :func:`result_source`).
+SOURCES = ("Built-in", "EmailListVerify", "Built-in + EmailListVerify")
 
 log = logging.getLogger(__name__)
 
 STATUSES = ("VALID", "INVALID", "RISKY", "UNKNOWN", "DISPOSABLE", "ROLE", "FREE_PROVIDER")
-MAX_ROWS = 50_000
-MAX_BYTES = 25 * 1024 * 1024
-BATCH = 50
+#: Rows per job. Uploads are streamed into the job and processed in batches, so a
+#: large file never has to be split by hand.
+MAX_ROWS = 1_000_000
+MAX_BYTES = 100 * 1024 * 1024
+#: Rows validated per worker step; progress is written at most every PROGRESS_SECONDS.
+BATCH = 200
+PROGRESS_SECONDS = 3.0
 PREVIEW_ROWS = 8
+#: Evidence cache lifetimes (days), per check type.
+EVIDENCE_TTL_DAYS = {"dns": 1, "smtp": 7, "public": 14, "catch_all": 30, "mailbox": 30}
+#: Per-job caps on the slower, opt-in layers (distinct domains / mail hosts).
+PUBLIC_MAX_SITES = 300
+SMTP_MAX_HOSTS = 300
 LOCAL_CHECKS = (
     {"key": "syntax", "label": "Syntax", "detail": "RFC-style address format and placeholder addresses"},
     {"key": "mx", "label": "MX / domain", "detail": "The domain exists and accepts mail (MX, else A record)"},
@@ -130,10 +152,34 @@ def reason_for(status: str, checks: Mapping[str, Any]) -> str:
     if status == "UNKNOWN":
         if checks.get("dns") == "transient failure":
             return "DNS lookup failed temporarily; try again later"
-        if checks.get("paid_skipped"):
-            return f"Mail server exists; mailbox not verified ({checks['paid_skipped']})"
+        if checks.get("result_code"):
+            return f"EmailListVerify could not confirm the mailbox ({checks['result_code']})"
+        if checks.get("strict_demoted"):
+            return "Not externally verified (strict validation)"
         return "Mail server exists; mailbox not verified"
     return ""
+
+
+#: Evidence columns appended to exports (see engine.evidence_summary).
+_EXPORT_SIGNALS = ("technical", "domain", "mx", "spf", "dmarc", "smtp", "catch_all", "role", "disposable",
+                   "free_provider", "person_match", "public_evidence", "mailbox_verification")
+
+
+def _contact_mode(columns: Mapping[str, str]) -> bool:
+    """Contact mode: the input names the person (first/last or full name)."""
+    return bool(columns.get("first_name") or columns.get("last_name") or columns.get("full_name"))
+
+
+def result_source(provider: Optional[str], checks: Optional[Mapping[str, Any]]) -> str:
+    """Where a result came from: ``Built-in`` (local checks only), ``Built-in + EmailListVerify``
+    (the built-in checks ran and EmailListVerify gave the final answer) or ``EmailListVerify``
+    (an external answer with no built-in record, e.g. an older cached result)."""
+    checks = checks or {}
+    if provider != "emaillistverify":
+        return "Built-in"
+    if "builtin_status" in checks or "syntax" in checks or "mx" in checks:
+        return "Built-in + EmailListVerify"
+    return "EmailListVerify"
 
 
 def _name_from(row: Mapping[str, Any], email: str) -> str:
@@ -153,10 +199,101 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "campaign"
 
 
+class _EvidenceRun:
+    """Per-run evidence with two cache levels: in memory for the run, and the workspace's
+    ``email_check_cache`` (hashed subjects, per-check expiry) across runs. The slower
+    layers (SMTP preflight, public evidence) run only when the job asked for them, and
+    at most once per distinct host or site."""
+
+    def __init__(self, service: "EmailValidationJobService", ctx: Ctx, settings: Mapping[str, Any]) -> None:
+        self.store = service.store
+        self.ctx = ctx
+        self.dns = service.dns_client or engine.DnsPythonClient()
+        self.smtp = (engine.SmtpPreflight(connect=service.smtp_connect) if settings.get("smtp_preflight")
+                     else None)
+        self.finder = (engine.PublicEvidenceFinder(service.public_fetcher) if settings.get("public_evidence")
+                       else None)
+        self.memory: Dict[Tuple[str, str], Any] = {}
+
+    def _cached(self, check_type: str, subject: str) -> Any:
+        key = (check_type, subject)
+        if key in self.memory:
+            return self.memory[key]
+        row = self.store.first(self.ctx, "email_check_cache",
+                               {"subject_hash": engine.sha256(subject), "check_type": check_type})
+        value = row["result"] if row is not None and row["expires_at"] > utcnow() else None
+        if value is not None:
+            self.memory[key] = value
+        return value
+
+    def remember(self, check_type: str, subject: str, kind: str, result: Any, *, source: str = "built-in",
+                 provider: Optional[str] = None, ttl_type: Optional[str] = None) -> Any:
+        result = engine.cache_json(result)
+        self.memory[(check_type, subject)] = result
+        now = utcnow()
+        values = {"subject_hash": engine.sha256(subject), "subject_kind": kind, "check_type": check_type,
+                  "result": result, "source": source, "provider": provider, "checked_at": now,
+                  "expires_at": now + timedelta(days=EVIDENCE_TTL_DAYS[ttl_type or check_type])}
+        try:
+            existing = self.store.first(self.ctx, "email_check_cache",
+                                        {"subject_hash": values["subject_hash"], "check_type": check_type})
+            if existing is None:
+                self.store.insert(self.ctx, "email_check_cache", values)
+            else:
+                self.store.update(self.ctx, "email_check_cache", existing["id"], values)
+        except Exception:  # noqa: BLE001 - the cache is an optimisation; never fail a row over it
+            log.debug("evidence cache write skipped (%s)", check_type)
+        return result
+
+    def domain(self, domain: str) -> Dict[str, Any]:
+        cached = self._cached("dns", domain)
+        if cached is not None:
+            return cached
+        info = engine.inspect_domain(domain, self.dns)
+        if info.get("dns_error") in ("servfail", "timeout", "error"):
+            self.memory[("dns", domain)] = info  # transient: reuse within this run only
+            return info
+        return self.remember("dns", domain, "domain", info)
+
+    def smtp_check(self, host: str) -> Optional[Dict[str, Any]]:
+        if self.smtp is None:
+            return None
+        cached = self._cached("smtp", host)
+        if cached is not None:
+            return cached
+        if sum(1 for (kind, _) in self.memory if kind == "smtp") >= SMTP_MAX_HOSTS:
+            return {"smtp": "unknown", "detail": "per-job SMTP host limit reached", "host": host}
+        return self.remember("smtp", host, "host", self.smtp.check(host))
+
+    def public_scan(self, site: str) -> Optional[Dict[str, Any]]:
+        if self.finder is None or not site:
+            return None
+        cached = self._cached("public", site)
+        if cached is not None:
+            return cached
+        if sum(1 for (kind, _) in self.memory if kind == "public") >= PUBLIC_MAX_SITES:
+            return None
+        scan = {**self.finder.scan(site), "checked_at": utcnow().isoformat()}
+        return self.remember("public", site, "domain", scan)
+
+    def catch_all(self, domain: str) -> Optional[bool]:
+        cached = self._cached("catch_all", domain)
+        return None if cached is None else cached.get("catch_all")
+
+    def learn_catch_all(self, domain: str, value: Optional[bool]) -> None:
+        if value is not None and self.catch_all(domain) is not True:  # "yes" is never downgraded by one "ok"
+            self.remember("catch_all", domain, "domain", {"catch_all": value}, source="EmailListVerify",
+                          provider="emaillistverify")
+
+
 class EmailValidationJobService:
     def __init__(self, platform: Any) -> None:
         self.platform = platform
         self.store = platform.store
+        #: Injection points (tests): DNS client, SMTP connector, public-page fetcher.
+        self.dns_client: Any = None
+        self.smtp_connect: Any = None
+        self.public_fetcher: Any = None
 
     # --- creation ---------------------------------------------------------------------
 
@@ -193,29 +330,36 @@ class EmailValidationJobService:
         if len(data) > MAX_BYTES:
             raise ValidationError(f"the file is larger than {MAX_BYTES // (1024 * 1024)} MB; split it")
         try:
-            parsed = parse_file(filename, data, max_rows=MAX_ROWS)
-            rows = list(iter_rows(fmt, data, max_rows=MAX_ROWS))
+            parsed = parse_file(filename, data, max_rows=MAX_ROWS)  # streams: header, count, problems
+            sample = []
+            for pair in iter_rows(fmt, data, max_rows=200):
+                sample.append(pair)
         except ParseError as error:
             raise ValidationError(str(error)) from None
         if not parsed.columns:
             raise ValidationError("; ".join(parsed.problems) or "the file has no header row")
-        if not rows:
+        if not sample:
             raise ValidationError("the file has a header but no data rows")
-        candidates = detect_email_columns(parsed.columns, [r for _, r in rows])
+        candidates = detect_email_columns(parsed.columns, [r for _, r in sample])
         chosen = None
         if candidates and (len(candidates) == 1 or candidates[0]["score"] - candidates[1]["score"] >= 15):
             chosen = candidates[0]["column"]
+        contact_columns = engine.detect_contact_columns(parsed.columns)
         job = self.store.insert(ctx, "email_validation_jobs", {
             "name": (name or filename)[:200], "source_type": "upload", "filename": filename, "format": fmt,
             "size_bytes": len(data), "columns": parsed.columns, "email_column": chosen,
-            "preview": [r for _, r in rows[:PREVIEW_ROWS]], "row_count": len(rows),
+            "preview": [r for _, r in sample[:PREVIEW_ROWS]], "row_count": 0,
             "status": "ready" if chosen else "uploaded",
             "settings": {"candidates": candidates, "problems": parsed.problems,
-                         "truncated": any("more than" in p for p in parsed.problems)},
-            "counts": {"total": len(rows), "processed": 0}})
-        self._insert_items(ctx, job["id"], rows)
+                         "truncated": any("more than" in p for p in parsed.problems),
+                         "contact_columns": contact_columns, "contact_mode": _contact_mode(contact_columns)},
+            "counts": {"total": 0, "processed": 0}})
+        # Streamed straight into the job in chunks of 500: the file is never held as a list of rows.
+        total = self._insert_items(ctx, job["id"], iter_rows(fmt, data, max_rows=MAX_ROWS))
+        job = self.store.update(ctx, "email_validation_jobs", job["id"], {
+            "row_count": total, "counts": {"total": total, "processed": 0}})
         audit(self.store, ctx, "email_validation.upload", entity_type="email_validation_jobs", entity_id=job["id"],
-              summary=f"{filename}: {len(rows)} row(s)", changes={"size_bytes": len(data), "email_column": chosen})
+              summary=f"{filename}: {total} row(s)", changes={"size_bytes": len(data), "email_column": chosen})
         return job
 
     def create_from_rows(self, ctx: Ctx, *, name: str, rows: Sequence[Mapping[str, Any]], email_field: str,
@@ -234,10 +378,12 @@ class EmailValidationJobService:
                     columns.append(str(column))
         if email_field not in columns:
             raise ValidationError(f"the rows have no {email_field!r} field")
+        contact_columns = engine.detect_contact_columns(c for c in columns if c != email_field)
         job = self.store.insert(ctx, "email_validation_jobs", {
             "name": name[:200], "source_type": source_type, "source_id": source_id, "columns": columns,
             "email_column": email_field, "preview": records[:PREVIEW_ROWS], "row_count": len(records),
-            "status": "ready", "counts": {"total": len(records), "processed": 0}})
+            "status": "ready", "counts": {"total": len(records), "processed": 0},
+            "settings": {"contact_columns": contact_columns, "contact_mode": _contact_mode(contact_columns)}})
         self._insert_items(ctx, job["id"], enumerate(records, start=1))
         audit(self.store, ctx, "email_validation.create", entity_type="email_validation_jobs", entity_id=job["id"],
               summary=f"{name}: {len(records)} row(s) from {source_type}")
@@ -312,8 +458,13 @@ class EmailValidationJobService:
             if job["status"] == "uploaded":
                 raise ValidationError("choose the email column first")
             raise ConflictError(f"the job is already {job['status']}")
+        strict = (settings or {}).get("strict_validation", (job.get("settings") or {}).get("strict_validation", True))
         clean = {"allow_paid": bool((settings or {}).get("allow_paid")),
-                 "max_age_days": max(0, min(365, int((settings or {}).get("max_age_days") or 30)))}
+                 "max_age_days": max(0, min(365, int((settings or {}).get("max_age_days") or 30))),
+                 "strict_validation": bool(strict),
+                 # Opt-in evidence layers: slower, so never on by default.
+                 "public_evidence": bool((settings or {}).get("public_evidence")),
+                 "smtp_preflight": bool((settings or {}).get("smtp_preflight"))}
         if clean["allow_paid"] and not elv_enabled(self.platform.service("providers"), ctx):
             raise ValidationError("EmailListVerify is not configured and verified; run with built-in checks only")
         merged = {**(job.get("settings") or {}), **clean}
@@ -388,6 +539,17 @@ class EmailValidationJobService:
         out["total"] = sum(int(v) for v in grouped.values())
         out["pending"] = pending
         out["processed"] = out["total"] - pending
+        # Provenance filters: rows EmailListVerify answered vs. built-in only (pending rows have no provider).
+        by_provider = self.store.group_count(ctx, "email_validation_items", "provider", {"job_id": job_id})
+        out["provider_emaillistverify"] = int(by_provider.get("emaillistverify", 0))
+        out["provider_local"] = int(by_provider.get("local", 0))
+        out["unknown_builtin"] = self.store.count(ctx, "email_validation_items",
+                                                  {"job_id": job_id, "status": "UNKNOWN", "provider": "local"})
+        # The three user-facing statuses (see engine.final_status).
+        out["final_valid"] = self.store.count(ctx, "email_validation_items", {
+            "job_id": job_id, "status": "VALID", "provider__in": list(engine.VERIFIERS)})
+        out["final_invalid"] = out["INVALID"]
+        out["final_not_verified"] = out["processed"] - out["final_valid"] - out["final_invalid"]
         return out
 
     def _finish(self, ctx: Ctx, job_id: str, status: str, error: Optional[str] = None) -> Dict[str, Any]:
@@ -396,18 +558,149 @@ class EmailValidationJobService:
             "status": status, "counts": counts, "processed": counts["processed"], "finished_at": utcnow(),
             "error": error})
 
+    # --- resolving UNKNOWNs with EmailListVerify (explicit, confirmed, paid) ----------------
+
+    _CANDIDATES = {"status__in": list(engine.PAID_CANDIDATE_STATUSES), "provider": "local"}
+
+    def _catch_all_domains(self, ctx: Ctx, domains: Iterable[str]) -> set:
+        """Domains a verifier already reported as catch-all: checking another address there
+        cannot confirm a mailbox, so it is not sent (and not charged)."""
+        wanted = {engine.sha256(d): d for d in domains if d}
+        found = set()
+        keys = list(wanted)
+        for offset in range(0, len(keys), 500):
+            for row in self.store.all(ctx, "email_check_cache", {"subject_hash__in": keys[offset:offset + 500],
+                                                                 "check_type": "catch_all"}, cap=500):
+                if (row.get("result") or {}).get("catch_all") is True and row["expires_at"] > utcnow():
+                    found.add(wanted[row["subject_hash"]])
+        return found
+
+    def _unresolved_emails(self, ctx: Ctx, job_id: str) -> Tuple[List[str], int]:
+        """Distinct NOT VERIFIED addresses only the built-in checks answered (unknown, role,
+        free provider), in row order, and how many sit on a known catch-all domain (skipped)."""
+        seen: Dict[str, str] = {}
+        offset = 0
+        while True:
+            rows = self.store.list(ctx, "email_validation_items", {"job_id": job_id, **self._CANDIDATES},
+                                   order="row_number", limit=500, offset=offset).rows
+            if not rows:
+                break
+            for row in rows:
+                if row.get("email"):
+                    seen.setdefault(row["email"], row.get("domain") or row["email"].rpartition("@")[2])
+            offset += len(rows)
+        catch_all = self._catch_all_domains(ctx, set(seen.values()))
+        emails = [e for e, d in seen.items() if d not in catch_all]
+        return emails, len(seen) - len(emails)
+
+    def unknowns_estimate(self, ctx: Ctx, job_id: str) -> Dict[str, Any]:
+        """Exactly what :meth:`verify_unknowns` would spend: built-in UNKNOWNs that EmailListVerify
+        has not answered, minus addresses with a fresh EmailListVerify answer in the cache (those
+        are reused for free). Already-resolved rows (VALID, INVALID, RISKY, ...) are never sent."""
+        job = self.store.get(ctx, "email_validation_jobs", job_id)
+        settings = job.get("settings") or {}
+        max_age = int(settings.get("max_age_days") or 30)
+        emails, skipped_catch_all = self._unresolved_emails(ctx, job_id)
+        cutoff = utcnow() - timedelta(days=max_age)
+        reusable = 0
+        for offset in range(0, len(emails), 500):
+            chunk = emails[offset:offset + 500]
+            for row in self.store.all(ctx, "email_validations", {"email__in": chunk, "provider": "emaillistverify"},
+                                      cap=len(chunk)):
+                if row["validated_at"] >= cutoff:
+                    reusable += 1
+        registry = self.platform.service("providers")
+        conn_settings = (registry.connection(ctx, "emaillistverify") or {}).get("settings") or {}
+        cost = float(conn_settings.get("cost_per_check") or 1.0)
+        balance = self.platform.service("credits").balance(ctx, "emaillistverify")
+        to_check = len(emails) - reusable
+        credits = round(to_check * cost, 4)
+        active = elv_enabled(registry, ctx)
+        blocker = None
+        if job["status"] != "completed":
+            blocker = "Finish the built-in run first; unknowns can be verified on a completed job."
+        elif not active:
+            blocker = "EmailListVerify is not configured and verified (Sources → providers)."
+        elif not emails:
+            blocker = "There are no unresolved unknowns to verify."
+        elif credits > 0 and not balance.get("known"):
+            blocker = "The EmailListVerify balance is unknown; refresh it (a free call) before spending."
+        elif credits > 0 and balance.get("remaining", 0) < credits:
+            blocker = f"Only {balance.get('remaining', 0):g} EmailListVerify credits remain; {credits:g} are needed."
+        disposable = self.store.count(ctx, "email_validation_items",
+                                      {"job_id": job_id, "status": "DISPOSABLE", "provider": "local"})
+        return {"job_id": job_id, "unresolved": len(emails), "reused_from_cache": reusable, "to_check": to_check,
+                "skipped_catch_all": skipped_catch_all, "skipped_disposable": disposable,
+                "cost_per_check": cost, "credits": credits, "provider_active": active,
+                "credits_known": bool(balance.get("known")), "credits_remaining": balance.get("remaining"),
+                "can_verify": blocker is None, "blocker": blocker}
+
+    def verify_unknowns(self, ctx: Ctx, job_id: str, *, confirm: bool, expected_credits: Any) -> Dict[str, Any]:
+        """Send the job's unresolved UNKNOWNs (and only those) to EmailListVerify. The caller must
+        confirm the exact credit figure from :meth:`unknowns_estimate`; if it changed, nothing runs."""
+        ctx.require_write()
+        estimate = self.unknowns_estimate(ctx, job_id)
+        if estimate["blocker"]:
+            raise ValidationError(estimate["blocker"])
+        try:
+            expected = float(expected_credits)
+        except (TypeError, ValueError):
+            expected = None
+        if not confirm or expected is None or abs(expected - estimate["credits"]) > 1e-9:
+            raise ConflictError(f"confirm spending exactly {estimate['credits']:g} EmailListVerify credits on "
+                                f"{estimate['to_check']} address(es) (estimate changed or not confirmed)")
+        job = self.store.get(ctx, "email_validation_jobs", job_id)
+        send = set(self._unresolved_emails(ctx, job_id)[0])
+        offset = 0
+        while True:  # candidates that are sent become PENDING; the rest (catch-all) keep their result
+            rows = self.store.list(ctx, "email_validation_items", {"job_id": job_id, **self._CANDIDATES},
+                                   order="row_number", limit=500, offset=offset).rows
+            if not rows:
+                break
+            kept = 0
+            for row in rows:
+                if row.get("email") in send:
+                    self.store.update(ctx, "email_validation_items", row["id"], {"status": "PENDING"})
+                else:
+                    kept += 1
+            offset += kept  # reset rows left the filter; skip only the ones that stayed
+        settings = {**(job.get("settings") or {}), "allow_paid": True, "recheck_unknowns": True,
+                    "paid_statuses": list(engine.PAID_CANDIDATE_STATUSES)}
+        task = self.platform.tasks.submit(ctx, "email_validation_job", {"job_id": job_id},
+                                          entity_type="email_validation_jobs", entity_id=job_id)
+        job = self.store.update(ctx, "email_validation_jobs", job_id, {
+            "status": "queued", "task_id": task["id"], "settings": settings, "finished_at": None})
+        audit(self.store, ctx, "email_validation.verify_unknowns", entity_type="email_validation_jobs",
+              entity_id=job_id, changes={"unresolved": estimate["unresolved"], "to_check": estimate["to_check"],
+                                         "credits": estimate["credits"]})
+        return {**job, "estimate": estimate}
+
+    def set_strict(self, ctx: Ctx, job_id: str, enabled: bool) -> Dict[str, Any]:
+        """Strict validation: VALID only when EmailListVerify verified the mailbox."""
+        ctx.require_write()
+        job = self.store.get(ctx, "email_validation_jobs", job_id)
+        return self.store.update(ctx, "email_validation_jobs", job_id, {
+            "settings": {**(job.get("settings") or {}), "strict_validation": bool(enabled)}})
+
     def items(self, ctx: Ctx, job_id: str, filters: Optional[Mapping[str, Any]] = None, *, limit: int = 50,
               offset: int = 0, order: Optional[str] = None):
         self.store.get(ctx, "email_validation_jobs", job_id)
         clean = {k: v for k, v in (filters or {}).items() if k != "job_id"}
-        return self.store.list(ctx, "email_validation_items", {**clean, "job_id": job_id}, order=order,
+        page = self.store.list(ctx, "email_validation_items", {**clean, "job_id": job_id}, order=order,
                                limit=min(max(1, limit), 500), offset=max(0, offset))
+        for row in page.rows:
+            if row.get("status") != "PENDING":
+                row["final_status"] = engine.final_status(row.get("status"), row.get("provider"))
+                row["summary"] = engine.evidence_summary(row.get("status"), row.get("provider"), row.get("checks"))
+        return page
 
-    def _iter_items(self, ctx: Ctx, job_id: str, statuses: Optional[Sequence[str]] = None
-                    ) -> Iterable[Dict[str, Any]]:
+    def _iter_items(self, ctx: Ctx, job_id: str, statuses: Optional[Sequence[str]] = None, *,
+                    provider: Optional[str] = None) -> Iterable[Dict[str, Any]]:
         filters: Dict[str, Any] = {"job_id": job_id}
         if statuses:
             filters["status__in"] = list(statuses)
+        if provider:
+            filters["provider"] = provider
         offset = 0
         while True:
             rows = self.store.list(ctx, "email_validation_items", filters, order="row_number", limit=500,
@@ -417,8 +710,8 @@ class EmailValidationJobService:
             yield from rows
             offset += len(rows)
 
-    def export(self, ctx: Ctx, job_id: str, fmt: str = "csv", status: Optional[Sequence[str]] = None
-               ) -> Tuple[str, bytes, str]:
+    def export(self, ctx: Ctx, job_id: str, fmt: str = "csv", status: Optional[Sequence[str]] = None,
+               provider: Optional[str] = None) -> Tuple[str, bytes, str]:
         """``(filename, content, media type)``: the original columns plus the result."""
         job = self.store.get(ctx, "email_validation_jobs", job_id)
         if fmt not in ("csv", "xlsx"):
@@ -427,19 +720,28 @@ class EmailValidationJobService:
         for s in statuses:
             if s not in STATUSES + ("PENDING",):
                 raise ValidationError(f"unknown status {s!r}")
+        if provider not in (None, "", "local", "emaillistverify"):
+            raise ValidationError(f"unknown provider {provider!r}")
         columns = list(job.get("columns") or [])
-        extra = ["validation_email", "validation_status", "validation_score", "validation_reason",
-                 "validation_provider", "validated_at"]
+        extra = ["validation_email", "validation_status", "validation_detail", "validation_score",
+                 "validation_reason", "validation_provider", "validation_source", "validated_at"] + [
+                     f"signal_{key}" for key in _EXPORT_SIGNALS]
         header = columns + [c for c in extra if c not in columns]
 
         def records():
-            for item in self._iter_items(ctx, job_id, statuses):
+            for item in self._iter_items(ctx, job_id, statuses, provider=provider or None):
                 row = item.get("row") or {}
                 values = [row.get(c, "") for c in columns]
-                values += [item.get("email") or "", item["status"],
-                           "" if item.get("score") is None else item["score"],
+                pending = item["status"] == "PENDING"
+                summary = {} if pending else engine.evidence_summary(item["status"], item.get("provider"),
+                                                                      item.get("checks"))
+                values += [item.get("email") or "",
+                           "PENDING" if pending else engine.final_status(item["status"], item.get("provider")),
+                           item["status"], "" if item.get("score") is None else item["score"],
                            reason_for(item["status"], item.get("checks") or {}), item.get("provider") or "",
+                           "" if pending else summary["source"],
                            item["validated_at"].isoformat() if item.get("validated_at") else ""]
+                values += [summary.get(key, "") for key in _EXPORT_SIGNALS]
                 yield [str(v) if v is not None else "" for v in values]
 
         base = re.sub(r"[^A-Za-z0-9._-]+", "-", job["name"]).strip("-")[:60] or "validation"
@@ -480,8 +782,10 @@ class EmailValidationJobService:
         settings = job.get("settings") or {}
         column = job.get("email_column") or "email"
         email_service = self.platform.service("email")
+        evidence = _EvidenceRun(self, ctx, settings)
         self.store.update(ctx, "email_validation_jobs", job_id, {
             "status": "running", "started_at": job.get("started_at") or utcnow()})
+        last_progress = 0.0
         while True:
             if reporter.is_cancelled():
                 self._finish(ctx, job_id, "cancelled")
@@ -495,13 +799,19 @@ class EmailValidationJobService:
                                     order="row_number", limit=BATCH).rows
             if not batch:
                 break
-            self._process(ctx, email_service, batch, column, settings, task_id=task.get("id"))
-            counts = self.counts(ctx, job_id)
-            self.store.update(ctx, "email_validation_jobs", job_id, {"counts": counts,
-                                                                      "processed": counts["processed"]})
-            reporter.progress(f"validated {counts['processed']} of {counts['total']}", done=counts["processed"],
-                              total=counts["total"], counts=counts)
+            self._process(ctx, email_service, batch, column, settings, task_id=task.get("id"), evidence=evidence)
+            if time.monotonic() - last_progress >= PROGRESS_SECONDS:  # counting a huge job every batch is waste
+                last_progress = time.monotonic()
+                counts = self.counts(ctx, job_id)
+                self.store.update(ctx, "email_validation_jobs", job_id, {"counts": counts,
+                                                                          "processed": counts["processed"]})
+                reporter.progress(f"validated {counts['processed']} of {counts['total']}",
+                                  done=counts["processed"], total=counts["total"], counts=counts)
         final = self._finish(ctx, job_id, "completed")
+        if settings.get("recheck_unknowns"):  # a confirmed recheck authorises one paid run, not future ones
+            final = self.store.update(ctx, "email_validation_jobs", job_id, {
+                "settings": {**settings, "allow_paid": False, "recheck_unknowns": False, "paid_statuses": None,
+                             "last_recheck_at": utcnow().isoformat()}})
         audit(self.store, ctx, "email_validation.complete", entity_type="email_validation_jobs", entity_id=job_id,
               summary=f"{final['counts'].get('processed', 0)} row(s) validated", changes={"counts": final["counts"]})
         self._notify(ctx, final)
@@ -515,18 +825,28 @@ class EmailValidationJobService:
         return {"job_id": job_id, "status": "completed", "counts": final["counts"]}
 
     def _process(self, ctx: Ctx, email_service: Any, batch: List[Dict[str, Any]], column: str,
-                 settings: Mapping[str, Any], *, task_id: Optional[str]) -> None:
+                 settings: Mapping[str, Any], *, task_id: Optional[str], evidence: Optional[_EvidenceRun] = None
+                 ) -> None:
+        evidence = evidence or _EvidenceRun(self, ctx, settings)
         emails: Dict[str, str] = {}
+        originals: Dict[str, str] = {}
         for item in batch:
-            raw = extract_email((item.get("row") or {}).get(column))
-            emails[item["id"]] = raw
+            original = extract_email((item.get("row") or {}).get(column))
+            originals[item["id"]] = original
+            emails[item["id"]] = engine.to_ascii_email(original)[0] if original else ""  # IDN -> punycode
         wanted = [e for e in emails.values() if e]
         results = {}
         if wanted:
+            paid_statuses = tuple(settings.get("paid_statuses") or ("UNKNOWN",))
             for result in email_service.validate(ctx, wanted, allow_paid=bool(settings.get("allow_paid")),
                                                  max_age_days=int(settings.get("max_age_days") or 30),
-                                                 task_id=task_id):
+                                                 task_id=task_id, paid_statuses=paid_statuses):
                 results[result["email"]] = result
+        known_contacts = {}
+        lookup = sorted({_key(e) for e in wanted if normalize_email(_key(e))})
+        if lookup:  # one query per batch rather than one per row
+            for contact in self.store.all(ctx, "contacts", {"email__in": lookup}, cap=len(lookup) * 2):
+                known_contacts.setdefault(contact["email"], contact["id"])
         now = utcnow()
         for item in batch:
             raw = emails[item["id"]]
@@ -544,13 +864,68 @@ class EmailValidationJobService:
                                "provider": result.get("provider"), "checks": result.get("checks") or {},
                                "cached": bool(result.get("cached")), "validated_at": result.get("validated_at") or now,
                                "email": result["email"][:320]}
+                    if (settings.get("strict_validation", True) and changes["status"] == "VALID"
+                            and changes["provider"] not in engine.VERIFIERS):
+                        # Strict validation: VALID means "a mailbox verifier confirmed it", nothing less.
+                        changes.update(status="UNKNOWN", score=None,
+                                       checks={**changes["checks"], "strict_demoted": True})
+                    self._add_evidence(changes, originals[item["id"]], key, item.get("row") or {}, settings,
+                                       evidence, fresh=not result.get("cached"))
                 domain = key.rpartition("@")[2] if "@" in key else None
                 changes["domain"] = (domain or None) and domain[:253]
-                if not item.get("contact_id") and normalize_email(key):
-                    contact = self.store.first(ctx, "contacts", {"email": key})
-                    if contact is not None:
-                        changes["contact_id"] = contact["id"]
+                if not item.get("contact_id") and key in known_contacts:
+                    changes["contact_id"] = known_contacts[key]
             self.store.update(ctx, "email_validation_items", item["id"], changes)
+
+    def _add_evidence(self, changes: Dict[str, Any], original: str, email: str, row: Mapping[str, Any],
+                      settings: Mapping[str, Any], evidence: _EvidenceRun, *, fresh: bool) -> None:
+        """Layers 1-8 for one address, stored as ``checks["evidence"]``. Only a domain that
+        provably takes no mail (NXDOMAIN, null MX, nothing to deliver to) or a malformed address
+        changes the result, to INVALID; everything else is evidence."""
+        checks = dict(changes.get("checks") or {})
+        fmt = engine.check_format(original)
+        ev: Dict[str, Any] = {"format": {k: fmt[k] for k in ("ok", "idn", "issues", "placeholder", "did_you_mean")}}
+        provider = changes.get("provider")
+        if not fmt["ok"]:
+            if changes["status"] != "INVALID" and provider not in engine.VERIFIERS:
+                changes.update(status="INVALID", score=0.0)
+                checks["syntax"] = False
+        elif "@" in email:
+            domain = email.rpartition("@")[2]
+            dom = evidence.domain(domain)
+            ev["domain"] = {k: dom.get(k) for k in ("exists", "dns_error", "mail", "null_mx", "a_fallback", "spf",
+                                                     "spf_all", "dmarc", "dmarc_policy", "verdict", "invalid_reason")}
+            ev["domain"]["mx_hosts"] = len(dom.get("mx") or [])
+            if dom.get("verdict") == "invalid" and changes["status"] != "INVALID" and provider not in engine.VERIFIERS:
+                changes.update(status="INVALID", score=0.0)
+                checks["mx"] = False
+                checks["domain_invalid"] = dom.get("invalid_reason")
+            contact_columns = settings.get("contact_columns") or {}
+            contact = {name: row.get(col) for name, col in contact_columns.items()}
+            first, last = engine._names(contact)  # noqa: SLF001 - same module family
+            ev["risk"] = engine.risk_signals(email, first_name=first, last_name=last)
+            if dom.get("mx"):
+                smtp = evidence.smtp_check(dom["mx"][0])
+                if smtp is not None:
+                    ev["smtp"] = smtp
+            if evidence.finder is not None:
+                site = engine._host_of(str(contact.get("website") or "")) or (  # noqa: SLF001
+                    domain if not ev["risk"]["free_provider"] else "")
+                scan = evidence.public_scan(site) if site else None
+                ev["public"] = engine.public_evidence_for(email, scan, contact,
+                                                          checked_at=(scan or {}).get("checked_at"))
+            if settings.get("contact_mode"):
+                ev["contact"] = engine.contact_signals(email, contact, public_evidence=ev.get("public"))
+            learned = engine.catch_all_from(provider, checks)
+            if learned is not None and fresh:
+                evidence.learn_catch_all(domain, learned)
+            ev["catch_all"] = learned if learned is not None else evidence.catch_all(domain)
+            if provider in engine.VERIFIERS and fresh:
+                evidence.remember("mailbox:" + str(provider), email, "email",
+                                  {"status": changes["status"], "result_code": checks.get("result_code")},
+                                  source=engine.VERIFIERS[provider]["label"], provider=provider, ttl_type="mailbox")
+        checks["evidence"] = ev
+        changes["checks"] = checks
 
     def _notify(self, ctx: Ctx, job: Mapping[str, Any]) -> None:
         try:
@@ -706,7 +1081,12 @@ class EmailValidationJobService:
                 ctx, "emaillistverify").get("api_key"):
             return {"provider": "emaillistverify", "status": "not_configured",
                     "detail": "no EmailListVerify key is stored; built-in validation still works"}
-        return registry.verify(ctx, "emaillistverify")
+        result = registry.verify(ctx, "emaillistverify")
+        if result.get("status") == "ok" and isinstance(result.get("credits"), (int, float)):
+            # The same free call reports the balance: record it so paid checks can reserve credits.
+            self.platform.service("credits").sync(ctx, "emaillistverify", remaining=float(result["credits"]),
+                                                  source="EmailListVerify /api/credits")
+        return result
 
 
 def run_validation_job_task(platform: Any, ctx: Ctx, task: Dict[str, Any], reporter: Any) -> Dict[str, Any]:

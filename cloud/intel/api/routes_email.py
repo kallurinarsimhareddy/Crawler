@@ -145,10 +145,20 @@ def job_action(job_id: str, action: str, body: Optional[Dict[str, Any]] = Body(N
             create_missing_contacts=bool(body.get("create_missing_contacts")), list_name=body.get("list_name")),
         "enroll": lambda: service.enroll(ctx, job_id, sequence_id=str(body.get("sequence_id") or ""),
                                          statuses=_statuses(body.get("statuses")), campaign_id=body.get("campaign_id")),
+        # Paid: sends only the unresolved UNKNOWNs, after the caller confirms the exact estimate.
+        "verify-unknowns": lambda: service.verify_unknowns(ctx, job_id, confirm=body.get("confirm") is True,
+                                                           expected_credits=body.get("expected_credits")),
+        "strict": lambda: service.set_strict(ctx, job_id, bool(body.get("enabled", True))),
     }
     if action not in actions:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "unknown action")
     return _run(actions[action])
+
+
+@router.get("/email/jobs/{job_id}/unknowns")
+def unknowns_estimate(job_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    """Free: exactly how many addresses (and credits) "Verify Unknowns" would send to EmailListVerify."""
+    return _run(lambda: platform.service("email_jobs").unknowns_estimate(ctx, job_id))
 
 
 @router.get("/email/jobs/{job_id}/items")
@@ -163,10 +173,12 @@ def job_items(job_id: str, request: Request, limit: int = 50, offset: int = 0, o
 
 @router.get("/email/jobs/{job_id}/export")
 def export_job(job_id: str, format: str = "csv", status_filter: Optional[str] = None,
-               ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+               provider_filter: Optional[str] = None, ctx: Ctx = Depends(workspace_ctx),
+               platform: Platform = Depends(get_platform)):
     try:
         filename, content, media = platform.service("email_jobs").export(ctx, job_id, format,
-                                                                         _statuses(status_filter))
+                                                                         _statuses(status_filter),
+                                                                         provider=provider_filter)
     except PlatformError as error:
         raise http_error(error) from error
     return Response(content, media_type=media, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
