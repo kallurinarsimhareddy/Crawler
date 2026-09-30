@@ -506,7 +506,7 @@ function Crawls() {
     <EmptyState
       icon="scraper"
       title="Careers crawls"
-      description="The CareerCloud careers crawler runs as its own jobs, with progress, logs and results for each crawl."
+      description="The SANA GTM careers crawler runs as its own jobs, with progress, logs and results for each crawl."
       action={
         <span className="actions">
           <Link className="button button--primary" to="/new">New crawl</Link>

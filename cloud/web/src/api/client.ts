@@ -72,7 +72,7 @@ export async function send(path: string, init: RequestInit = {}, authenticated =
     response = await fetch(`${BASE_URL}${path}`, { ...init, headers: { ...headers, ...(init.headers as Record<string, string>) } });
   } catch (error) {
     if ((error as Error).name === "AbortError") throw error;
-    throw new ApiError("Cannot reach the CareerCloud API. Is it running?", 0);
+    throw new ApiError("Cannot reach the SANA GTM API. Is the service running?", 0);
   }
   if (response.status === 401 && authenticated) onUnauthorized();
   return response;
