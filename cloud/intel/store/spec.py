@@ -82,6 +82,9 @@ class EntitySpec:
     #: Which generated migration creates this table. Applied migrations never
     #: change, so new entities go into a new migration file.
     migration: str = "0003"
+    #: The migration from which only workspace admins (owner/admin) may read or
+    #: write this table: RLS uses ``can_admin`` instead of ``is_member``/``can_write``.
+    admin_only: Optional[str] = None
 
     def column(self, name: str) -> Col:
         return self.columns[name]
@@ -1022,7 +1025,7 @@ entity("ai_usage", "ai", {
 _M7 = {"migration": "0007"}
 
 
-def _add(entity_name: str, columns: Mapping[str, Col]) -> None:
+def _add(entity_name: str, columns: Mapping[str, Col], version: str = "0007") -> None:
     """Add columns to a table an earlier migration created (``alter table ... add column``)."""
     from dataclasses import replace
 
@@ -1030,7 +1033,13 @@ def _add(entity_name: str, columns: Mapping[str, Col]) -> None:
     for name, col in columns.items():
         if name in spec.columns or name in COMMON_COLUMNS:
             raise ValueError(f"{entity_name}.{name} already exists")
-        spec.columns[name] = replace(col, added="0007")  # type: ignore[index]
+        spec.columns[name] = replace(col, added=version)  # type: ignore[index]
+
+
+def _replace_spec(spec: EntitySpec, **changes: Any) -> EntitySpec:
+    from dataclasses import replace
+
+    return replace(spec, **changes)
 
 
 def _widen(entity_name: str, column: str, *extra: str) -> None:
@@ -1336,6 +1345,24 @@ entity("email_check_cache", "ecc", {
 }, unique=(("subject_hash", "check_type"),), migration="0008",
    description="Reusable email-validation evidence (DNS, SPF/DMARC, SMTP preflight, public evidence, "
                "catch-all) keyed by a SHA-256 of the address, domain or host, with a per-check expiry.")
+
+
+# --- 0009: user invitations ------------------------------------------------------
+# Invitations hold invitee emails and token hashes: admins only (was: any member
+# reads, any writer writes). Profile fields, the team to join, and delivery
+# bookkeeping are added; the token itself is never stored.
+_add("workspace_invitations", {
+    "first_name": _t(100),
+    "last_name": _t(100),
+    "team_id": _t(40),
+    "invited_by_label": _t(320),
+    "delivery": Col("text", choices=("link", "email", "email_failed"), default="link", required=True),
+    "sent_count": Col("int", required=True, default=0, minimum=0),
+    "last_sent_at": Col("ts"),
+    "revoked_at": Col("ts"),
+    "revoked_by": Col("uuid"),
+}, version="0009")
+ENTITIES["workspace_invitations"] = _replace_spec(ENTITIES["workspace_invitations"], admin_only="0009")
 
 
 def entities() -> Iterable[EntitySpec]:

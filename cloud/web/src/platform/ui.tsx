@@ -275,7 +275,7 @@ export function DataTable<T extends Row>({ rows, columns, link, empty = { title:
               {columns.map((c, i) => {
                 const content = c.render ? c.render(row) : fmt(row[c.key]);
                 return (
-                  <td key={c.key} className={c.className}>
+                  <td key={c.key} className={c.className} data-label={c.label || undefined}>
                     {i === 0 && link ? (
                       <Link className="link" to={link(row)}>
                         {content}

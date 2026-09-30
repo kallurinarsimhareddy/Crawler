@@ -383,6 +383,8 @@ class Store(ABC):
         ctx.require_write()
         if ctx.system:
             return
+        if spec.admin_only:
+            ctx.require_admin()
         if spec.system_write:
             raise ValidationError(f"{spec.name} is written by the platform only")
         if spec.append_only and op != "insert":

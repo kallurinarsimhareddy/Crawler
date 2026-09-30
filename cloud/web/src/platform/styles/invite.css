@@ -1,0 +1,14 @@
+/* The public /invite page (outside the app shell; shares the sign-in card look). */
+.invite-card { gap: 14px; }
+.invite-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 6px 14px; margin: 0; }
+.invite-facts dt { color: var(--text-muted); font-size: 0.85rem; }
+.invite-facts dd { margin: 0; font-weight: 600; min-width: 0; }
+.invite-facts__email { overflow-wrap: anywhere; }
+.invite-actions { display: flex; flex-direction: column; gap: 10px; }
+.invite-actions .alert { margin: 0; }
+.invite-card > .button { align-self: stretch; text-align: center; }
+
+@media (max-width: 420px) {
+  .invite-facts { grid-template-columns: minmax(0, 1fr); gap: 2px; }
+  .invite-facts dd { margin-bottom: 8px; }
+}

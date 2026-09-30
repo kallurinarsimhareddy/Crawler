@@ -2,14 +2,16 @@
 // Every action is also enforced by the API (and RLS); the UI only hides what a
 // role cannot do so read-only members are not offered dead buttons.
 
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { request } from "../../api/client";
 import { EmptyState, ErrorBanner, Loading } from "../../components/Feedback";
+import { copyText } from "../../lib/clipboard";
 import { Icon } from "../../shell/Icon";
 import type { PageOf, Row } from "../api";
 import { ASSIGNABLE_ROLES, auditQuery, canAdmin, canManage, canWrite, describeChanges, parseEvents, parseIds, roleLabel, toSearch } from "../logic/admin";
-import { DataTable, FilterBar, KeyValues, PageHeader, Pill, Tabs, fmt, fmtDate, useAction, useLoad } from "../ui";
+import { EMPTY_INVITE, extractToken, fullName, invitationActions, inviteBody, inviteLink, memberLabel, statusLabel, validateInvite, type InviteForm } from "../logic/invitations";
+import { DataTable, FilterBar, KeyValues, PageHeader, Pill, Tabs, fmt, fmtDate, useAction, useLoad, type Loaded } from "../ui";
 import { useWorkspace, useWs } from "../workspace";
 import "../styles/admin.css";
 
@@ -32,7 +34,12 @@ interface Member {
   role: string;
   role_label: string;
   email: string | null;
+  name: string | null;
   teams: string[];
+  team_ids: string[];
+  status: string;
+  joined_at: string | null;
+  is_owner: boolean;
   is_you: boolean;
 }
 
@@ -42,35 +49,220 @@ interface Overview {
   permissions: { key: string; label: string; group: string; roles: string[] }[];
 }
 
-function memberName(m: { email?: string | null; user_id: string }): string {
-  return m.email ?? `${m.user_id.slice(0, 8)}…`;
+type Team = Row & { name: string; members: { user_id: string; role: string }[] };
+
+/** What the API returns after creating, resending or re-linking an invitation. */
+interface Issued extends Row {
+  email: string;
+  token: string;
+  invite_url: string | null;
+  email_sent: boolean;
+  delivery_message: string;
 }
 
-function MembersTab({ members, reload }: { members: Member[]; reload: () => void }) {
+function issuedLink(issued: Issued): string {
+  return issued.invite_url ?? inviteLink(window.location.origin, issued.token);
+}
+
+/** A modal dialog: scrim, Escape to close, focus moved inside. */
+function Dialog({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+  const panel = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    document.addEventListener("keydown", onKey);
+    (panel.current?.querySelector<HTMLElement>("input, select, textarea") ?? panel.current?.querySelector<HTMLElement>("button"))?.focus();
+    return () => document.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  return (
+    <div className="admin-dialog" role="dialog" aria-modal="true" aria-label={title}>
+      <button type="button" className="admin-dialog__scrim" aria-label="Close" onClick={onClose} />
+      <div className="admin-dialog__panel card" ref={panel}>
+        <div className="admin-dialog__head">
+          <h2>{title}</h2>
+          <button type="button" className="button button--ghost button--small" onClick={onClose} aria-label="Close">✕</button>
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+/** The invite link with a copy button; says plainly whether an email went out. */
+function IssuedLink({ issued }: { issued: Issued }) {
+  const [copied, setCopied] = useState<string | null>(null);
+  const [copyError, setCopyError] = useState<Error | null>(null);
+  const link = issuedLink(issued);
+  return (
+    <div className="admin-issued" role="status">
+      {issued.email_sent ? (
+        <p className="alert alert--info">{issued.delivery_message}</p>
+      ) : (
+        <p className="alert alert--warning">{issued.delivery_message}</p>
+      )}
+      <label className="field">
+        <span className="field__label">Invite link for {issued.email}</span>
+        <input className="input mono" readOnly value={link} onFocus={(e) => e.currentTarget.select()} />
+      </label>
+      <p className="muted small">The link works once, only for {issued.email}, and expires on {fmtDate(issued.expires_at)}. It is shown only now; copying a new link later replaces it.</p>
+      <div className="actions">
+        <button
+          type="button"
+          className="button button--primary button--small"
+          onClick={() => {
+            setCopyError(null);
+            copyText(link).then(() => setCopied("Invite link copied."), (err: Error) => setCopyError(err));
+          }}
+        >
+          Copy Invite Link
+        </button>
+        {copied && <span className="muted small">{copied}</span>}
+      </div>
+      {copyError && <ErrorBanner error={copyError} />}
+    </div>
+  );
+}
+
+function InviteDialog({ teams, onClose, onInvited }: { teams: Team[]; onClose: () => void; onInvited: () => void }) {
+  const client = useWs();
+  const action = useAction();
+  const [form, setForm] = useState<InviteForm>(EMPTY_INVITE);
+  const [problem, setProblem] = useState<string | null>(null);
+  const [issued, setIssued] = useState<Issued | null>(null);
+  const set = (key: keyof InviteForm) => (e: { target: { value: string } }) => setForm({ ...form, [key]: e.target.value });
+
+  const submit = async (e: FormEvent) => {
+    e.preventDefault();
+    const invalid = validateInvite(form, ASSIGNABLE_ROLES);
+    setProblem(invalid);
+    if (invalid) return;
+    const result = await action.run(() => client.post<Issued>("/admin/invitations", inviteBody(form)));
+    if (result) {
+      setIssued(result);
+      onInvited();
+    }
+  };
+
+  return (
+    <Dialog title={issued ? "Invitation created" : "Invite user"} onClose={onClose}>
+      {issued ? (
+        <>
+          <IssuedLink issued={issued} />
+          <div className="form__actions">
+            <button type="button" className="button button--ghost" onClick={() => { setIssued(null); setForm(EMPTY_INVITE); }}>Invite another</button>
+            <button type="button" className="button button--primary" onClick={onClose}>Done</button>
+          </div>
+        </>
+      ) : (
+        <form className="form" onSubmit={submit} noValidate>
+          <label className="field">
+            <span className="field__label">Email *</span>
+            <input className="input" type="email" autoComplete="off" required value={form.email} onChange={set("email")} placeholder="teammate@company.com" />
+          </label>
+          <div className="form-grid">
+            <label className="field">
+              <span className="field__label">First name</span>
+              <input className="input" autoComplete="off" maxLength={100} value={form.first_name} onChange={set("first_name")} />
+            </label>
+            <label className="field">
+              <span className="field__label">Last name</span>
+              <input className="input" autoComplete="off" maxLength={100} value={form.last_name} onChange={set("last_name")} />
+            </label>
+          </div>
+          <div className="form-grid">
+            <label className="field">
+              <span className="field__label">Role *</span>
+              <select className="input" required value={form.role} onChange={set("role")}>
+                {ASSIGNABLE_ROLES.map((r) => <option key={r} value={r}>{roleLabel(r)}</option>)}
+              </select>
+            </label>
+            <label className="field">
+              <span className="field__label">Team (optional)</span>
+              <select className="input" value={form.team_id} onChange={set("team_id")}>
+                <option value="">No team</option>
+                {teams.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+            </label>
+          </div>
+          <p className="muted small">They join with this role after signing in, or creating an account, as this email address. The invitation expires in 7 days.</p>
+          {problem && <p className="alert alert--error" role="alert">{problem}</p>}
+          {action.error && <ErrorBanner error={action.error} />}
+          <div className="form__actions">
+            <button type="button" className="button button--ghost" onClick={onClose}>Cancel</button>
+            <button className="button button--primary" disabled={action.busy}>{action.busy ? "Sending…" : "Send Invitation"}</button>
+          </div>
+        </form>
+      )}
+    </Dialog>
+  );
+}
+
+function TeamsDialog({ member, teams, onClose, onSaved }: { member: Member; teams: Team[]; onClose: () => void; onSaved: () => void }) {
+  const client = useWs();
+  const action = useAction();
+  const [picked, setPicked] = useState<string[]>(member.team_ids);
+  const toggle = (id: string) => setPicked(picked.includes(id) ? picked.filter((t) => t !== id) : [...picked, id]);
+  return (
+    <Dialog title={`Teams for ${memberLabel(member)}`} onClose={onClose}>
+      {teams.length === 0 ? (
+        <EmptyState icon="users" title="No teams yet" description="Create a team on the Teams tab first." />
+      ) : (
+        <fieldset className="admin-checks">
+          <legend className="sr-only">Teams</legend>
+          {teams.map((t) => (
+            <label key={t.id} className="admin-check">
+              <input type="checkbox" checked={picked.includes(t.id)} onChange={() => toggle(t.id)} /> {t.name}
+            </label>
+          ))}
+        </fieldset>
+      )}
+      {action.error && <ErrorBanner error={action.error} />}
+      <div className="form__actions">
+        <button type="button" className="button button--ghost" onClick={onClose}>Cancel</button>
+        <button
+          type="button"
+          className="button button--primary"
+          disabled={action.busy || teams.length === 0}
+          onClick={() => void action.run(async () => {
+            await client.patch(`/admin/members/${member.user_id}/teams`, { team_ids: picked });
+            onSaved();
+            onClose();
+          })}
+        >
+          Save teams
+        </button>
+      </div>
+    </Dialog>
+  );
+}
+
+function MembersTab({ members, teams, reload }: { members: Member[]; teams: Team[]; reload: () => void }) {
   const client = useWs();
   const role = useRole();
   const action = useAction();
   const admin = canAdmin(role);
+  const manage = canManage(role);
+  const [editing, setEditing] = useState<Member | null>(null);
   return (
     <div className="card">
       {!admin && <ReadOnlyNote need="Workspace admins" />}
       {action.error && <ErrorBanner error={action.error} />}
       <DataTable
         rows={members.map((m) => ({ ...m, id: m.user_id }))}
-        empty={{ title: "No members", description: "Invite teammates from the Invitations tab.", icon: "users" }}
+        empty={{ title: "No members", description: "Invite teammates with Invite User.", icon: "users" }}
         columns={[
-          { key: "email", label: "Member", render: (m) => <span>{memberName(m)}{m.is_you && <span className="chip admin-you">you</span>}<span className="muted small block mono">{m.user_id}</span></span> },
+          { key: "name", label: "Name", render: (m) => <span className="admin-name">{m.name ?? (m.email ? m.email.split("@")[0] : <span className="muted">—</span>)}{m.is_you && <span className="chip admin-you">you</span>}</span> },
+          { key: "email", label: "Email", render: (m) => m.email ? <span className="admin-email">{m.email}</span> : <span className="muted mono small" title={m.user_id}>{m.user_id.slice(0, 8)}…</span> },
           {
             key: "role",
             label: "Role",
             render: (m) =>
-              admin && m.role !== "owner" ? (
+              admin && !m.is_owner ? (
                 <select
                   className="input input--small"
-                  aria-label={`Role for ${memberName(m)}`}
+                  aria-label={`Role for ${memberLabel(m)}`}
                   value={m.role}
                   disabled={action.busy}
-                  onChange={(e) => void action.run(async () => { await client.patch(`/admin/members/${m.user_id}`, { role: e.target.value }); reload(); })}
+                  onChange={(e) => void action.run(async () => { await client.patch(`/admin/members/${m.user_id}/role`, { role: e.target.value }); reload(); })}
                 >
                   {ASSIGNABLE_ROLES.map((r) => <option key={r} value={r}>{roleLabel(r)}</option>)}
                 </select>
@@ -79,97 +271,105 @@ function MembersTab({ members, reload }: { members: Member[]; reload: () => void
               ),
           },
           { key: "teams", label: "Teams", render: (m) => (m.teams.length ? m.teams.join(", ") : <span className="muted">—</span>) },
+          { key: "status", label: "Status", render: () => <Pill value="Active" /> },
+          { key: "joined_at", label: "Joined", render: (m) => (m.joined_at ? fmtDate(m.joined_at) : <span className="muted">—</span>) },
           {
             key: "actions",
-            label: "",
-            render: (m) =>
-              admin && m.role !== "owner" && !m.is_you ? (
-                <button
-                  type="button"
-                  className="button button--ghost button--small"
-                  disabled={action.busy}
-                  onClick={() => {
-                    if (!window.confirm(`Remove ${memberName(m)} from this workspace?`)) return;
-                    void action.run(async () => { await client.del(`/admin/members/${m.user_id}`); reload(); });
-                  }}
-                >
-                  Remove
-                </button>
-              ) : null,
+            label: "Actions",
+            render: (m) => (
+              <span className="actions admin-row-actions">
+                {manage && <button type="button" className="button button--ghost button--small" onClick={() => setEditing(m)}>Assign team</button>}
+                {admin && !m.is_owner && !m.is_you && (
+                  <button
+                    type="button"
+                    className="button button--ghost button--small"
+                    disabled={action.busy}
+                    onClick={() => {
+                      if (!window.confirm(`Remove ${memberLabel(m)} from this workspace? They lose access immediately.`)) return;
+                      void action.run(async () => { await client.del(`/admin/members/${m.user_id}`); reload(); });
+                    }}
+                  >
+                    Remove
+                  </button>
+                )}
+                {m.is_owner && <span className="muted small">Owner</span>}
+              </span>
+            ),
           },
         ]}
       />
+      {editing && <TeamsDialog member={editing} teams={teams} onClose={() => setEditing(null)} onSaved={reload} />}
     </div>
   );
 }
 
-function InvitationsTab() {
+function InvitationsTab({ reloadKey }: { reloadKey: number }) {
   const client = useWs();
   const admin = canAdmin(useRole());
-  const list = useLoad((signal) => client.get<{ items: Row[] }>("/admin/invitations", undefined, signal), client.base + "/inv");
+  const list = useLoad(
+    (signal) => (admin ? client.get<{ items: Row[] }>("/admin/invitations", undefined, signal) : Promise.resolve({ items: [] as Row[] })),
+    `${client.base}/inv/${reloadKey}/${admin}`,
+  );
   const action = useAction();
-  const [email, setEmail] = useState("");
-  const [inviteRole, setInviteRole] = useState("member");
-  const [created, setCreated] = useState<{ email: string; token: string } | null>(null);
+  const [issued, setIssued] = useState<Issued | null>(null);
+  if (!admin) return <div className="card"><ReadOnlyNote need="Workspace admins" /><p className="muted small">Invitations are visible to workspace admins only.</p></div>;
 
-  const submit = async (e: FormEvent) => {
-    e.preventDefault();
-    const result = await action.run(() => client.post<Row & { token: string }>("/admin/invitations", { email, role: inviteRole }));
+  const reissue = async (path: string) => {
+    const result = await action.run(() => client.post<Issued>(path));
     if (result) {
-      setCreated({ email: String(result.email), token: result.token });
-      setEmail("");
+      setIssued(result);
       list.refresh();
     }
   };
 
   return (
     <div className="stack">
-      {admin ? (
-        <form className="card form admin-inline" onSubmit={submit}>
-          <label className="field admin-grow">
-            <span className="field__label">Email</span>
-            <input className="input" type="email" required value={email} onChange={(e) => setEmail(e.target.value)} placeholder="teammate@company.com" />
-          </label>
-          <label className="field">
-            <span className="field__label">Role</span>
-            <select className="input" value={inviteRole} onChange={(e) => setInviteRole(e.target.value)}>
-              {ASSIGNABLE_ROLES.map((r) => <option key={r} value={r}>{roleLabel(r)}</option>)}
-            </select>
-          </label>
-          <div className="form__actions"><button className="button button--primary" disabled={action.busy || !email.trim()}>Create invitation</button></div>
-          {action.error && <ErrorBanner error={action.error} />}
-        </form>
-      ) : (
-        <ReadOnlyNote need="Workspace admins" />
-      )}
-      {created && (
-        <div className="card admin-token" role="status">
-          <strong>Invitation for {created.email}</strong>
-          <p className="muted small">Send this code to the invitee. It is shown only now and stored only as a hash. They sign in as {created.email} and paste it under Settings → Users &amp; Permissions → Join a workspace.</p>
-          <code className="admin-token__value">{created.token}</code>
-          <div className="actions">
-            <button type="button" className="button button--ghost button--small" onClick={() => void navigator.clipboard?.writeText(created.token)}>Copy</button>
-            <button type="button" className="button button--ghost button--small" onClick={() => setCreated(null)}>Done</button>
-          </div>
+      {issued && (
+        <div className="card">
+          <IssuedLink issued={issued} />
+          <div className="form__actions"><button type="button" className="button button--ghost button--small" onClick={() => setIssued(null)}>Done</button></div>
         </div>
       )}
+      {action.error && <ErrorBanner error={action.error} />}
       <div className="card">
         {list.error && <ErrorBanner error={list.error} onRetry={list.refresh} />}
         {list.loading && !list.data ? <Loading /> : (
           <DataTable
             rows={list.data?.items ?? []}
-            empty={{ title: "No invitations", description: "Invite teammates by email; they join with the role you choose.", icon: "users" }}
+            empty={{ title: "No invitations", description: "Use Invite User to add teammates; they join with the role you choose.", icon: "users" }}
             columns={[
-              { key: "email", label: "Email" },
+              { key: "email", label: "Email", render: (r) => <span><span className="admin-email">{String(r.email)}</span>{fullName(r.first_name, r.last_name) && <span className="muted small block">{fullName(r.first_name, r.last_name)}</span>}</span> },
               { key: "role", label: "Role", render: (r) => roleLabel(String(r.role)) },
-              { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
-              { key: "expires_at", label: "Expires", render: (r) => fmtDate(r.expires_at) },
+              { key: "team_name", label: "Team", render: (r) => (r.team_name ? String(r.team_name) : <span className="muted">—</span>) },
+              { key: "status", label: "Status", render: (r) => <Pill value={statusLabel(r.status)} /> },
+              { key: "invited_by_label", label: "Invited by", render: (r) => (r.invited_by_label ? String(r.invited_by_label) : <span className="muted">—</span>) },
+              { key: "created_at", label: "Created", render: (r) => fmtDate(r.created_at) },
+              { key: "expires_at", label: "Expires", render: (r) => (r.status === "pending" || r.status === "expired" ? fmtDate(r.expires_at) : <span className="muted">—</span>) },
               {
                 key: "actions",
-                label: "",
-                render: (r) => admin && r.status === "pending" ? (
-                  <button type="button" className="button button--ghost button--small" onClick={() => void action.run(async () => { await client.post(`/admin/invitations/${r.id}/revoke`); list.refresh(); })}>Revoke</button>
-                ) : null,
+                label: "Actions",
+                render: (r) => {
+                  const can = invitationActions(r.status);
+                  return (
+                    <span className="actions admin-row-actions">
+                      {can.resend && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void reissue(`/admin/invitations/${r.id}/resend`)}>Resend</button>}
+                      {can.copy && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void reissue(`/admin/invitations/${r.id}/link`)}>Copy Invite Link</button>}
+                      {can.revoke && (
+                        <button
+                          type="button"
+                          className="button button--ghost button--small"
+                          disabled={action.busy}
+                          onClick={() => {
+                            if (!window.confirm(`Revoke the invitation for ${String(r.email)}? The link stops working.`)) return;
+                            void action.run(async () => { await client.post(`/admin/invitations/${r.id}/revoke`); setIssued(null); list.refresh(); });
+                          }}
+                        >
+                          Revoke
+                        </button>
+                      )}
+                    </span>
+                  );
+                },
               },
             ]}
           />
@@ -179,22 +379,22 @@ function InvitationsTab() {
   );
 }
 
-/** For someone who was given an invitation code: redeem it into the workspace it names. */
+/** For someone holding an invitation link or code: redeem it into the workspace it names. */
 function JoinWorkspace() {
   const { reload, select } = useWorkspace();
   const action = useAction();
-  const [token, setToken] = useState("");
+  const [text, setText] = useState("");
   const [joined, setJoined] = useState<string | null>(null);
+  const token = extractToken(text);
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    const code = token.trim();
-    const workspaceId = code.split(".")[0];
+    if (!token) return;
     const result = await action.run(() =>
-      request<{ workspace_id: string; role: string }>(`/api/v1/w/${encodeURIComponent(workspaceId)}/invitations/accept`, { method: "POST", body: JSON.stringify({ token: code }) }),
+      request<{ workspace_id: string; workspace_name: string; role: string }>("/api/v1/invitations/accept", { method: "POST", body: JSON.stringify({ token }) }),
     );
     if (result) {
-      setJoined(`Joined as ${roleLabel(result.role)}.`);
-      setToken("");
+      setJoined(`Joined ${result.workspace_name} as ${roleLabel(result.role)}.`);
+      setText("");
       reload();
       select(result.workspace_id);
     }
@@ -202,25 +402,24 @@ function JoinWorkspace() {
   return (
     <form className="card form admin-inline" onSubmit={submit}>
       <label className="field admin-grow">
-        <span className="field__label">Join a workspace with an invitation code</span>
-        <input className="input mono" value={token} onChange={(e) => setToken(e.target.value)} placeholder="paste the code you were sent" />
+        <span className="field__label">Have an invitation link for another workspace?</span>
+        <input className="input mono" value={text} onChange={(e) => setText(e.target.value)} placeholder="paste the invite link" autoComplete="off" />
       </label>
-      <div className="form__actions"><button className="button button--ghost" disabled={action.busy || !token.includes(".")}>Join</button></div>
+      <div className="form__actions"><button className="button button--ghost" disabled={action.busy || !token}>Join</button></div>
       {action.error && <ErrorBanner error={action.error} />}
       {joined && <p className="muted small">{joined}</p>}
     </form>
   );
 }
 
-function TeamsTab({ members }: { members: Member[] }) {
+function TeamsTab({ members, teams, reloadTeams }: { members: Member[]; teams: Loaded<{ items: Team[] }>; reloadTeams: () => void }) {
   const client = useWs();
   const manage = canManage(useRole());
-  const teams = useLoad((signal) => client.get<{ items: (Row & { members: { user_id: string; role: string }[] })[] }>("/admin/teams", undefined, signal), client.base + "/teams");
   const action = useAction();
   const [name, setName] = useState("");
   const [pick, setPick] = useState<Record<string, string>>({});
   const byId = Object.fromEntries(members.map((m) => [m.user_id, m]));
-  const run = (fn: () => Promise<unknown>) => void action.run(async () => { await fn(); teams.refresh(); });
+  const run = (fn: () => Promise<unknown>) => void action.run(async () => { await fn(); reloadTeams(); });
 
   return (
     <div className="stack">
@@ -251,7 +450,7 @@ function TeamsTab({ members }: { members: Member[] }) {
                 <ul className="admin-list">
                   {team.members.map((tm) => (
                     <li key={tm.user_id}>
-                      <span>{byId[tm.user_id] ? memberName(byId[tm.user_id]) : `${tm.user_id.slice(0, 8)}…`}{tm.role === "lead" && <span className="chip admin-you">lead</span>}</span>
+                      <span>{byId[tm.user_id] ? memberLabel(byId[tm.user_id]) : `${tm.user_id.slice(0, 8)}…`}{tm.role === "lead" && <span className="chip admin-you">lead</span>}</span>
                       {manage && <button type="button" className="button button--ghost button--small" onClick={() => run(() => client.del(`/admin/teams/${team.id}/members/${tm.user_id}`))}>Remove</button>}
                     </li>
                   ))}
@@ -261,7 +460,7 @@ function TeamsTab({ members }: { members: Member[] }) {
                 <div className="admin-inline">
                   <select className="input input--small" aria-label="Add member" value={pick[team.id] ?? ""} onChange={(e) => setPick({ ...pick, [team.id]: e.target.value })}>
                     <option value="">Add a member…</option>
-                    {members.filter((m) => !team.members.some((tm) => tm.user_id === m.user_id)).map((m) => <option key={m.user_id} value={m.user_id}>{memberName(m)}</option>)}
+                    {members.filter((m) => !team.members.some((tm) => tm.user_id === m.user_id)).map((m) => <option key={m.user_id} value={m.user_id}>{memberLabel(m)}</option>)}
                   </select>
                   <button type="button" className="button button--ghost button--small" disabled={!pick[team.id]} onClick={() => run(async () => { await client.post(`/admin/teams/${team.id}/members`, { user_id: pick[team.id] }); setPick({ ...pick, [team.id]: "" }); })}>Add</button>
                 </div>
@@ -308,7 +507,7 @@ function AssignmentTab({ members }: { members: Member[] }) {
           <span className="field__label">New owner</span>
           <select className="input" value={owner} onChange={(e) => setOwner(e.target.value)}>
             <option value="">Unassigned</option>
-            {members.map((m) => <option key={m.user_id} value={m.user_id}>{memberName(m)} · {m.role_label}</option>)}
+            {members.map((m) => <option key={m.user_id} value={m.user_id}>{memberLabel(m)} · {m.role_label}</option>)}
           </select>
         </label>
       </div>
@@ -364,14 +563,27 @@ function PermissionsTab({ overview }: { overview: Overview }) {
 
 export function UsersPermissions() {
   const client = useWs();
+  const admin = canAdmin(useRole());
   const overview = useLoad((signal) => client.get<Overview>("/admin/overview", undefined, signal), client.base + "/ov");
   const members = useLoad((signal) => client.get<{ items: Member[] }>("/admin/members", undefined, signal), client.base + "/members");
+  const teams = useLoad((signal) => client.get<{ items: Team[] }>("/admin/teams", undefined, signal), client.base + "/teams");
   const [tab, setTab] = useState("members");
+  const [inviting, setInviting] = useState(false);
+  const [invited, setInvited] = useState(0);
   const list = members.data?.items ?? [];
   const failure = overview.error ?? members.error;
+  const reload = () => { members.refresh(); teams.refresh(); };
   return (
     <div className="page">
-      <PageHeader title="Users & Permissions" subtitle="Members, roles (Admin, Manager, User, Read-only), invitations, teams and record ownership." />
+      <PageHeader
+        title="Users & Permissions"
+        subtitle="Members, roles (Admin, Manager, User, Read-only), invitations, teams and record ownership."
+        actions={admin ? (
+          <button type="button" className="button button--primary" onClick={() => setInviting(true)}>
+            <Icon name="plus" size={16} /> Invite User
+          </button>
+        ) : undefined}
+      />
       {failure && <ErrorBanner error={failure} onRetry={() => { overview.refresh(); members.refresh(); }} />}
       <Tabs
         active={tab}
@@ -387,15 +599,22 @@ export function UsersPermissions() {
       <div className="admin-body">
         {members.loading && !members.data ? <Loading /> : (
           <>
-            {tab === "members" && <MembersTab members={list} reload={members.refresh} />}
-            {tab === "invitations" && <InvitationsTab />}
-            {tab === "teams" && <TeamsTab members={list} />}
+            {tab === "members" && <MembersTab members={list} teams={teams.data?.items ?? []} reload={reload} />}
+            {tab === "invitations" && <InvitationsTab reloadKey={invited} />}
+            {tab === "teams" && <TeamsTab members={list} teams={teams} reloadTeams={reload} />}
             {tab === "assignment" && <AssignmentTab members={list} />}
             {tab === "permissions" && (overview.data ? <PermissionsTab overview={overview.data} /> : <Loading />)}
           </>
         )}
         {tab === "members" && <JoinWorkspace />}
       </div>
+      {inviting && (
+        <InviteDialog
+          teams={teams.data?.items ?? []}
+          onClose={() => setInviting(false)}
+          onInvited={() => { setInvited((n) => n + 1); setTab("invitations"); }}
+        />
+      )}
     </div>
   );
 }

@@ -356,8 +356,8 @@ class PostgresStore(Store):
 
     def list_members(self, ctx: Ctx) -> List[Dict[str, Any]]:
         with self._tx(self._scope(ctx)) as conn:
-            rows = conn.execute("select user_id, role from careercloud.workspace_members where workspace_id = %s",
-                                [ctx.workspace_id]).fetchall()
+            rows = conn.execute("select user_id, role, created_at from careercloud.workspace_members "
+                                "where workspace_id = %s", [ctx.workspace_id]).fetchall()
         return [_plain(r) for r in rows]
 
     def update_workspace(self, ctx: Ctx, **changes: Any) -> Dict[str, Any]:

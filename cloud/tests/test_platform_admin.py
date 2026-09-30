@@ -118,7 +118,7 @@ class ServiceTests(unittest.TestCase):
         self.admin.remove_member(self.ctx, uid)
         self.assertIsNone(self.store.membership(uid, self.ws))
         self.assertEqual(self.admin.teams(self.ctx)[0]["members"], [])
-        self.assertTrue(self.store.all(self.ctx, "audit_log", {"action": "admin.member_remove"}))
+        self.assertTrue(self.store.all(self.ctx, "audit_log", {"action": "user.removed"}))
 
     # --- invitations -----------------------------------------------------------
     def test_invitation_lifecycle(self) -> None:

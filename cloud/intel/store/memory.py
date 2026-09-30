@@ -71,6 +71,7 @@ class MemoryStore(Store):
         self._tables: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self._workspaces: Dict[str, Dict[str, Any]] = {}
         self._members: Dict[Tuple[str, str], str] = {}
+        self._joined: Dict[Tuple[str, str], Any] = {}
 
     # --- workspaces --------------------------------------------------------
 
@@ -89,6 +90,7 @@ class MemoryStore(Store):
             }
             self._workspaces[ws["id"]] = ws
             self._members[(ws["id"], user_id)] = "owner"
+            self._joined[(ws["id"], user_id)] = ws["created_at"]
             return {**copy.deepcopy(ws), "role": "owner"}
 
     def workspaces_for(self, user_id: str) -> List[Dict[str, Any]]:
@@ -117,8 +119,10 @@ class MemoryStore(Store):
         self._authorize(ctx, admin=True)
         if role not in ("admin", "manager", "member", "viewer"):
             raise ValidationError("role must be admin, manager, member or viewer")
+        key = (ctx.workspace_id, str(uuid.UUID(user_id)))
         with self._lock:
-            self._members[(ctx.workspace_id, str(uuid.UUID(user_id)))] = role
+            self._members[key] = role
+            self._joined.setdefault(key, utcnow())
 
     def remove_member(self, ctx: Ctx, user_id: str) -> bool:
         self._authorize(ctx, admin=True)
@@ -126,13 +130,14 @@ class MemoryStore(Store):
         with self._lock:
             if self._members.get(key) == "owner":
                 raise ValidationError("the workspace owner cannot be removed")
+            self._joined.pop(key, None)
             return self._members.pop(key, None) is not None
 
     def list_members(self, ctx: Ctx) -> List[Dict[str, Any]]:
         self._authorize(ctx)
         with self._lock:
-            return [{"user_id": uid, "role": role} for (ws, uid), role in self._members.items()
-                    if ws == ctx.workspace_id]
+            return [{"user_id": uid, "role": role, "created_at": self._joined.get((ws, uid))}
+                    for (ws, uid), role in self._members.items() if ws == ctx.workspace_id]
 
     def update_workspace(self, ctx: Ctx, **changes: Any) -> Dict[str, Any]:
         self._authorize(ctx, admin=True)
@@ -209,9 +214,13 @@ class MemoryStore(Store):
                 table.update(before)
                 raise
 
+    def _hidden(self, ctx: Ctx, spec: EntitySpec) -> bool:
+        """An ``admin_only`` table is invisible to members below admin (RLS ``can_admin``)."""
+        return bool(spec.admin_only) and not ctx.system and             self._members.get((ctx.workspace_id, ctx.user_id)) not in ("owner", "admin")
+
     def _visible(self, ctx: Ctx, spec: EntitySpec, row_id: str) -> Optional[Dict[str, Any]]:
         row = self._table(spec).get(row_id)
-        if row is None or row["workspace_id"] != ctx.workspace_id:
+        if row is None or row["workspace_id"] != ctx.workspace_id or self._hidden(ctx, spec):
             return None
         return row
 
@@ -252,6 +261,8 @@ class MemoryStore(Store):
         try:
             self._authorize(ctx)
         except NotFoundError:
+            return []
+        if self._hidden(ctx, spec):
             return []
         rows = [r for r in self._table(spec).values() if r["workspace_id"] == ctx.workspace_id]
         for name, op, value in filters:
