@@ -50,6 +50,46 @@ class SourceService:
                         "secret_hint": conn.get("secret_hint"), "last_checked_at": conn.get("last_checked_at")})
         return out
 
+    def status(self, ctx: Ctx) -> Dict[str, Any]:
+        """Per source: access method, credentials required and missing, configured and
+        verified state, last check and error, and recorded usage. Nothing live is called."""
+        from cloud.intel.sources.base import JOB_FIELDS
+
+        registry = self.platform.service("providers")
+        connections = {c["provider"]: c for c in registry.list_connections(ctx, kind="source")}
+        usage: Dict[str, Dict[str, Any]] = {}
+        try:
+            for event in self.store.all(ctx, "usage_events", {"operation": "search"}, cap=5000):
+                u = usage.setdefault(event["provider"], {"searches": 0, "failures": 0, "postings": 0,
+                                                         "last_used_at": None})
+                u["searches"] += 1
+                u["failures"] += 0 if event["success"] else 1
+                u["postings"] += int(event.get("units") or 0) if event["success"] else 0
+                if u["last_used_at"] is None or event["created_at"] > u["last_used_at"]:
+                    u["last_used_at"] = event["created_at"]
+        except Exception:  # noqa: BLE001 - usage is informative only
+            log.debug("usage summary failed", exc_info=True)
+        items = []
+        for row in self.list_sources(ctx):
+            conn = connections.get(row["name"], {})
+            health = row.get("health") or {}
+            state = health.get("status") or "unknown"
+            items.append({
+                "name": row["name"], "label": row["label"], "kind": row["kind"],
+                "access_method": row["access_method"], "paid": row["paid"], "requires": row["requires"],
+                "missing": health.get("missing") or [], "requirement": row["requirement"],
+                "state": state, "configured": state not in ("not_configured", "error"),
+                "verified": conn.get("status") == "verified",
+                "connection_status": conn.get("status"), "last_checked_at": conn.get("last_checked_at"),
+                "last_error": conn.get("last_error"), "usage": usage.get(row["name"], {}),
+                "detail": health.get("detail")})
+        order = {"ok": 0, "configured_unverified": 1, "not_configured": 2, "error": 3}
+        items.sort(key=lambda i: (order.get(i["state"], 9), i["label"]))
+        return {"items": items, "job_schema": list(JOB_FIELDS),
+                "policy": ("official API, partner or licensed access only; no anti-bot, CAPTCHA, login or paywall "
+                           "bypass, no stealth or proxy evasion"),
+                "summary": {s: sum(1 for i in items if i["state"] == s) for s in order}}
+
     def search(self, ctx: Ctx, source: str, query: Union[SourceQuery, Mapping[str, Any]], *,
                allow_paid: bool = False, ingest: bool = True, task_id: Optional[str] = None) -> Dict[str, Any]:
         ctx.require_write()

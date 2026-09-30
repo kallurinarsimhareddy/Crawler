@@ -7,6 +7,8 @@ import type { Row } from "../api";
 import { DataTable, Json, KeyValues, PageHeader, Pill, ResourceList, Stat, Tags, fmt, fmtDate, useAction, useLoad } from "../ui";
 import { useWorkspace, useWs } from "../workspace";
 import { AiProviderSettings, ProactiveSettings } from "../controlroom/AiSettings";
+import { GtmActions } from "./GtmBridge";
+import { EnrichmentSources, JobSourceStatus } from "./SourcesStatus";
 
 // --- Research agent ------------------------------------------------------------
 
@@ -134,6 +136,12 @@ export function ResearchRun() {
           ]}
         />
       </div>
+      {resultRows.length > 0 && (
+        <div className="card">
+          <div className="card__header"><h3>Use these results in GTM</h3></div>
+          <GtmActions sourceType="research" sourceId={runId} />
+        </div>
+      )}
       {proposals.length > 0 && (
         <div className="card pad">
           <h3>Proposed actions</h3>
@@ -347,6 +355,8 @@ export function Sources() {
           ]}
         />
       )}
+      <JobSourceStatus />
+      <EnrichmentSources />
     </div>
   );
 }

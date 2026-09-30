@@ -57,6 +57,20 @@ SERVICES: Dict[str, str] = {
     "agent": "cloud.intel.agent.service:AgentService",
     "agent_memory": "cloud.intel.agent.memory:MemoryService",
     "insights": "cloud.intel.agent.insights:InsightService",
+    # SANA GTM completion (migration 0007)
+    "email_jobs": "cloud.intel.email.jobs:EmailValidationJobService",
+    "mailboxes": "cloud.intel.sending.mailboxes:MailboxService",
+    "outbox": "cloud.intel.sending.outbox:OutboxService",
+    "events": "cloud.intel.sending.events:EventService",
+    "suppression": "cloud.intel.gtm.suppression:SuppressionService",
+    "scoring": "cloud.intel.scoring.service:ScoringService",
+    "reports": "cloud.intel.analytics.reports:ReportService",
+    "admin": "cloud.intel.admin.service:AdminService",
+    "notifications": "cloud.intel.admin.notifications:NotificationService",
+    "integrations": "cloud.intel.integrations.service:IntegrationService",
+    "internal_data": "cloud.intel.imports.internal:InternalDataService",
+    "gtm_bridge": "cloud.intel.gtm.bridge:GtmBridgeService",
+    "enrichment": "cloud.intel.providers.enrichment:EnrichmentService",
 }
 
 

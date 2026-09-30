@@ -55,6 +55,11 @@ def _catalog() -> Dict[str, Dict[str, Any]]:
         "provider": "seamless", "kind": "enrichment", "label": "Seamless.AI", "access_method": "api",
         "requires": ["api_key"], "paid": True,
         "requirement": "a Seamless.AI API key with API access enabled on the workspace's own Seamless account"}
+    catalog["partner_api"] = {
+        "provider": "partner_api", "kind": "enrichment", "label": "Authorized partner API", "access_method": "partner",
+        "requires": ["api_key"], "paid": True,
+        "requirement": ("an API key from a data partner the workspace holds a contract with, plus an https base_url "
+                        "in the connection settings (JSON contract: see cloud/intel/providers/enrichment.py)")}
     catalog["emaillistverify"] = {
         "provider": "emaillistverify", "kind": "email_validation", "label": "EmailListVerify",
         "access_method": "api", "requires": ["api_key"], "paid": True,
@@ -238,6 +243,10 @@ class ProviderRegistry:
             from cloud.intel.providers.seamless import SeamlessConnector
 
             return SeamlessConnector(secrets, settings=settings, session=session)
+        if name == "partner_api":
+            from cloud.intel.providers.enrichment import PartnerApiConnector
+
+            return PartnerApiConnector(secrets, settings=settings)
         raise NotFoundError(f"{name} is not an enrichment provider")
 
     def configured(self, ctx: Ctx, name: str) -> bool:

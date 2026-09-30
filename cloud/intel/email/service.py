@@ -20,13 +20,14 @@ Every result updates the cache, the matching contacts' ``email_status`` /
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 from typing import Any, Dict, Iterable, List, Optional
 
 from cloud.intel.core.audit import audit
 from cloud.intel.core.context import ConflictError, Ctx, utcnow
 from cloud.intel.core.normalize import normalize_email
-from cloud.intel.email.providers import EmailListVerifyProvider, LocalValidator, ValidationResult
+from cloud.intel.email.providers import FATAL_CODES, EmailListVerifyProvider, elv_enabled, LocalValidator, ValidationResult
 from cloud.intel.providers.base import PaidCallRefused, ProviderError
 
 __all__ = ["EmailValidationService", "run_validation_task"]
@@ -35,6 +36,8 @@ log = logging.getLogger(__name__)
 
 CACHE_DAYS = 30
 MAX_SYNC = 25
+#: Addresses per paid batch (one ledger reservation each).
+PAID_BATCH = 50
 
 
 class EmailValidationService:
@@ -49,9 +52,11 @@ class EmailValidationService:
         if self.paid_factory is not None:
             return self.paid_factory(ctx)
         registry = self.platform.service("providers")
-        if not registry.enabled(ctx, "emaillistverify"):  # stored AND verified by a live check
+        if not elv_enabled(registry, ctx):
             return None
-        return EmailListVerifyProvider(registry.get_secrets(ctx, "emaillistverify").get("api_key", ""))
+        settings = (registry.connection(ctx, "emaillistverify") or {}).get("settings") or {}
+        return EmailListVerifyProvider(registry.get_secrets(ctx, "emaillistverify").get("api_key", ""),
+                                       cost_per_check=float(settings.get("cost_per_check") or 1.0))
 
     def cached(self, ctx: Ctx, email: str, *, max_age_days: int = CACHE_DAYS) -> Optional[Dict[str, Any]]:
         row = self.store.first(ctx, "email_validations", {"email": email})
@@ -94,29 +99,52 @@ class EmailValidationService:
 
     def _paid_checks(self, ctx: Ctx, provider, undecided: List[ValidationResult], *, task_id: Optional[str]
                      ) -> List[Dict[str, Any]]:
+        """Paid checks in batches of :data:`PAID_BATCH`, each against its own ledger
+        reservation that is consumed for the calls actually made (released when none
+        were). An account-level failure (bad key, no credits) stops further calls; the
+        remaining addresses keep their local result with the reason recorded."""
         ledger = self.platform.service("credits")
-        reservation = ledger.reserve(ctx, "emaillistverify", len(undecided), task_id=task_id,
-                                     reason=f"validate {len(undecided)} email(s)", action="email_validation")
-        used = 0
+        cost = float(getattr(provider, "cost_per_check", 1.0) or 1.0)
         out: List[Dict[str, Any]] = []
-        try:
-            for local in undecided:
-                try:
-                    result = provider.check(local.email)
-                    used += 1
-                    result.checks = {**local.checks, **result.checks}
-                    ledger.record_usage(ctx, "emaillistverify", "verify_email", task_id=task_id)
-                except (ProviderError, PaidCallRefused) as error:
-                    ledger.record_usage(ctx, "emaillistverify", "verify_email", success=False, error=str(error),
-                                        task_id=task_id)
-                    local.checks["paid_error"] = str(error)[:300]
-                    result = local
-                out.append(self._save(ctx, result))
-        finally:
-            if used:
-                ledger.consume(ctx, reservation["id"], used)
-            else:
-                ledger.release(ctx, reservation["id"], reason="no paid checks were made")
+        fatal: Optional[str] = None
+        for offset in range(0, len(undecided), PAID_BATCH):
+            batch = undecided[offset:offset + PAID_BATCH]
+            if fatal is not None:
+                for local in batch:
+                    local.checks["paid_error"] = fatal
+                    out.append(self._save(ctx, local))
+                continue
+            reservation = ledger.reserve(ctx, "emaillistverify", len(batch) * cost, task_id=task_id,
+                                         reason=f"validate {len(batch)} email(s)", action="email_validation")
+            used = 0
+            try:
+                for local in batch:
+                    if fatal is not None:
+                        local.checks["paid_error"] = fatal
+                        out.append(self._save(ctx, local))
+                        continue
+                    started = time.monotonic()
+                    try:
+                        result = provider.check(local.email)
+                        used += 1
+                        result.checks = {**local.checks, **result.checks}
+                        ledger.record_usage(ctx, "emaillistverify", "verify_email", task_id=task_id, units=1,
+                                            latency_ms=round((time.monotonic() - started) * 1000, 1))
+                    except (ProviderError, PaidCallRefused) as error:
+                        code = getattr(error, "code", "provider_error")
+                        ledger.record_usage(ctx, "emaillistverify", "verify_email", success=False, units=0,
+                                            error=f"{code}: {error}", task_id=task_id)
+                        local.checks["paid_error"] = str(error)[:300]
+                        local.checks["paid_error_code"] = code
+                        if code in FATAL_CODES:
+                            fatal = f"stopped after an account error ({code}): {error}"[:300]
+                        result = local
+                    out.append(self._save(ctx, result))
+            finally:
+                if used:
+                    ledger.consume(ctx, reservation["id"], used * cost)
+                else:
+                    ledger.release(ctx, reservation["id"], reason="no paid checks were made")
         return out
 
     @staticmethod

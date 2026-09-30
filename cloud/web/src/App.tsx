@@ -10,12 +10,17 @@ import { ResetPassword } from "./pages/ResetPassword";
 import { CompanyDetail } from "./platform/pages/Companies";
 import { ContactDetail, Discovery, HiringIntel, Postings, Provenance } from "./platform/pages/Intel";
 import { Home } from "./platform/pages/Home";
-import { AnalyticsSection, CampaignsSection, CompaniesSection, ContactsSection, HiringSection, ProspectingSection, ResearchSection, SequencesSection, SettingsSection } from "./platform/pages/Sections";
+import { Analytics } from "./platform/pages/Analytics";
+import { AuditLog, Integrations, Notifications, UsersPermissions } from "./platform/pages/Admin";
+import { EmailValidation, EmailValidationJob } from "./platform/pages/EmailValidation";
+import { InternalData } from "./platform/pages/InternalData";
+import { CampaignDetail, EmailSending, SequenceDetail, Suppressions } from "./platform/pages/Sending";
+import { CampaignsSection, CompaniesSection, ContactsSection, HiringSection, ProspectingSection, ResearchSection, SequencesSection, SettingsSection } from "./platform/pages/Sections";
 import { Credits, Exports, ImportDetail, Imports, ResearchRun, Sources } from "./platform/pages/Tools";
 import { ScrapeRun, Scraper } from "./platform/pages/Scraper";
 import { BackgroundTasks, Dashboard, ListDetail, Opportunities } from "./platform/pages/Work";
 import { ResourcePage } from "./platform/ResourcePage";
-import { ACTIVITIES, LISTS, MONITORS, SEGMENTS, SUPPRESSIONS, TASKS, TEMPLATES } from "./platform/resources";
+import { ACTIVITIES, LISTS, MONITORS, SEGMENTS, TASKS, TEMPLATES } from "./platform/resources";
 import { RecordView, RequireWorkspace } from "./platform/Shell";
 import { AutomationBuilder } from "./platform/controlroom/Automation";
 import { ControlRoom } from "./platform/controlroom/ControlRoom";
@@ -68,9 +73,13 @@ export function App() {
         <Route path="research" element={<W><ResearchSection /></W>} />
         <Route path="research/:runId" element={<W><ResearchRun /></W>} />
         <Route path="campaigns" element={<W><CampaignsSection /></W>} />
+        <Route path="campaigns/:campaignId" element={<W><CampaignDetail /></W>} />
         <Route path="sequences" element={<W><SequencesSection /></W>} />
+        <Route path="sequences/:sequenceId" element={<W><SequenceDetail /></W>} />
+        <Route path="email-validation" element={<W><EmailValidation /></W>} />
+        <Route path="email-validation/:jobId" element={<W><EmailValidationJob /></W>} />
         <Route path="templates" element={<W><ResourcePage config={TEMPLATES} /></W>} />
-        <Route path="suppressions" element={<W><ResourcePage config={SUPPRESSIONS} /></W>} />
+        <Route path="suppressions" element={<W><Suppressions /></W>} />
         <Route path="lists" element={<W><ResourcePage config={LISTS} /></W>} />
         <Route path="lists/:listId" element={<W><ListDetail /></W>} />
         <Route path="segments" element={<W><ResourcePage config={SEGMENTS} /></W>} />
@@ -78,13 +87,19 @@ export function App() {
         <Route path="monitors" element={<W><ResourcePage config={MONITORS} /></W>} />
         <Route path="imports" element={<W><Imports /></W>} />
         <Route path="imports/:batchId" element={<W><ImportDetail /></W>} />
+        <Route path="internal-data" element={<W><InternalData /></W>} />
         <Route path="exports" element={<W><Exports /></W>} />
         <Route path="sources" element={<W><Sources /></W>} />
         <Route path="credits" element={<W><Credits /></W>} />
-        <Route path="analytics" element={<W><AnalyticsSection /></W>} />
+        <Route path="analytics" element={<W><Analytics /></W>} />
+        <Route path="notifications" element={<W><Notifications /></W>} />
         <Route path="background" element={<W><BackgroundTasks /></W>} />
         <Route path="provenance/:entity/:entityId" element={<W><Provenance /></W>} />
         <Route path="settings" element={<W><SettingsSection /></W>} />
+        <Route path="settings/sending" element={<W><EmailSending /></W>} />
+        <Route path="settings/integrations" element={<W><Integrations /></W>} />
+        <Route path="settings/users" element={<W><UsersPermissions /></W>} />
+        <Route path="settings/audit" element={<W><AuditLog /></W>} />
         <Route
           path="*"
           element={

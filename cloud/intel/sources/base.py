@@ -23,7 +23,32 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
-__all__ = ["SourceAdapter", "SourceQuery", "SourceUnavailable", "SourceError", "dedupe_postings"]
+__all__ = ["JOB_FIELDS", "SourceAdapter", "SourceQuery", "SourceUnavailable", "SourceError", "dedupe_postings",
+           "normalize_posting"]
+
+#: The unified posting every source produces (``job_postings`` columns). Every key is
+#: present on every normalised row, so downstream code never guesses per source.
+JOB_FIELDS = ("company_name", "title", "job_url", "external_id", "location", "country", "posted_at", "description",
+              "department", "employment_type", "workplace_type", "ats", "source_kind", "source_name")
+
+
+def normalize_posting(row: Mapping[str, Any], source_name: str) -> Dict[str, Any]:
+    """One source row in the unified shape: every :data:`JOB_FIELDS` key present, text
+    trimmed, empty strings as None, ``workplace_type`` defaulting to ``unknown`` and the
+    source recorded. Extra keys a source adds (salary, skills...) are kept."""
+    out: Dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, str):
+            value = value.strip() or None
+        out[key] = value
+    for key in JOB_FIELDS:
+        out.setdefault(key, None)
+    out["source_kind"] = out.get("source_kind") or "external_source"
+    out["source_name"] = out.get("source_name") or source_name
+    out["workplace_type"] = out.get("workplace_type") or "unknown"
+    if out.get("external_id") is not None:
+        out["external_id"] = str(out["external_id"]) or None
+    return out
 
 
 class SourceError(RuntimeError):
@@ -157,5 +182,5 @@ class SourceAdapter(ABC):
     def run(self, query: SourceQuery) -> List[Dict[str, Any]]:
         """search -> normalize -> dedupe, the path every caller should use."""
         raws = self.search(query)
-        rows = [self.normalize(raw) for raw in raws]
+        rows = [normalize_posting(self.normalize(raw), self.name) for raw in raws]
         return self.dedupe([r for r in rows if r.get("title") and r.get("job_url")])

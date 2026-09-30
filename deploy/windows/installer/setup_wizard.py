@@ -31,12 +31,14 @@ from pathlib import Path
 
 HERE = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
 sys.path.insert(0, str(HERE / "manager"))
+import config_rules as R  # noqa: E402
 import sanagtm_common as C  # noqa: E402
+from updater import Updater  # noqa: E402
 
 PAYLOAD = HERE / "payload.zip"
 LOG_FILE = Path(os.environ.get("TEMP", ".")) / "SANA-GTM-Setup.log"
 DEFAULT_DIR = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Programs" / "SANA GTM"
-REPLACED = ("runtime", "app", "bin", "manager", "version.json")
+from updater import RELEASE_ITEMS as REPLACED  # noqa: E402  (what an update replaces)
 
 
 def log(msg: str) -> None:
@@ -72,19 +74,10 @@ def config_from_env(values: dict):
     return settings, secrets
 
 
-def check_values(settings: dict, secrets: dict) -> list:
-    problems = []
-    if not settings.get("supabase_url", "").startswith("https://"):
-        problems.append("Supabase project URL must start with https:// (e.g. https://<ref>.supabase.co)")
-    if not secrets.get("CAREERCLOUD_DATABASE_URL", "").startswith(("postgres://", "postgresql://")):
-        problems.append("Supabase database connection string must start with postgresql://")
-    if not secrets.get("CAREERCLOUD_REDIS_URL", "").startswith(("redis://", "rediss://")):
-        problems.append("Upstash Redis URL must start with rediss://")
-    if len(secrets.get("CAREERCLOUD_PLATFORM_SECRETS_KEY", "")) < 16:
-        problems.append("SANA GTM platform secret is required")
-    if settings.get("tunnel_mode") == "named" and not (secrets.get("TUNNEL_TOKEN") and settings.get("tunnel_hostname")):
-        problems.append("A named Cloudflare tunnel needs both the tunnel token and its public hostname")
-    return problems
+def check_values(settings: dict, secrets: dict, install_dir=None) -> list:
+    """Problems with the entered values, as messages that never repeat a value."""
+    return R.problem_messages(R.check_config(settings, secrets,
+                                             install_dir=None if install_dir is None else str(install_dir)))
 
 
 # --- the installation itself ------------------------------------------------------------------
@@ -97,6 +90,8 @@ class Installer:
         self.report = report                      # report(step, state, detail)
         self.start = start
         self.update = (self.paths.config / "secrets.dat").exists()
+        self.backup = None                        # previous release, while an update can still roll back
+        self.rolled_back = False
 
     def step(self, name, fn):
         self.report(name, "run", "")
@@ -114,15 +109,44 @@ class Installer:
         self.step("Checking this PC", self.check_pc)
         self.step("Stopping SANA GTM", self.stop_existing)
         self.step("Installing Python runtime and SANA GTM", self.extract)
-        self.step("Saving configuration (encrypted)", self.save_config)
-        self.step("Checking Supabase and Upstash", self.validate)
-        self.step("Registering automatic startup", self.register)
-        self.step("Creating the SANA GTM shortcut", lambda: C.create_shortcuts(self.paths))
-        if not self.start:
-            return True
-        self.step("Starting background services", lambda: C.start_supervisor(self.paths))
-        self.step("Waiting for API, Worker and Tunnel", self.wait_ready)
+        try:
+            self.step("Saving configuration (encrypted)", self.save_config)
+            self.step("Checking Supabase and Upstash", self.validate)
+            self.step("Registering automatic startup", self.register)
+            self.step("Creating the SANA GTM shortcut", lambda: C.create_shortcuts(self.paths))
+            if self.start:
+                self.step("Starting background services", lambda: C.start_supervisor(self.paths))
+                self.step("Waiting for API, Worker and Tunnel", self.wait_ready)
+        except Exception:
+            self.rollback_update()
+            raise
+        self.finish_update()
         return True
+
+    def rollback_update(self) -> None:
+        """An update that does not come up healthy is undone: the previous release
+        goes back (config, data and logs were never touched) and is restarted."""
+        if not (self.update and self.backup):
+            return
+        log(f"update failed; rolling back to {self.backup.name}")
+        try:
+            C.stop_everything(self.paths, wait_s=15)
+        except Exception:  # noqa: BLE001 - psutil may be missing in a broken release
+            log(traceback.format_exc())
+        self.rolled_back = Updater(self.paths.root).rollback(self.backup)
+        self.backup = None
+        if self.rolled_back and self.start:
+            try:
+                C.start_supervisor(self.paths)
+            except Exception:  # noqa: BLE001
+                log(traceback.format_exc())
+        self.report("Installing Python runtime and SANA GTM", "fail",
+                    "update rolled back to the previous version" if self.rolled_back else "rollback failed")
+
+    def finish_update(self) -> None:
+        if self.backup is not None:
+            pruned = Updater(self.paths.root).prune()
+            log(f"update complete; previous release kept in {self.backup} (pruned {pruned})")
 
     def check_pc(self):
         if sys.getwindowsversion().build < 17763:
@@ -150,28 +174,16 @@ class Installer:
         return "stopped"
 
     def extract(self):
-        root = self.paths.root
-        for name in REPLACED:
-            t = root / name
-            for attempt in range(10):
-                try:
-                    if t.is_dir():
-                        shutil.rmtree(t)
-                    elif t.exists():
-                        t.unlink()
-                    break
-                except OSError:
-                    if attempt == 9:
-                        raise RuntimeError(f"{t} is in use; close SANA GTM windows and run Setup again")
-                    time.sleep(1)
-        with zipfile.ZipFile(PAYLOAD) as z:
-            members = z.namelist()
-            for i, m in enumerate(members):
-                z.extract(m, root)
-                if i % 500 == 0:
-                    self.report("Installing Python runtime and SANA GTM", "run", f"{i * 100 // len(members)}%")
+        """Stage the new release beside the live one, then swap it in. The replaced
+        release is kept in versions\\ until the new one is READY (rollback)."""
+        self.paths.root.mkdir(parents=True, exist_ok=True)
+        updater = Updater(self.paths.root, report=lambda msg: self.report(
+            "Installing Python runtime and SANA GTM", "run", msg))
+        staged = updater.stage(PAYLOAD)
+        count = sum(1 for _ in staged.rglob("*") if _.is_file())
+        self.backup = updater.swap(staged)
         self.paths.ensure()
-        return f"{len(members)} files"
+        return f"{count} files" + ("; previous release kept for rollback" if self.backup else "")
 
     def save_config(self):
         settings = C.load_settings(self.paths)       # existing values win over defaults
@@ -306,8 +318,19 @@ def run_gui(existing):
             ttk.Button(row, text="Browse...", command=lambda: state["dir"].set(
                 filedialog.askdirectory(initialdir=state["dir"].get()) or state["dir"].get())).pack(side="left", padx=6)
         back_btn.configure(state="disabled")
-        next_btn.configure(text="Next >", state="normal",
-                           command=lambda: page_config() if (not existing or state["change"].get()) else page_install({}, {}))
+
+        def next_from_welcome():
+            if not existing:
+                problem = R.check_install_dir(state["dir"].get())
+                if problem:
+                    messagebox.showerror("SANA GTM Setup", problem)
+                    return
+            if not existing or state["change"].get():
+                page_config()
+            else:
+                page_install({}, {})
+
+        next_btn.configure(text="Next >", state="normal", command=next_from_welcome)
 
     # page 2 ---------------------------------------------------------------------------------
     spec = [
@@ -370,7 +393,7 @@ def run_gui(existing):
             add(i, key, label, secret)
         grid = global_grid
         back_btn.configure(state="normal", command=page_welcome)
-        next_btn.configure(text="Install", command=submit)
+        next_btn.configure(text="Next >", command=submit)
 
     def load_env():
         f = filedialog.askopenfilename(title="Select a SANA GTM .env file",
@@ -402,11 +425,29 @@ def run_gui(existing):
                         "CAREERCLOUD_PLATFORM_SECRETS_KEY": "saved" * 4, "TUNNEL_TOKEN": "saved"}
         effective = {k: placeholders.get(k, "saved") for k in saved_secrets_present}
         effective.update(secrets)
-        problems = check_values(settings, effective)
+        problems = check_values(settings, effective, None if existing else state["dir"].get())
         if problems:
             messagebox.showerror("SANA GTM Setup", "\n".join(problems))
             return
-        page_install(settings, secrets)
+        page_review(settings, secrets)
+
+    # review ---------------------------------------------------------------------------------
+    def page_review(settings, secrets):
+        clear()
+        tk.Label(body, text="Review", font=("Segoe UI Semibold", 14)).pack(anchor="w", pady=(0, 8))
+        rows = [("Install folder", state["dir"].get()),
+                ("Supabase project URL", settings.get("supabase_url", "")),
+                ("Queue prefix", settings.get("queue_prefix", "")),
+                ("Local API port", str(settings.get("api_port", 8100))),
+                ("Tunnel", "named: " + settings.get("tunnel_hostname", "") if settings.get("tunnel_mode") == "named"
+                 else "automatic quick tunnel")]
+        for key, label, *_ in spec + advanced:
+            if key in C.SECRET_KEYS:
+                rows.append((label.split(" (")[0], R.mask(secrets.get(key) or (key in saved_secrets_present))))
+        for label, value in rows:
+            para(f"{label}:  {value}")
+        back_btn.configure(state="normal", command=page_config)
+        next_btn.configure(text="Install", command=lambda: page_install(settings, secrets))
 
     # page 3 ---------------------------------------------------------------------------------
     def page_install(settings, secrets):

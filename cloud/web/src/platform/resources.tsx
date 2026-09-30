@@ -72,6 +72,7 @@ export const CAMPAIGNS: ResourceConfig = {
     { key: "target_titles", label: "Target titles", type: "tags" },
   ],
   createLabel: "New campaign",
+  link: (r) => `/campaigns/${r.id}`,
   emptyHint: "Group target accounts around a message, then add sequences and templates.",
 };
 
@@ -91,6 +92,7 @@ export const SEQUENCES: ResourceConfig = {
     { key: "description", label: "Description", type: "textarea" },
   ],
   createLabel: "New sequence",
+  link: (r) => `/sequences/${r.id}`,
   emptyHint: "Build multi-step outreach; every enrollment waits for your approval.",
 };
 

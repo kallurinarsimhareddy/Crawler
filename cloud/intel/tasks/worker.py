@@ -56,6 +56,12 @@ HANDLERS: Dict[str, str] = {
     "signals": "cloud.intel.signals.service:run_signals_task",
     "export": "cloud.intel.exports.service:run_export_task",
     "source_search": "cloud.intel.sources.service:run_source_search_task",
+    "email_validation_job": "cloud.intel.email.jobs:run_validation_job_task",
+    "email_send": "cloud.intel.sending.outbox:run_send_task",
+    "workflow_resume": "cloud.intel.automation.engine:run_workflow_resume_task",
+    "scoring": "cloud.intel.scoring.service:run_scoring_task",
+    "internal_data": "cloud.intel.imports.internal:run_internal_data_task",
+    "integration": "cloud.intel.integrations.service:run_integration_task",
 }
 
 
@@ -73,6 +79,12 @@ class PermanentTaskError(Exception):
 
 class TaskCancelled(Exception):
     pass
+
+
+#: Services whose ``tick(ctx) -> int`` runs on every maintenance pass, per workspace.
+#: A tick must be cheap when there is nothing due and must never send email unless
+#: every sending gate allows it.
+PERIODIC_SERVICES = ("outbox", "automation")
 
 
 def resolve_handler(kind: str) -> Callable[..., Dict[str, Any]]:
@@ -209,11 +221,20 @@ class PlatformWorker:
                     self._last_insights[workspace_id] = time.monotonic()
                     report["insights"] = report.get("insights", 0) + len(
                         self.platform.service("insights").generate(ctx))
-                if self.platform.config.allow_email_sending:
-                    stats = self.platform.service("sequences").process_due(ctx)
-                    report["sequence_steps"] = report.get("sequence_steps", 0) + stats.get("processed", 0)
+                # Due sequence steps advance in the "outbox" periodic tick below, which is a
+                # no-op unless sending is permitted (production + explicit flag).
             except Exception:  # noqa: BLE001
                 log.exception("maintenance failed for workspace %s", workspace_id)
+            # Periodic service ticks (outbox, delayed workflows, scheduled work). Each is
+            # isolated: one failing service never stops the others or the next workspace.
+            for name in PERIODIC_SERVICES:
+                try:
+                    tick = getattr(self.platform.service(name), "tick", None)
+                    if callable(tick):
+                        done = tick(ctx) or 0
+                        report[f"tick_{name}"] = report.get(f"tick_{name}", 0) + int(done)
+                except Exception:  # noqa: BLE001
+                    log.exception("periodic %s failed for workspace %s", name, workspace_id)
         return report
 
     def run(self, concurrency: int = 1) -> None:

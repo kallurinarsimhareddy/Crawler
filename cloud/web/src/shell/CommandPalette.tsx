@@ -67,7 +67,7 @@ export function CommandPalette({ onClose }: { onClose: () => void }) {
     const out: Item[] = [];
     if (q) out.push({ id: "ask", label: `Ask SANA GTM AI: “${query.trim()}”`, icon: "sparkles", group: "AI", run: askAi(query.trim(), true) });
     const pages = destinations().filter((d) => !q || `${d.label} ${d.section} ${d.keywords}`.toLowerCase().includes(q));
-    out.push(...pages.slice(0, q ? 6 : 8).map((d) => ({ id: `page:${d.to}`, label: d.label, hint: d.section, icon: d.icon, group: "Go to", run: go(d.to) })));
+    out.push(...pages.slice(0, q ? 10 : 8).map((d) => ({ id: `page:${d.to}:${d.label}`, label: d.label, hint: d.section, icon: d.icon, group: "Go to", run: go(d.to) })));
     out.push(...records.companies.map((r) => ({ id: `co:${r.id}`, label: String(r.name ?? r.domain ?? r.id), hint: String(r.domain ?? ""), icon: "building" as IconName, group: "Companies", run: go(`/companies/${r.id}`) })));
     out.push(...records.contacts.map((r) => ({ id: `ct:${r.id}`, label: String(r.full_name ?? r.email ?? r.id), hint: String(r.title ?? ""), icon: "users" as IconName, group: "Contacts", run: go(`/contacts/${r.id}`) })));
     if (!q) out.push(...PROMPTS.map((p) => ({ id: `ex:${p}`, label: p, icon: "sparkles" as IconName, group: "Ask SANA GTM AI", run: askAi(p, false) })));

@@ -115,10 +115,18 @@ class MemoryStore(Store):
 
     def add_member(self, ctx: Ctx, user_id: str, role: str) -> None:
         self._authorize(ctx, admin=True)
-        if role not in ("admin", "member", "viewer"):
-            raise ValidationError("role must be admin, member or viewer")
+        if role not in ("admin", "manager", "member", "viewer"):
+            raise ValidationError("role must be admin, manager, member or viewer")
         with self._lock:
             self._members[(ctx.workspace_id, str(uuid.UUID(user_id)))] = role
+
+    def remove_member(self, ctx: Ctx, user_id: str) -> bool:
+        self._authorize(ctx, admin=True)
+        key = (ctx.workspace_id, str(uuid.UUID(user_id)))
+        with self._lock:
+            if self._members.get(key) == "owner":
+                raise ValidationError("the workspace owner cannot be removed")
+            return self._members.pop(key, None) is not None
 
     def list_members(self, ctx: Ctx) -> List[Dict[str, Any]]:
         self._authorize(ctx)
@@ -150,7 +158,7 @@ class MemoryStore(Store):
             raise NotFoundError("workspace not found")
         if admin and role not in ("owner", "admin"):
             raise ForbiddenError("workspace admin rights required")
-        if write and role not in ("owner", "admin", "member"):
+        if write and role not in ("owner", "admin", "manager", "member"):
             raise ForbiddenError("this workspace role is read-only")
 
     def _table(self, spec: EntitySpec) -> Dict[str, Dict[str, Any]]:

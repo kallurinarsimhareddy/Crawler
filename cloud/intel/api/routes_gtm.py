@@ -52,9 +52,10 @@ def _create_step(platform: Platform, ctx: Ctx, values: Dict[str, Any]) -> Dict[s
 
 
 def _create_suppression(platform: Platform, ctx: Ctx, values: Dict[str, Any]) -> Dict[str, Any]:
-    return platform.service("sequences").add_suppression(
-        ctx, str(values.get("value") or ""), kind=values.get("kind", "email"), reason=values.get("reason", "manual"),
-        source=values.get("source") or "manual")
+    return platform.service("suppression").add(
+        ctx, str(values.get("value") or ""), kind=values.get("kind") or None, reason=values.get("reason", "manual"),
+        source=values.get("source") or "manual", scope=values.get("scope") or "workspace",
+        campaign_id=values.get("campaign_id"), note=values.get("note"))
 
 
 def _create_workflow(platform: Platform, ctx: Ctx, values: Dict[str, Any]) -> Dict[str, Any]:
@@ -72,7 +73,9 @@ router.include_router(crud_router("sequence_steps", path="/sequence-steps", tag=
 router.include_router(crud_router("sequence_enrollments", path="/enrollments", tag="sequences",
                                   allow_create=False, allow_update=False, allow_delete=False))
 router.include_router(crud_router("message_events", path="/message-events", tag="sequences", allow_create=False))
-router.include_router(crud_router("suppressions", tag="suppressions", create=_create_suppression))
+# Removal goes through POST /suppression/remove (protected reasons need an admin), never a bare DELETE.
+router.include_router(crud_router("suppressions", tag="suppressions", create=_create_suppression,
+                                  allow_update=False, allow_delete=False))
 router.include_router(crud_router("workflows", tag="workflows", create=_create_workflow, update=_update_workflow))
 router.include_router(crud_router("workflow_runs", path="/workflow-runs", tag="workflows"))
 

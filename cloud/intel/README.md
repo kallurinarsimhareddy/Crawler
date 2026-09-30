@@ -134,6 +134,7 @@ caller is not a member of is a 404. POSTs honour `Idempotency-Key`. Lists take
 | AI | `/ai/providers`, `/scraper/schema`, `/scraper/plan`, `/scraper/runs` (+ `/results`, `/records`, `/pages`, `/errors`, `/evidence`, `/files/{csv|xlsx|json|ndjson}`, `/pause|resume|cancel|retry|restart`, `/crm/match`, `/crm/propose`, `/proposals`), `/scraper/proposals/review|apply`, `/scraper/templates`, `POST /research/plan`, `/research/runs` (+ results, export, `approve`, `actions`) |
 | GTM | `/campaigns` (+ `/match`), `/companies/{id}/campaign-mapping`, `/templates` (+ `/preview`), `/sequences` (+ `/enroll`), `/sequence-steps`, `/enrollments` (+ `/approve`, `/{id}/stop`), `/sequences/process-due`, `/message-events`, `/events/inbound`, `/suppressions`, `/workflows` (+ `/test`), `/workflow-runs`; public `/unsubscribe/{token}` |
 | Analytics | `/analytics/dashboard`, `/analytics/timeseries` |
+| Scoring & reports | `/scores/model`, `/scores/{company|contact}/{id}` (GET live explanation, POST recompute+save), `/scores/{type}/{id}/history`, `POST /scores/rescore` (task `scoring`), `/analytics/reports` (+ `/{report}?start=&end=&<filter>=`, `/{report}/export?format=csv|xlsx`), `/analytics/saved-reports` |
 
 With `CAREERCLOUD_ENV=development` the interactive docs are at `/docs`.
 
@@ -279,3 +280,25 @@ E:\Crawlers\CareerCrawler\venv\Scripts\python -m unittest discover -s tests   # 
 PostgreSQL tests use an embedded `pgserver` database per test class (or
 `CAREERCLOUD_TEST_DATABASE_URL`, which must be disposable). Real-infrastructure
 checks stay separate in `cloud/ops/staging_e2e.py`.
+
+Frontend logic tests (pure modules in `web/src/platform/logic/`, plus route
+integrity for the sidebar and command palette) run with `npm test` in `cloud/web`.
+
+## SANA GTM completion (migration 0007)
+
+| Area | Modules | UI |
+|---|---|---|
+| Email validation jobs | `email/jobs.py` (`email_jobs`: CSV/XLSX upload, column detection, background run, results, export, list/campaign/sequence actions), `email/providers.py` (EmailListVerify batching, retry, error normalization; paid checks only when the key is stored **and** verified) | `/email-validation` |
+| Native sending | `sending/mailboxes.py` (Google/Microsoft OAuth + PKCE, API/SMTP relay; no mailbox passwords), `sending/outbox.py` (queue, schedule windows, caps; `tick` sends only when every gate allows), `sending/events.py` (provider webhooks normalized and de-duplicated; reply → stop sequence, task, notification) | `/settings/sending`, `/campaigns/:id`, `/sequences/:id` |
+| Suppression | `gtm/suppression.py` (platform-global read-only list, workspace and campaign scopes, expiry, bulk import/export; checked before every send) | `/suppressions` |
+| Scoring | `scoring/service.py` (account, contact, hiring, technology, opportunity, buying stage — factors, evidence, timestamp, model; `score_snapshots` history) | company and contact pages |
+| Analytics | `analytics/reports.py` (13 reports, date range, filters, CSV/XLSX, saved views) | `/analytics` |
+| Workflows | `automation/engine.py`, `graph.py`, `templates.py` (branching, delays, approvals, retries, failure policy, history; CRM changes PROPOSE → REVIEW → APPLY) | `/workflows` |
+| Admin | `admin/service.py` (roles Admin/Manager/User/Read-only, invitations, teams, assignment), `admin/notifications.py`, audit redaction in `core/audit.py` | `/settings/users`, `/settings/audit`, `/notifications` |
+| Integrations | `integrations/service.py` (Slack, signed webhooks, Google Workspace, Microsoft 365, calendars; "Not configured" without credentials) | `/settings/integrations` |
+| Internal data | `imports/internal.py` (12–30 file batches, schema comparison, explicit ambiguous-column mapping, conflict review) | `/internal-data` |
+| Scraper → GTM | `gtm/bridge.py` (list, validation job, draft campaign, CRM proposal, research — all reviewable) | scraper run "GTM" tab |
+| Enrichment / sources | `providers/enrichment.py` (source priority, identity check, fill-blanks-only, credit reserve/release), `sources/*` status | `/sources` |
+
+Services that finish work emit workflow triggers: `scrape_completed`,
+`import_completed`, `validation_job_completed`, `reply_received`.

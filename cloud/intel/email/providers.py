@@ -24,13 +24,13 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, FrozenSet, Optional
+from typing import Any, Callable, Dict, FrozenSet, List, Optional
 from urllib.parse import urlencode
 
 from cloud.intel.core.normalize import FREE_EMAIL_DOMAINS, normalize_email
 from cloud.intel.providers.base import ProviderError, ProviderNotConfigured
 
-__all__ = ["DISPOSABLE_DOMAINS", "EmailListVerifyProvider", "EmailValidationProvider", "LocalValidator",
+__all__ = ["DISPOSABLE_DOMAINS", "EmailListVerifyProvider", "EmailProviderError", "FATAL_CODES", "elv_enabled", "normalize_elv_code", "EmailValidationProvider", "LocalValidator",
            "ValidationResult", "dns_has_mail", "ELV_STATUS"]
 
 STATUSES = ("VALID", "INVALID", "RISKY", "UNKNOWN", "DISPOSABLE", "ROLE", "FREE_PROVIDER")
@@ -167,19 +167,69 @@ ELV_STATUS: Dict[str, tuple] = {
     "spamtrap": ("INVALID", 0.0),
     "role": ("ROLE", 40.0),
 }
-_ELV_ERRORS = ("key_not_valid", "missing_parameters", "insufficient_credits", "no_credits", "error", "error_credit")
+#: Provider reply -> (normalized error code, retryable). Anything unknown is "provider_error".
+_ELV_ERRORS: Dict[str, tuple] = {
+    "key_not_valid": ("auth", False),
+    "missing_parameters": ("bad_request", False),
+    "insufficient_credits": ("no_credits", False),
+    "no_credits": ("no_credits", False),
+    "error": ("provider_error", True),
+    "error_credit": ("no_credits", False),
+}
+#: HTTP statuses worth another try (rate limit, gateway and server errors).
+_RETRY_HTTP = frozenset({408, 425, 429, 500, 502, 503, 504})
+#: Account-level failures: once one happens, further calls in the run are pointless.
+FATAL_CODES = frozenset({"auth", "no_credits", "bad_request"})
+
+
+class EmailProviderError(ProviderError):
+    """A normalized provider failure. ``code`` is one of auth, bad_request, no_credits,
+    rate_limited, timeout, network, provider_error; ``retryable`` says whether trying
+    again later could succeed. The message never contains the API key."""
+
+    def __init__(self, message: str, *, code: str = "provider_error", retryable: bool = False) -> None:
+        super().__init__(message)
+        self.code = code
+        self.retryable = retryable
+
+
+def elv_enabled(registry: Any, ctx: Any) -> bool:
+    """Paid EmailListVerify checks run only for a stored AND verified key. Uses the
+    registry's ``enabled()`` when it has one; otherwise configured + status verified."""
+    enabled = getattr(registry, "enabled", None)
+    if callable(enabled):
+        return bool(enabled(ctx, "emaillistverify"))
+    if not registry.configured(ctx, "emaillistverify"):
+        return False
+    return (registry.connection(ctx, "emaillistverify") or {}).get("status") == "verified"
+
+
+def normalize_elv_code(text: Optional[str]) -> str:
+    """EmailListVerify answers with a bare result code; tolerate whitespace, case and
+    ``code|detail`` / ``code:detail`` suffixes."""
+    code = (text or "").strip().lower()
+    for sep in ("|", ":", " "):
+        code = code.split(sep, 1)[0]
+    return code
 
 
 class EmailListVerifyProvider(EmailValidationProvider):
     """The current EmailListVerify API (OpenAPI at https://api.emaillistverify.com/api-doc-json, read
     2026-09-29): the key travels in the ``x-api-key`` header, never the URL. The legacy
-    ``apps.emaillistverify.com/api/getCredit?secret=`` endpoints now serve the web app's HTML."""
+    ``apps.emaillistverify.com/api/getCredit?secret=`` endpoints now serve the web app's HTML.
+
+    Paid mailbox-level validation, one credit per checked address by default
+    (``cost_per_check`` comes from the connection settings when set). Transient
+    failures (timeouts, connection errors, HTTP 429/5xx) are retried with exponential
+    backoff; a permanent failure (bad key, no credits) raises at once."""
 
     name = "emaillistverify"
     paid = True
     BASE = "https://api.emaillistverify.com/api"
 
-    def __init__(self, api_key: str, *, session: Any = None, timeout: float = 30.0) -> None:
+    def __init__(self, api_key: str, *, session: Any = None, timeout: float = 30.0, max_retries: int = 2,
+                 backoff: float = 1.0, sleep: Optional[Callable[[float], None]] = None,
+                 cost_per_check: float = 1.0) -> None:
         self._key = api_key or ""
         if session is None:
             import requests
@@ -187,7 +237,37 @@ class EmailListVerifyProvider(EmailValidationProvider):
             session = requests.Session()
         self._session = session
         self.timeout = timeout
+        self.max_retries = max(0, int(max_retries))
+        self.backoff = backoff
+        self._sleep = sleep or time.sleep
+        self.cost_per_check = float(cost_per_check)
         self.calls = 0
+        self.retries = 0
+
+    def _redact(self, text: str) -> str:
+        return text.replace(self._key, "***") if self._key else text
+
+    def _get(self, path: str, params: Dict[str, str]) -> Any:
+        attempt = 0
+        while True:
+            try:
+                response = self._session.get(f"{self.BASE}/{path}?{urlencode(params)}",
+                                             headers={**self._headers(), "Accept": "text/html"}, timeout=self.timeout)
+            except Exception as error:  # noqa: BLE001 - requests' exceptions, or a test double's
+                kind = "timeout" if "timeout" in type(error).__name__.lower() else "network"
+                if attempt < self.max_retries:
+                    attempt += 1
+                    self.retries += 1
+                    self._sleep(self.backoff * (2 ** (attempt - 1)))
+                    continue
+                raise EmailProviderError(f"EmailListVerify {kind} error ({self._redact(type(error).__name__)})",
+                                         code=kind, retryable=True) from None
+            if response.status_code in _RETRY_HTTP and attempt < self.max_retries:
+                attempt += 1
+                self.retries += 1
+                self._sleep(self.backoff * (2 ** (attempt - 1)))
+                continue
+            return response
 
     def health(self, live: bool = False) -> Dict[str, Any]:
         if not self._key:
@@ -217,13 +297,38 @@ class EmailListVerifyProvider(EmailValidationProvider):
             raise ProviderNotConfigured("EmailListVerify is not connected for this workspace")
         started = time.monotonic()
         self.calls += 1
-        response = self._session.get(f"{self.BASE}/verifyEmail?{urlencode({'email': email})}",
-                                     headers={**self._headers(), "Accept": "text/html"}, timeout=self.timeout)
-        code = (response.text or "").strip().lower()
-        if response.status_code != 200 or code in _ELV_ERRORS:
-            raise ProviderError(f"EmailListVerify refused the request ({code or response.status_code})")
+        response = self._get("verifyEmail", {"email": email})
+        code = normalize_elv_code(response.text)
+        if response.status_code == 429:
+            raise EmailProviderError("EmailListVerify rate limit reached", code="rate_limited", retryable=True)
+        if response.status_code != 200:
+            raise EmailProviderError(f"EmailListVerify answered HTTP {response.status_code}",
+                                     code="provider_error", retryable=response.status_code >= 500)
+        if code in _ELV_ERRORS:
+            error_code, retryable = _ELV_ERRORS[code]
+            raise EmailProviderError(f"EmailListVerify refused the request ({code})", code=error_code,
+                                     retryable=retryable)
         status, score = ELV_STATUS.get(code, ("UNKNOWN", 40.0))
         return ValidationResult(email, status, score, self.name,
-                                {"result_code": code, "mapping_verified": False,
+                                {"result_code": code or "empty", "mapping_verified": False,
                                  "latency_ms": round((time.monotonic() - started) * 1000, 1)},
                                 raw={"result": code})
+
+    def check_many(self, emails: List[str], *, batch_size: int = 50) -> List[Any]:
+        """Check addresses in batches: one ValidationResult or EmailProviderError per
+        address, in order. After an account-level failure (bad key, no credits) the
+        remaining addresses are not sent; they come back as that same error."""
+        out: List[Any] = []
+        fatal: Optional[EmailProviderError] = None
+        for offset in range(0, len(emails), max(1, batch_size)):
+            for email in emails[offset:offset + batch_size]:
+                if fatal is not None:
+                    out.append(fatal)
+                    continue
+                try:
+                    out.append(self.check(email))
+                except EmailProviderError as error:
+                    out.append(error)
+                    if error.code in FATAL_CODES:
+                        fatal = error
+        return out

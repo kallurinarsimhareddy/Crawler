@@ -178,6 +178,9 @@ def pyinstaller(payload: Path):
     sh([py, "-m", "PyInstaller", "--noconfirm", "--clean", "--onefile", "--windowed", "--name", "SANA-GTM-Setup",
         "--icon", STAGE / "manager" / "sana-gtm.ico",
         "--add-data", f"{payload};.", "--add-data", f"{STAGE / 'manager'};manager",
+        # manager\ modules the wizard imports at run time (and their stdlib dependencies)
+        "--paths", HERE / "manager", "--hidden-import", "sanagtm_common", "--hidden-import", "config_rules",
+        "--hidden-import", "updater", "--hidden-import", "urllib.parse",
         "--hidden-import", "psutil", "--distpath", DIST, "--workpath", BUILD / "pyi-work", "--specpath", BUILD,
         HERE / "setup_wizard.py"], env=dict(os.environ, PYTHONNOUSERSITE="1"))
 

@@ -42,6 +42,12 @@ const PATHS = {
   arrow: "M5 12h14M13 6l6 6-6 6",
   send: "M4 12l16-8-6 16-3-7z",
   note: "M5 4h14v11l-5 5H5zM14 20v-5h5",
+  mail: "M3 6a1 1 0 0 1 1-1h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1zM3 7l9 6 9-6",
+  mailcheck: "M21 12V6a1 1 0 0 0-1-1H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h8M3 7l9 6 9-6M15 18l2 2 4-4",
+  shield: "M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6zM9 12l2 2 4-4",
+  plug: "M9 3v5M15 3v5M6 8h12v3a6 6 0 0 1-12 0zM12 17v4",
+  history: "M3 12a9 9 0 1 0 3-6.7L3 8M3 3v5h5M12 7v5l3 2",
+  layers: "M12 3l9 5-9 5-9-5zM3 13l9 5 9-5M3 17l9 5 9-5",
 } as const;
 
 export type IconName = keyof typeof PATHS;

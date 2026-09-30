@@ -535,6 +535,12 @@ def _finish(platform: Any, ctx: Ctx, progress: _Progress, schema: Mapping[str, A
              "files": files, "ai_calls": ai.calls, "ai_failures": ai.failures, "ai_note": ai.summary,
              "observability": observability, "errors": len(errors), "progress": dict(progress.state)}
     store.update(ctx, "scrape_runs", run["id"], {"status": status, "stats": stats})
+    if status == "completed":
+        try:  # workflows on "scrape_completed"; best-effort, never fails the run
+            platform.service("automation").emit(ctx, "scrape_completed", f"scrape:{run['id']}",
+                                                {"run_id": run["id"], "records": len(records), "counts": counts})
+        except Exception:  # noqa: BLE001
+            log.debug("scrape_completed emit skipped", exc_info=True)
     log.info("scrape.finish run=%s status=%s records=%s pages=%s ai_calls=%s duration=%s", run["id"], status,
              len(records), observability["pages_visited"], ai.calls, observability["duration_seconds"])
     return {"run_id": run["id"], "records": len(records), "counts": counts, "outcomes": outcomes,
