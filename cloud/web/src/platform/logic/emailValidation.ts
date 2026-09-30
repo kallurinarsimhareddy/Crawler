@@ -219,7 +219,8 @@ export const MAX_PASTED = 50_000;
 
 // A deliberately loose shape check that only catches obviously broken entries; the server's
 // syntax/MX/disposable/role checks (and EmailListVerify) still decide every address.
-const EMAIL_SHAPE = /^[^\s@<>(),;:"[\]\\]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,}$/;
+// The local part is dot-separated atoms, so a leading, trailing or doubled dot is malformed.
+const EMAIL_SHAPE = /^[^\s@<>(),;:"[\]\\.]+(?:\.[^\s@<>(),;:"[\]\\.]+)*@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,}$/;
 
 export interface PastedEmails {
   /** Non-empty entries found in the text, duplicates included. */

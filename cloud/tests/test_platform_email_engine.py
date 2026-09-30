@@ -394,5 +394,113 @@ class ChunkingTests(unittest.TestCase):
         self.assertTrue(job["settings"]["truncated"])
 
 
+class BackgroundIngestTests(unittest.TestCase):
+    """Large uploads: the request only samples the file; the worker reads it in bulk chunks."""
+
+    def setUp(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from cloud.intel.email import jobs as jobs_module
+        from cloud.shared.storage import LocalFileStorage
+
+        self.jobs_module = jobs_module
+        self.scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(self.scratch.cleanup)
+        self.platform, self.ctx, _ = make_platform()
+        self.platform.storage = LocalFileStorage(Path(self.scratch.name))
+        self.jobs = self.platform.service("email_jobs")
+        patches = [mock.patch.object(jobs_module, "INLINE_INGEST_BYTES", 100),
+                   mock.patch.object(jobs_module, "INGEST_CHUNK", 100)]
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    @staticmethod
+    def csv(n):
+        return ("Email,First Name,Last Name,Company\n" + "".join(
+            f"user{i}@acme-test.example,First{i},Last{i},Acme\n" for i in range(n))).encode()
+
+    def ingest(self, job):
+        task_id = job["settings"]["ingest"]["task_id"]
+        done = run_task_inline(self.platform, self.ctx.workspace_id, task_id)
+        self.assertEqual(done["status"], "completed", done.get("error"))
+        return self.jobs.get(self.ctx, job["id"])
+
+    def test_the_upload_request_only_samples_and_queues(self) -> None:
+        from cloud.intel.core.context import ConflictError
+
+        inserts = []
+        original = self.platform.store.insert_many
+        self.platform.store.insert_many = lambda ctx, entity, rows: inserts.append(len(rows)) or original(ctx, entity,
+                                                                                                          rows)
+        job = self.jobs.create_upload(self.ctx, "big.csv", self.csv(1234))
+        self.assertEqual(inserts, [])  # no rows written during the request
+        ingest = job["settings"]["ingest"]
+        self.assertEqual((ingest["state"], job["row_count"], job["email_column"]), ("pending", 0, "Email"))
+        self.assertTrue(job["settings"]["contact_mode"])
+        self.assertEqual(len(job["preview"]), 8)
+        self.assertTrue(self.platform.storage.exists(ingest["storage_key"]))
+        with self.assertRaises(ConflictError):  # validation waits until the file is read
+            self.jobs.start(self.ctx, job["id"])
+        job = self.ingest(job)
+        self.assertEqual((job["row_count"], job["counts"]["total"], job["settings"]["ingest"]["state"]),
+                         (1234, 1234, "done"))
+        self.assertEqual(inserts, [100] * 12 + [34])  # bulk chunks of INGEST_CHUNK
+        self.assertFalse(self.platform.storage.exists(ingest["storage_key"]))  # the rows now live in the job
+        job = self.jobs.start(self.ctx, job["id"])
+        self.assertEqual(run_task_inline(self.platform, self.ctx.workspace_id, job["task_id"])["status"], "completed")
+        self.assertEqual(self.jobs.get(self.ctx, job["id"])["counts"]["processed"], 1234)
+
+    def test_ingest_resumes_without_duplicating_rows(self) -> None:
+        from cloud.intel.imports.parse import iter_rows
+
+        data = self.csv(500)
+        job = self.jobs.create_upload(self.ctx, "big.csv", data)
+        # A previous attempt got 300 rows in before it stopped.
+        self.jobs._insert_items(self.ctx, job["id"], (pair for pair in iter_rows("csv", data, max_rows=300)))  # noqa: SLF001
+        job = self.ingest(job)
+        rows = self.platform.store.all(self.ctx, "email_validation_items", {"job_id": job["id"]})
+        numbers = sorted(r["row_number"] for r in rows)
+        self.assertEqual((job["row_count"], len(rows), numbers), (500, 500, list(range(1, 501))))
+
+    def test_ingest_stops_at_the_row_limit(self) -> None:
+        with mock.patch.object(self.jobs_module, "MAX_ROWS", 250):
+            job = self.ingest(self.jobs.create_upload(self.ctx, "big.csv", self.csv(400)))
+        self.assertEqual(job["row_count"], 250)
+        self.assertTrue(job["settings"]["truncated"])
+        self.assertTrue(any("250" in p for p in job["settings"]["problems"]))
+
+    def test_deleting_a_job_that_is_still_reading_removes_the_upload(self) -> None:
+        job = self.jobs.create_upload(self.ctx, "big.csv", self.csv(300))
+        key = job["settings"]["ingest"]["storage_key"]
+        self.jobs.delete(self.ctx, job["id"])
+        self.assertFalse(self.platform.storage.exists(key))
+        task = self.platform.tasks.get(self.ctx, job["settings"]["ingest"]["task_id"])
+        self.assertEqual(task["status"], "cancelled")
+
+    def test_results_are_written_back_in_one_bulk_update_per_batch(self) -> None:
+        job = self.ingest(self.jobs.create_upload(self.ctx, "big.csv", self.csv(1200)))
+        store = self.platform.store
+        calls = {"update_many_items": 0, "update_items": 0}
+        original_many, original_one = store.update_many, store.update
+
+        def many(ctx, entity, changes):
+            if entity == "email_validation_items":
+                calls["update_many_items"] += 1
+            return original_many(ctx, entity, changes)
+
+        def one(ctx, entity, row_id, changes, **kw):
+            if entity == "email_validation_items":
+                calls["update_items"] += 1
+            return original_one(ctx, entity, row_id, changes, **kw)
+
+        store.update_many, store.update = many, one
+        job = self.jobs.start(self.ctx, job["id"])
+        run_task_inline(self.platform, self.ctx.workspace_id, job["task_id"])
+        self.assertEqual(calls, {"update_many_items": 3, "update_items": 0})  # BATCH=500: 500 + 500 + 200
+        self.assertEqual(self.jobs.get(self.ctx, job["id"])["counts"]["processed"], 1200)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,6 +38,44 @@ class StoreContract:
         updated = self.store.update(self.ctx, "companies", row["id"], {"industry": "Manufacturing"})
         self.assertEqual(updated["version"], 2)
 
+    def test_insert_many_and_update_many(self) -> None:
+        rows = self.store.insert_many(self.ctx, "companies", [{"name": f"Bulk {i}", "domain": f"bulk{i}.com"}
+                                                              for i in range(2500)])  # > one pipelined chunk
+        self.assertEqual(len(rows), 2500)
+        self.assertEqual([r["name"] for r in rows[:3]], ["Bulk 0", "Bulk 1", "Bulk 2"])  # input order kept
+        self.assertTrue(all(r["id"].startswith("co_") and r["version"] == 1 and r["created_by"] == self.owner
+                            for r in rows))
+        self.assertEqual(self.store.count(self.ctx, "companies", {"name__ilike": "Bulk "}), 2500)
+        # Mixed change sets; an id from another workspace and a missing id are skipped, never written.
+        foreign = self.store.insert(self.other_ctx, "companies", {"name": "Theirs"})
+        changes = [(r["id"], {"city": "Tulsa"} if i % 2 else {"city": "Dallas", "industry": "Energy"})
+                   for i, r in enumerate(rows)] + [(foreign["id"], {"city": "Hacked"}), ("co_" + "0" * 32, {"city": "x"})]
+        updated = self.store.update_many(self.ctx, "companies", changes)
+        self.assertEqual(len(updated), 2500)
+        self.assertTrue(all(r["version"] == 2 for r in updated))
+        self.assertEqual(self.store.get(self.ctx, "companies", rows[0]["id"])["industry"], "Energy")
+        self.assertEqual(self.store.get(self.ctx, "companies", rows[1]["id"])["city"], "Tulsa")
+        self.assertEqual(self.store.get(self.other_ctx, "companies", foreign["id"]).get("city"), None)
+        self.assertEqual(self.store.insert_many(self.ctx, "companies", []), [])
+        self.assertEqual(self.store.update_many(self.ctx, "companies", []), [])
+
+    def test_bulk_writes_keep_validation_permissions_and_atomicity(self) -> None:
+        with self.assertRaises(ValidationError):
+            self.store.insert_many(self.ctx, "companies", [{"name": "ok"}, {"name": "x", "lifecycle": "bogus"}])
+        with self.assertRaises(ConflictError):  # a duplicate rolls back the whole batch
+            self.store.insert_many(self.ctx, "companies", [{"name": "A", "domain": "dup.com"},
+                                                           {"name": "B", "domain": "dup.com"}])
+        self.assertEqual(self.store.count(self.ctx, "companies", {"domain": "dup.com"}), 0)
+        row = self.store.insert(self.ctx, "companies", {"name": "Mine"})
+        viewer = str(uuid.uuid4())
+        self.store.add_member(self.ctx, viewer, "viewer")
+        viewer_ctx = Ctx(self.ws["id"], viewer, "viewer")
+        with self.assertRaises((ForbiddenError, ValidationError, Exception)):
+            self.store.insert_many(viewer_ctx, "companies", [{"name": "nope"}])
+        with self.assertRaises((ForbiddenError, ValidationError, Exception)):
+            self.store.update_many(viewer_ctx, "companies", [(row["id"], {"city": "nope"})])
+        self.assertIsNone(self.store.get(self.ctx, "companies", row["id"]).get("city"))
+
     def test_optimistic_concurrency(self) -> None:
         row = self.store.insert(self.ctx, "companies", {"name": "Foo"})
         self.store.update(self.ctx, "companies", row["id"], {"city": "Tulsa"}, expected_version=1)

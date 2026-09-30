@@ -246,3 +246,9 @@ test("Copy Valid Emails contains only final VALID rows, never Not Verified", asy
   assert.equal(notVerified, "unknown@x.com\ncatchall@x.com\nrole@x.com");
   assert.equal(emailsToText([" a@x.com ", "", "a@x.com", "b@x.com"]), "a@x.com\nb@x.com");
 });
+
+test("paste: leading, trailing and doubled dots in the local part are malformed", () => {
+  const p = parsePastedEmails("bad..dots@domain.com\n.lead@domain.com\ntrail.@domain.com\ngood.dots@domain.com");
+  assert.deepEqual(p.malformed, ["bad..dots@domain.com", ".lead@domain.com", "trail.@domain.com"]);
+  assert.deepEqual(p.emails, ["good.dots@domain.com"]);
+});

@@ -184,6 +184,31 @@ class MemoryStore(Store):
             self._table(spec)[row["id"]] = copy.deepcopy(row)
             return copy.deepcopy(row)
 
+    def _insert_many(self, ctx: Ctx, spec: EntitySpec, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """All-or-nothing, like the PostgreSQL transaction: a failing row restores the table."""
+        with self._lock:
+            table = self._table(spec)
+            before = dict(table)
+            try:
+                return [self._insert(ctx, spec, row) for row in rows]
+            except Exception:
+                table.clear()
+                table.update(before)
+                raise
+
+    def _update_many(self, ctx: Ctx, spec: EntitySpec, changes: List[Tuple[str, Dict[str, Any]]]
+                     ) -> List[Dict[str, Any]]:
+        with self._lock:
+            table = self._table(spec)
+            before = dict(table)  # _update replaces row dicts, so a shallow copy is a full snapshot
+            try:
+                return [row for row in (self._update(ctx, spec, row_id, values, None) for row_id, values in changes)
+                        if row is not None]
+            except Exception:
+                table.clear()
+                table.update(before)
+                raise
+
     def _visible(self, ctx: Ctx, spec: EntitySpec, row_id: str) -> Optional[Dict[str, Any]]:
         row = self._table(spec).get(row_id)
         if row is None or row["workspace_id"] != ctx.workspace_id:

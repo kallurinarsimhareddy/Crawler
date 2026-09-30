@@ -156,6 +156,82 @@ class PostgresStore(Store):
             result = conn.execute(query, [self._adapt(spec, n, row[n]) for n in names]).fetchone()
         return _plain(result)
 
+    #: Rows per pipelined ``executemany`` call inside one transaction.
+    BULK_CHUNK = 1000
+
+    def _insert_many(self, ctx: Ctx, spec: EntitySpec, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """One transaction, one permission check, and the same INSERT as :meth:`_insert`
+        sent through psycopg's pipeline (a few round trips per chunk instead of several
+        per row). RLS still applies to every row."""
+        from psycopg import sql
+
+        by_id: Dict[str, Dict[str, Any]] = {}
+        groups: Dict[Tuple[str, ...], List[Dict[str, Any]]] = {}
+        for row in rows:
+            groups.setdefault(tuple(row), []).append(row)
+        with self._tx(self._scope(ctx)) as conn:
+            if not ctx.system and not self._has_role(conn, ctx, write=True):
+                raise ForbiddenError("not a writer in this workspace")
+            for names, group in groups.items():
+                query = sql.SQL("insert into {} ({}) values ({}) returning *").format(
+                    self._table(spec), sql.SQL(", ").join(sql.Identifier(n) for n in names),
+                    sql.SQL(", ").join(sql.Placeholder() for _ in names))
+                with conn.cursor() as cur:
+                    for start in range(0, len(group), self.BULK_CHUNK):
+                        chunk = group[start:start + self.BULK_CHUNK]
+                        cur.executemany(query, [[self._adapt(spec, n, r[n]) for n in names] for r in chunk],
+                                        returning=True)
+                        while True:
+                            result = cur.fetchone()
+                            if result is not None:
+                                by_id[result["id"]] = _plain(result)
+                            if not cur.nextset():
+                                break
+        return [by_id[row["id"]] for row in rows if row["id"] in by_id]
+
+    def _update_many(self, ctx: Ctx, spec: EntitySpec, changes: List[Tuple[str, Dict[str, Any]]]
+                     ) -> List[Dict[str, Any]]:
+        """The same UPDATE as :meth:`_update` (workspace filter + RLS), pipelined in one
+        transaction, grouped by the set of changed columns."""
+        from psycopg import sql
+
+        out: List[Dict[str, Any]] = []
+        groups: Dict[Tuple[str, ...], List[Tuple[str, Dict[str, Any]]]] = {}
+        for row_id, values in changes:
+            groups.setdefault(tuple(values), []).append((row_id, values))
+        with self._tx(self._scope(ctx)) as conn:
+            if not ctx.system and not self._has_role(conn, ctx, write=True):
+                raise ForbiddenError("this workspace role is read-only")
+            for names, group in groups.items():
+                query = sql.SQL("update {} set {} where id = %s and workspace_id = %s returning *").format(
+                    self._table(spec), sql.SQL(", ").join(sql.SQL("{} = %s").format(sql.Identifier(n))
+                                                          for n in names))
+                with conn.cursor() as cur:
+                    for start in range(0, len(group), self.BULK_CHUNK):
+                        chunk = group[start:start + self.BULK_CHUNK]
+                        cur.executemany(query, [[self._adapt(spec, n, values[n]) for n in names]
+                                                + [row_id, ctx.workspace_id] for row_id, values in chunk],
+                                        returning=True)
+                        while True:
+                            result = cur.fetchone()
+                            if result is not None:
+                                out.append(_plain(result))
+                            if not cur.nextset():
+                                break
+        return out
+
+    def _delete_many(self, ctx: Ctx, spec: EntitySpec, row_ids: List[str]) -> int:
+        from psycopg import sql
+
+        query = sql.SQL("delete from {} where id = any(%s) and workspace_id = %s").format(self._table(spec))
+        deleted = 0
+        with self._tx(self._scope(ctx)) as conn:
+            if not ctx.system and not self._has_role(conn, ctx, write=True):
+                raise ForbiddenError("this workspace role is read-only")
+            for start in range(0, len(row_ids), 5000):
+                deleted += conn.execute(query, [row_ids[start:start + 5000], ctx.workspace_id]).rowcount
+        return deleted
+
     def _has_role(self, conn: Any, ctx: Ctx, *, write: bool) -> bool:
         role = conn.execute("select careercloud.member_role(%s::uuid) as role", [ctx.workspace_id]).fetchone()["role"]
         if role is None:

@@ -85,6 +85,8 @@ type Job = Row & {
     contact_columns?: ContactColumns;
     public_evidence?: boolean;
     smtp_preflight?: boolean;
+    /** Large uploads are read into the job by the background worker. */
+    ingest?: { state: "pending" | "done"; rows?: number };
   };
   task?: { status: string; progress?: Record<string, unknown>; error?: string | null } | null;
   error?: string | null;
@@ -432,6 +434,7 @@ function ColumnStep({ job, onChanged }: { job: Job; onChanged: () => void }) {
   const action = useAction();
   const candidates = job.settings.candidates ?? [];
   const contactColumns = Object.entries(job.settings.contact_columns ?? {});
+  const reading = job.settings.ingest?.state === "pending";
   return (
     <>
       <div className="card pad">
@@ -472,6 +475,11 @@ function ColumnStep({ job, onChanged }: { job: Job; onChanged: () => void }) {
       </div>
       <div className="card pad">
         <h3>2 · Checks</h3>
+        {reading && (
+          <p className="alert alert--info" role="status">
+            Reading the file in the background… {fmt(job.settings.ingest?.rows ?? job.row_count)} rows so far. You can choose the email column and options now; validation can start when reading has finished.
+          </p>
+        )}
         <ProviderPanel compact />
         <p className="muted small">{PIPELINE_NOTE}</p>
         <OptionsBox value={options} onChange={setOptions} contact={Boolean(job.settings.contact_mode)} />
@@ -481,13 +489,13 @@ function ColumnStep({ job, onChanged }: { job: Job; onChanged: () => void }) {
           <span className="field__hint">Cached results are free and are never paid for twice.</span>
         </label>
         <div className="form__actions">
-          <button type="button" className="button button--primary" disabled={!column || action.busy}
+          <button type="button" className="button button--primary" disabled={!column || action.busy || reading}
             onClick={() => action.run(async () => {
               if (column !== job.email_column) await client.post(`/email/jobs/${job.id}/column`, { column });
               await client.post(`/email/jobs/${job.id}/start`, { settings: { allow_paid: false, max_age_days: maxAge, ...options } });
               onChanged();
             })}>
-            Validate {fmt(job.row_count)} row{job.row_count === 1 ? "" : "s"}
+            {reading ? "Reading the file…" : `Validate ${fmt(job.row_count)} row${job.row_count === 1 ? "" : "s"}`}
           </button>
         </div>
         {action.error && <ErrorBanner error={action.error} />}
@@ -942,7 +950,8 @@ export function EmailValidationJob() {
   const [poll, setPoll] = useState<number | undefined>(undefined);
   const { data: job, error, refresh } = useLoad((signal) => client.get<Job>(`/email/jobs/${jobId}`, undefined, signal), client.base + jobId + tick, poll);
   const remove = useAction();
-  useEffect(() => setPoll(job && isActive(job.status) ? 2000 : undefined), [job?.status]);
+  const reading = job?.settings?.ingest?.state === "pending";
+  useEffect(() => setPoll(job && (isActive(job.status) || reading) ? 2000 : undefined), [job?.status, reading]);
   if (error) return <div className="page"><Link to="/email-validation" className="back">← Email Validation</Link><ErrorBanner error={error} onRetry={refresh} /></div>;
   if (!job) return <div className="page"><Loading /></div>;
   const changed = () => setTick((n) => n + 1);

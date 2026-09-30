@@ -83,13 +83,22 @@ class EmailValidationService:
         ctx.require_write()
         results: List[Dict[str, Any]] = []
         undecided: List[ValidationResult] = []
+        to_save: List[ValidationResult] = []
+        ordered: List[str] = []
         seen = set()
         for raw in emails:
             email = normalize_email(raw) or (raw or "").strip().lower()
             if not email or email in seen:
                 continue
             seen.add(email)
-            hit = self.cached(ctx, email, max_age_days=max_age_days) if normalize_email(email) else None
+            ordered.append(email)
+        # One cache read for the whole call instead of one per address.
+        existing = self._prefetch(ctx, [e for e in ordered if normalize_email(e)])
+        cutoff = utcnow() - timedelta(days=max_age_days)
+        for email in ordered:
+            hit = existing.get(email) if normalize_email(email) else None
+            if hit is not None and hit["validated_at"] < cutoff:
+                hit = None
             if hit is not None and not (allow_paid and is_unresolved(hit, paid_statuses)):
                 results.append(self._out(hit, cached=True))
                 continue
@@ -97,7 +106,7 @@ class EmailValidationService:
             if not local.decisive or (allow_paid and local.status in paid_statuses):
                 undecided.append(local)
             else:
-                results.append(self._save(ctx, local))
+                to_save.append(local)
 
         if undecided:
             provider = self._paid(ctx) if allow_paid else None
@@ -106,10 +115,62 @@ class EmailValidationService:
                           else "no paid validation provider is connected")
                 for result in undecided:
                     result.checks["paid_skipped"] = reason
-                    results.append(self._save(ctx, result))
+                to_save.extend(undecided)
             else:
                 results.extend(self._paid_checks(ctx, provider, undecided, task_id=task_id))
+        results.extend(self._save_many(ctx, to_save, existing))
         return results
+
+    def _prefetch(self, ctx: Ctx, emails: List[str]) -> Dict[str, Dict[str, Any]]:
+        """Existing ``email_validations`` rows for ``emails`` (any age), in chunks of 500."""
+        found: Dict[str, Dict[str, Any]] = {}
+        for offset in range(0, len(emails), 500):
+            chunk = emails[offset:offset + 500]
+            for row in self.store.all(ctx, "email_validations", {"email__in": chunk}, cap=len(chunk) * 2):
+                found[row["email"]] = row
+        return found
+
+    def _save_many(self, ctx: Ctx, results: List[ValidationResult], existing: Dict[str, Dict[str, Any]]
+                   ) -> List[Dict[str, Any]]:
+        """:meth:`_save` for many results: one bulk insert for new addresses, one bulk update
+        for known ones, one bulk contact update. Same stored values as :meth:`_save`."""
+        if not results:
+            return []
+        now = utcnow()
+        inserts: List[Dict[str, Any]] = []
+        updates: List[Any] = []
+        for result in results:
+            values = {"status": result.status, "score": result.score, "checks": result.checks,
+                      "provider": result.provider, "validated_at": now,
+                      "expires_at": now + timedelta(days=CACHE_DAYS), "raw": result.raw}
+            row = existing.get(result.email)
+            if row is None:
+                inserts.append({"email": result.email, **values})
+            else:
+                updates.append((row["id"], values))
+        try:
+            saved = self.store.insert_many(ctx, "email_validations", inserts) if inserts else []
+        except ConflictError:  # another run cached one of these first: the per-row path handles the race
+            return [self._save(ctx, result) for result in results]
+        saved += self.store.update_many(ctx, "email_validations", updates) if updates else []
+        missing = {r.email for r in results} - {row["email"] for row in saved}
+        extra = [self._save(ctx, r) for r in results if r.email in missing]  # rows deleted meanwhile
+        self._update_contacts_many(ctx, saved)
+        return [self._out(row, cached=False) for row in saved] + extra
+
+    def _update_contacts_many(self, ctx: Ctx, rows: List[Dict[str, Any]]) -> None:
+        by_email = {row["email"]: row for row in rows}
+        emails = list(by_email)
+        contacts: List[Dict[str, Any]] = []
+        for offset in range(0, len(emails), 500):
+            chunk = emails[offset:offset + 500]
+            contacts += self.store.all(ctx, "contacts", {"email__in": chunk}, cap=len(chunk) * 100)
+        if not contacts:
+            return
+        self.store.update_many(ctx, "contacts", [(c["id"], self._contact_values(by_email[c["email"]]))
+                                                 for c in contacts])
+        for contact in contacts:
+            self._emit_validated(ctx, contact, by_email[contact["email"]])
 
     def _paid_checks(self, ctx: Ctx, provider, undecided: List[ValidationResult], *, task_id: Optional[str]
                      ) -> List[Dict[str, Any]]:
@@ -184,19 +245,25 @@ class EmailValidationService:
         self._update_contacts(ctx, row)
         return self._out(row, cached=False)
 
+    @staticmethod
+    def _contact_values(row: Dict[str, Any]) -> Dict[str, Any]:
+        return {"email_status": row["status"], "email_score": row["score"], "email_validated_at": row["validated_at"],
+                "validation_status": "verified" if row["status"] == "VALID" else (
+                    "rejected" if row["status"] in ("INVALID", "DISPOSABLE") else "needs_verification")}
+
+    def _emit_validated(self, ctx: Ctx, contact: Dict[str, Any], row: Dict[str, Any]) -> None:
+        try:
+            self.platform.service("automation").emit(ctx, "email_validated", f"email:{row['email']}:{row['id']}"
+                                                     f":{row['version']}", {"contact_id": contact["id"],
+                                                                            "email": row["email"],
+                                                                            "status": row["status"]})
+        except Exception:  # noqa: BLE001 - emitting is best-effort
+            log.debug("email_validated emit skipped", exc_info=True)
+
     def _update_contacts(self, ctx: Ctx, row: Dict[str, Any]) -> None:
         for contact in self.store.all(ctx, "contacts", {"email": row["email"]}, cap=100):
-            self.store.update(ctx, "contacts", contact["id"], {
-                "email_status": row["status"], "email_score": row["score"], "email_validated_at": row["validated_at"],
-                "validation_status": "verified" if row["status"] == "VALID" else (
-                    "rejected" if row["status"] in ("INVALID", "DISPOSABLE") else "needs_verification")})
-            try:
-                self.platform.service("automation").emit(ctx, "email_validated", f"email:{row['email']}:{row['id']}"
-                                                         f":{row['version']}", {"contact_id": contact["id"],
-                                                                                "email": row["email"],
-                                                                                "status": row["status"]})
-            except Exception:  # noqa: BLE001 - emitting is best-effort
-                log.debug("email_validated emit skipped", exc_info=True)
+            self.store.update(ctx, "contacts", contact["id"], self._contact_values(row))
+            self._emit_validated(ctx, contact, row)
 
     def emails_for(self, ctx: Ctx, params: Dict[str, Any]) -> List[str]:
         """Resolve a task's target: explicit emails, contact ids, or a contacts list."""

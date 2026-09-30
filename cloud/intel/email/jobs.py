@@ -55,9 +55,15 @@ STATUSES = ("VALID", "INVALID", "RISKY", "UNKNOWN", "DISPOSABLE", "ROLE", "FREE_
 #: large file never has to be split by hand.
 MAX_ROWS = 1_000_000
 MAX_BYTES = 100 * 1024 * 1024
-#: Rows validated per worker step; progress is written at most every PROGRESS_SECONDS.
-BATCH = 200
+#: Rows validated per worker step (results are written back in one bulk update);
+#: progress is written at most every PROGRESS_SECONDS.
+BATCH = 500
 PROGRESS_SECONDS = 3.0
+#: Uploads larger than this are stored and read into the job by a background task, so
+#: the upload request itself stays short (it only reads the header and a sample).
+INLINE_INGEST_BYTES = 2 * 1024 * 1024
+#: Rows per bulk insert while reading a file into a job.
+INGEST_CHUNK = 1000
 PREVIEW_ROWS = 8
 #: Evidence cache lifetimes (days), per check type.
 EVIDENCE_TTL_DAYS = {"dns": 1, "smtp": 7, "public": 14, "catch_all": 30, "mailbox": 30}
@@ -214,17 +220,37 @@ class _EvidenceRun:
         self.finder = (engine.PublicEvidenceFinder(service.public_fetcher) if settings.get("public_evidence")
                        else None)
         self.memory: Dict[Tuple[str, str], Any] = {}
+        #: Cache writes buffered until the end of the batch: (subject hash, check type) -> row.
+        self.pending: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
     def _cached(self, check_type: str, subject: str) -> Any:
         key = (check_type, subject)
-        if key in self.memory:
+        if key in self.memory:  # misses are remembered too: one lookup per subject per run
             return self.memory[key]
         row = self.store.first(self.ctx, "email_check_cache",
                                {"subject_hash": engine.sha256(subject), "check_type": check_type})
         value = row["result"] if row is not None and row["expires_at"] > utcnow() else None
-        if value is not None:
-            self.memory[key] = value
+        self.memory[key] = value
         return value
+
+    def prime(self, domains: Iterable[str]) -> None:
+        """Load the cached domain checks (DNS, catch-all) for every new domain of a batch in one
+        query, so the per-row lookups hit memory."""
+        types = ("dns", "catch_all")
+        new = sorted({d for d in domains if d and any((t, d) not in self.memory for t in types)})
+        if not new:
+            return
+        by_hash = {engine.sha256(d): d for d in new}
+        now = utcnow()
+        for offset in range(0, len(new), 500):
+            hashes = list(by_hash)[offset:offset + 500]
+            for row in self.store.all(self.ctx, "email_check_cache",
+                                      {"subject_hash__in": hashes, "check_type__in": list(types)}, cap=len(hashes) * 2):
+                if row["expires_at"] > now:
+                    self.memory[(row["check_type"], by_hash[row["subject_hash"]])] = row["result"]
+        for domain in new:
+            for check_type in types:
+                self.memory.setdefault((check_type, domain), None)
 
     def remember(self, check_type: str, subject: str, kind: str, result: Any, *, source: str = "built-in",
                  provider: Optional[str] = None, ttl_type: Optional[str] = None) -> Any:
@@ -234,16 +260,37 @@ class _EvidenceRun:
         values = {"subject_hash": engine.sha256(subject), "subject_kind": kind, "check_type": check_type,
                   "result": result, "source": source, "provider": provider, "checked_at": now,
                   "expires_at": now + timedelta(days=EVIDENCE_TTL_DAYS[ttl_type or check_type])}
-        try:
-            existing = self.store.first(self.ctx, "email_check_cache",
-                                        {"subject_hash": values["subject_hash"], "check_type": check_type})
-            if existing is None:
-                self.store.insert(self.ctx, "email_check_cache", values)
-            else:
-                self.store.update(self.ctx, "email_check_cache", existing["id"], values)
-        except Exception:  # noqa: BLE001 - the cache is an optimisation; never fail a row over it
-            log.debug("evidence cache write skipped (%s)", check_type)
+        self.pending[(values["subject_hash"], check_type)] = values  # written in bulk by flush()
         return result
+
+    def flush(self) -> None:
+        """Write the buffered cache entries: one read for the existing ones, one bulk update,
+        one bulk insert. The cache is an optimisation, so a failure never fails the batch."""
+        if not self.pending:
+            return
+        pending, self.pending = self.pending, {}
+        try:
+            existing: Dict[Tuple[str, str], str] = {}
+            hashes = sorted({h for h, _ in pending})
+            for offset in range(0, len(hashes), 500):
+                for row in self.store.all(self.ctx, "email_check_cache",
+                                          {"subject_hash__in": hashes[offset:offset + 500]}, cap=5000):
+                    existing[(row["subject_hash"], row["check_type"])] = row["id"]
+            updates = [(existing[key], values) for key, values in pending.items() if key in existing]
+            inserts = [values for key, values in pending.items() if key not in existing]
+            if updates:
+                self.store.update_many(self.ctx, "email_check_cache", updates)
+            if inserts:
+                try:
+                    self.store.insert_many(self.ctx, "email_check_cache", inserts)
+                except ConflictError:  # a concurrent run wrote one first: fall back to one at a time
+                    for values in inserts:
+                        try:
+                            self.store.insert(self.ctx, "email_check_cache", values)
+                        except ConflictError:
+                            pass
+        except Exception:  # noqa: BLE001
+            log.debug("evidence cache write skipped")
 
     def domain(self, domain: str) -> Dict[str, Any]:
         cached = self._cached("dns", domain)
@@ -305,7 +352,7 @@ class EmailValidationJobService:
             batch.append({"job_id": job_id, "row_number": number, "row": row, "status": "PENDING",
                           "contact_id": (contact_ids or {}).get(number)})
             count += 1
-            if len(batch) >= 500:
+            if len(batch) >= INGEST_CHUNK:
                 self.store.insert_many(ctx, "email_validation_items", batch)
                 batch = []
         if batch:
@@ -329,13 +376,17 @@ class EmailValidationJobService:
             raise ValidationError("the file is empty")
         if len(data) > MAX_BYTES:
             raise ValidationError(f"the file is larger than {MAX_BYTES // (1024 * 1024)} MB; split it")
+        background = len(data) > INLINE_INGEST_BYTES
         try:
-            parsed = parse_file(filename, data, max_rows=MAX_ROWS)  # streams: header, count, problems
+            # A large file is only sampled here (header + first rows); the worker reads the rest.
+            parsed = parse_file(filename, data, max_rows=200 if background else MAX_ROWS)
             sample = []
             for pair in iter_rows(fmt, data, max_rows=200):
                 sample.append(pair)
         except ParseError as error:
             raise ValidationError(str(error)) from None
+        if background:
+            parsed.problems = [p for p in parsed.problems if not p.startswith("more than")]
         if not parsed.columns:
             raise ValidationError("; ".join(parsed.problems) or "the file has no header row")
         if not sample:
@@ -354,13 +405,110 @@ class EmailValidationJobService:
                          "truncated": any("more than" in p for p in parsed.problems),
                          "contact_columns": contact_columns, "contact_mode": _contact_mode(contact_columns)},
             "counts": {"total": 0, "processed": 0}})
-        # Streamed straight into the job in chunks of 500: the file is never held as a list of rows.
+        if background:
+            job = self._queue_ingest(ctx, job, filename, fmt, data)
+            audit(self.store, ctx, "email_validation.upload", entity_type="email_validation_jobs", entity_id=job["id"],
+                  summary=f"{filename}: reading in the background",
+                  changes={"size_bytes": len(data), "email_column": chosen})
+            return job
+        # Small file: streamed straight into the job in bulk chunks; the file is never a list of rows.
         total = self._insert_items(ctx, job["id"], iter_rows(fmt, data, max_rows=MAX_ROWS))
         job = self.store.update(ctx, "email_validation_jobs", job["id"], {
             "row_count": total, "counts": {"total": total, "processed": 0}})
         audit(self.store, ctx, "email_validation.upload", entity_type="email_validation_jobs", entity_id=job["id"],
               summary=f"{filename}: {total} row(s)", changes={"size_bytes": len(data), "email_column": chosen})
         return job
+
+    # --- background ingest (large uploads) -------------------------------------------------
+
+    def _ingest_key(self, ctx: Ctx, job_id: str, fmt: str) -> str:
+        return f"email-validation/{ctx.workspace_id}/{job_id}/upload.{fmt}"
+
+    def _queue_ingest(self, ctx: Ctx, job: Mapping[str, Any], filename: str, fmt: str, data: bytes
+                      ) -> Dict[str, Any]:
+        import tempfile
+        from pathlib import Path
+
+        key = self._ingest_key(ctx, job["id"], fmt)
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / "upload"
+            path.write_bytes(data)
+            self.platform.storage.put_file(key, path, content_type="application/octet-stream")
+        task = self.platform.tasks.submit(ctx, "email_validation_job", {"job_id": job["id"], "phase": "ingest"},
+                                          entity_type="email_validation_jobs", entity_id=job["id"])
+        return self.store.update(ctx, "email_validation_jobs", job["id"], {"settings": {
+            **(job.get("settings") or {}),
+            "ingest": {"state": "pending", "task_id": task["id"], "storage_key": key, "format": fmt, "rows": 0}}})
+
+    def _ingest(self, ctx: Ctx, task: Mapping[str, Any], reporter: Any) -> Dict[str, Any]:
+        """Read a stored upload into the job in bulk chunks. Resumable: rows already in the
+        job (a paused or interrupted run) are skipped by row number. Memory stays bounded:
+        rows are streamed and inserted INGEST_CHUNK at a time."""
+        from cloud.intel.imports.parse import ParseError, iter_rows
+        from cloud.intel.tasks.worker import TaskPaused
+
+        job_id = task["params"]["job_id"]
+        job = self.store.get(ctx, "email_validation_jobs", job_id)
+        settings = dict(job.get("settings") or {})
+        ingest = dict(settings.get("ingest") or {})
+        if ingest.get("state") != "pending":
+            return {"job_id": job_id, "ingest": ingest.get("state") or "none"}
+        key = ingest["storage_key"]
+        if not self.platform.storage.exists(key):
+            raise ValidationError("the uploaded file is no longer stored; upload it again")
+        with self.platform.storage.open(key) as handle:
+            data = handle.read()
+        last = self.store.list(ctx, "email_validation_items", {"job_id": job_id}, order="-row_number", limit=1).rows
+        done_through = last[0]["row_number"] if last else 0
+        total = done_through
+        chunk: List[Dict[str, Any]] = []
+        last_progress = time.monotonic()
+
+        def flush() -> None:
+            nonlocal chunk
+            if chunk:
+                self.store.insert_many(ctx, "email_validation_items", chunk)
+                chunk = []
+
+        truncated = False
+        try:
+            for number, row in iter_rows(ingest.get("format") or job.get("format") or "csv", data,
+                                         max_rows=MAX_ROWS + 1):
+                if number > MAX_ROWS:
+                    truncated = True
+                    break
+                if number <= done_through:
+                    continue
+                chunk.append({"job_id": job_id, "row_number": number, "row": row, "status": "PENDING"})
+                total = number
+                if len(chunk) >= INGEST_CHUNK:
+                    flush()
+                    if reporter.is_cancelled():
+                        break
+                    if reporter.should_pause():
+                        raise TaskPaused({"rows": total})
+                    if time.monotonic() - last_progress >= PROGRESS_SECONDS:
+                        last_progress = time.monotonic()
+                        self.store.update(ctx, "email_validation_jobs", job_id, {
+                            "row_count": total, "settings": {**settings, "ingest": {**ingest, "rows": total}}})
+                        reporter.progress(f"read {total} rows", done=total)
+            flush()
+        except ParseError as error:
+            flush()
+            raise ValidationError(f"the file could not be read: {error}") from None
+        del data
+        problems = list(settings.get("problems") or [])
+        if truncated:
+            problems.append(f"more than {MAX_ROWS:,} rows; only the first {MAX_ROWS:,} are validated")
+        settings.update(problems=problems, truncated=truncated or bool(settings.get("truncated")),
+                        ingest={**ingest, "state": "done", "rows": total})
+        self.store.update(ctx, "email_validation_jobs", job_id, {
+            "row_count": total, "counts": {"total": total, "processed": 0}, "settings": settings})
+        try:
+            self.platform.storage.delete(key)  # the rows now live in the job
+        except Exception:  # noqa: BLE001 - cleanup is best-effort
+            log.debug("could not remove the ingested upload")
+        return {"job_id": job_id, "ingest": "done", "rows": total}
 
     def create_from_rows(self, ctx: Ctx, *, name: str, rows: Sequence[Mapping[str, Any]], email_field: str,
                          source_type: str = "scrape", source_id: Optional[str] = None, start: bool = False,
@@ -454,6 +602,8 @@ class EmailValidationJobService:
     def start(self, ctx: Ctx, job_id: str, *, settings: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
         ctx.require_write()
         job = self.store.get(ctx, "email_validation_jobs", job_id)
+        if ((job.get("settings") or {}).get("ingest") or {}).get("state") == "pending":
+            raise ConflictError("the file is still being read; start the validation when it has finished")
         if job["status"] != "ready":
             if job["status"] == "uploaded":
                 raise ValidationError("choose the email column first")
@@ -520,12 +670,23 @@ class EmailValidationJobService:
         job = self.store.get(ctx, "email_validation_jobs", job_id)
         if job["status"] in ("queued", "running"):
             raise ConflictError("cancel the job before deleting it")
-        while True:
+        ingest = (job.get("settings") or {}).get("ingest") or {}
+        if ingest.get("state") == "pending":  # stop reading the file and drop the stored upload
+            try:
+                task = self.platform.tasks.get(ctx, ingest["task_id"])
+                if task["status"] not in ("completed", "failed", "cancelled"):
+                    self.platform.tasks.cancel(ctx, ingest["task_id"])
+            except Exception:  # noqa: BLE001 - the task may already be gone
+                log.debug("ingest task cancel skipped")
+            try:
+                self.platform.storage.delete(ingest["storage_key"])
+            except Exception:  # noqa: BLE001
+                log.debug("stored upload already removed")
+        while True:  # one bulk delete per page instead of one transaction per row
             rows = self.store.list(ctx, "email_validation_items", {"job_id": job_id}, limit=500).rows
             if not rows:
                 break
-            for row in rows:
-                self.store.delete(ctx, "email_validation_items", row["id"])
+            self.store.delete_many(ctx, "email_validation_items", [row["id"] for row in rows])
         self.store.delete(ctx, "email_validation_jobs", job_id)
         audit(self.store, ctx, "email_validation.delete", entity_type="email_validation_jobs", entity_id=job_id,
               summary=job["name"])
@@ -775,6 +936,8 @@ class EmailValidationJobService:
     def run(self, ctx: Ctx, task: Mapping[str, Any], reporter: Any) -> Dict[str, Any]:
         from cloud.intel.tasks.worker import TaskPaused
 
+        if (task.get("params") or {}).get("phase") == "ingest":
+            return self._ingest(ctx, task, reporter)
         job_id = task["params"]["job_id"]
         job = self.store.get(ctx, "email_validation_jobs", job_id)
         if job["status"] == "cancelled":
@@ -847,7 +1010,9 @@ class EmailValidationJobService:
         if lookup:  # one query per batch rather than one per row
             for contact in self.store.all(ctx, "contacts", {"email__in": lookup}, cap=len(lookup) * 2):
                 known_contacts.setdefault(contact["email"], contact["id"])
+        evidence.prime(_key(e).rpartition("@")[2] for e in wanted if "@" in e)  # one cache read per batch
         now = utcnow()
+        writes: List[Tuple[str, Dict[str, Any]]] = []
         for item in batch:
             raw = emails[item["id"]]
             if not raw:
@@ -875,7 +1040,11 @@ class EmailValidationJobService:
                 changes["domain"] = (domain or None) and domain[:253]
                 if not item.get("contact_id") and key in known_contacts:
                     changes["contact_id"] = known_contacts[key]
-            self.store.update(ctx, "email_validation_items", item["id"], changes)
+            writes.append((item["id"], changes))
+        # One transaction for the whole batch; a crash before it leaves the rows PENDING, so a
+        # resumed run simply validates them again (results are cached, nothing is paid twice).
+        self.store.update_many(ctx, "email_validation_items", writes)
+        evidence.flush()
 
     def _add_evidence(self, changes: Dict[str, Any], original: str, email: str, row: Mapping[str, Any],
                       settings: Mapping[str, Any], evidence: _EvidenceRun, *, fresh: bool) -> None:

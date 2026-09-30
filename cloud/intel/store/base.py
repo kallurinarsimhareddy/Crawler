@@ -234,7 +234,52 @@ class Store(ABC):
         return self._insert(ctx, spec, row)
 
     def insert_many(self, ctx: Ctx, entity: str, rows: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-        return [self.insert(ctx, entity, row) for row in rows]
+        """Insert many rows with the same checks as :meth:`insert`, in one transaction where
+        the backend supports it (PostgreSQL: one permission check, pipelined statements).
+        All-or-nothing: a failing row rolls back the whole call."""
+        spec = get_spec(entity)
+        self._check_write(ctx, spec, "insert")
+        now = utcnow()
+        built = [{"id": new_id(spec.prefix), "workspace_id": ctx.workspace_id, "created_at": now, "updated_at": now,
+                  "created_by": ctx.user_id, "version": 1, **clean_values(spec, values, for_insert=True)}
+                 for values in rows]
+        return self._insert_many(ctx, spec, built) if built else []
+
+    def update_many(self, ctx: Ctx, entity: str, changes: Sequence[Tuple[str, Mapping[str, Any]]]
+                    ) -> List[Dict[str, Any]]:
+        """Apply ``(row_id, changes)`` pairs with the same checks as :meth:`update`, in one
+        transaction where the backend supports it. Returns the updated rows; ids that do
+        not exist in this workspace are skipped (not an error), so a caller can compare
+        counts. All-or-nothing on a database error."""
+        spec = get_spec(entity)
+        self._check_write(ctx, spec, "update")
+        cleaned = [(row_id, clean_values(spec, values, for_insert=False)) for row_id, values in changes]
+        cleaned = [(row_id, values) for row_id, values in cleaned if values]
+        return self._update_many(ctx, spec, cleaned) if cleaned else []
+
+    def delete_many(self, ctx: Ctx, entity: str, row_ids: Sequence[str]) -> int:
+        """Delete rows by id with the same checks as :meth:`delete`; ids outside this workspace
+        or already gone are skipped. Returns how many rows were deleted."""
+        spec = get_spec(entity)
+        self._check_write(ctx, spec, "delete")
+        ids = [row_id for row_id in dict.fromkeys(row_ids) if row_id]
+        return self._delete_many(ctx, spec, ids) if ids else 0
+
+    def _delete_many(self, ctx: Ctx, spec: EntitySpec, row_ids: List[str]) -> int:
+        return sum(1 for row_id in row_ids if self._delete(ctx, spec, row_id))
+
+    # Backends override these two for speed; the defaults keep per-row semantics.
+    def _insert_many(self, ctx: Ctx, spec: EntitySpec, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [self._insert(ctx, spec, row) for row in rows]
+
+    def _update_many(self, ctx: Ctx, spec: EntitySpec, changes: List[Tuple[str, Dict[str, Any]]]
+                     ) -> List[Dict[str, Any]]:
+        out = []
+        for row_id, values in changes:
+            row = self._update(ctx, spec, row_id, values, None)
+            if row is not None:
+                out.append(row)
+        return out
 
     def update(self, ctx: Ctx, entity: str, row_id: str, changes: Mapping[str, Any], *,
                expected_version: Optional[int] = None) -> Dict[str, Any]:
