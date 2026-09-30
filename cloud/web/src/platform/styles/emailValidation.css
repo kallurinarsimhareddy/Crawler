@@ -40,7 +40,18 @@ th.ev-col--chosen, td.ev-col--chosen { background: var(--accent-soft); font-weig
 .ev-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 16px; }
 .ev-actions > div { display: flex; flex-direction: column; gap: 6px; align-items: stretch; }
 .ev-actions .button { align-self: flex-start; }
+.ev-paste { margin-bottom: 16px; }
+.ev-paste h3 { margin-top: 0; }
+.ev-paste__text { display: block; width: 100%; max-width: 100%; box-sizing: border-box; min-height: 160px; resize: vertical; font-family: var(--font-mono, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 13px; line-height: 1.5; margin: 8px 0 12px; }
+.ev-paste__stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; margin-bottom: 8px; }
+.ev-paste__bad { overflow-wrap: anywhere; }
+.ev-copy { display: flex; flex-wrap: wrap; gap: 8px; padding: 8px 12px 0; }
+.ev-copy__note { padding: 4px 12px 0; margin: 0; }
+.ev-select { width: 32px; }
 @media (max-width: 640px) {
   .ev-results__head { padding: 8px; }
   .ev-date { flex: 1 1 100%; }
+  .ev-copy { padding: 8px 8px 0; }
+  .ev-copy .button { flex: 1 1 100%; justify-content: center; }
+  .ev-paste__stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }

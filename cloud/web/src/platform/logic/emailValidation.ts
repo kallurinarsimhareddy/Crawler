@@ -135,3 +135,118 @@ export function initialColumn(saved: string | null | undefined, candidates: Cand
 export function isActive(status: string): boolean {
   return status === "queued" || status === "running";
 }
+
+// --- pasted emails ------------------------------------------------------------------------
+
+/** Same row cap as the server's file upload (MAX_ROWS in cloud/intel/email/jobs.py). */
+export const MAX_PASTED = 50_000;
+
+// A deliberately loose shape check that only catches obviously broken entries; the server's
+// syntax/MX/disposable/role checks (and EmailListVerify) still decide every address.
+const EMAIL_SHAPE = /^[^\s@<>(),;:"[\]\\]+@[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*\.[a-z]{2,}$/;
+
+export interface PastedEmails {
+  /** Non-empty entries found in the text, duplicates included. */
+  total: number;
+  /** Distinct entries after lower-casing. */
+  unique: number;
+  /** Entries dropped because they repeat an earlier one. */
+  duplicates: number;
+  /** Distinct entries that cannot be an email address (not sent for validation). */
+  malformed: string[];
+  /** Distinct, well-formed addresses in paste order, capped at MAX_PASTED. */
+  emails: string[];
+  /** Well-formed addresses left out because of the cap. */
+  overLimit: number;
+}
+
+/** Clean one pasted token: trim, drop wrapping quotes/brackets and mailto:, lower-case. */
+function cleanToken(token: string): string {
+  let t = token.trim().replace(/^["'<(\[]+|["'>)\].]+$/g, "");
+  if (/^mailto:/i.test(t)) t = t.slice(7);
+  return t.trim().toLowerCase();
+}
+
+/** Split pasted text on newlines, commas, semicolons, tabs and spaces; normalize and de-duplicate. */
+export function parsePastedEmails(text: string, max: number = MAX_PASTED): PastedEmails {
+  const seen = new Set<string>();
+  const malformed: string[] = [];
+  const emails: string[] = [];
+  let total = 0;
+  let overLimit = 0;
+  for (const raw of (text ?? "").split(/[\s,;]+/)) {
+    const token = cleanToken(raw);
+    if (!token) continue;
+    total += 1;
+    if (seen.has(token)) continue;
+    seen.add(token);
+    if (!EMAIL_SHAPE.test(token)) malformed.push(token);
+    else if (emails.length < max) emails.push(token);
+    else overLimit += 1;
+  }
+  return { total, unique: seen.size, duplicates: total - seen.size, malformed, emails, overLimit };
+}
+
+/** The rows POST /email/jobs {source: "rows"} expects: one {email} object per address. */
+export function pastedRows(parsed: PastedEmails): { email: string }[] {
+  return parsed.emails.map((email) => ({ email }));
+}
+
+/**
+ * Worst-case EmailListVerify credits: only addresses the built-in checks cannot decide (and
+ * that are not cached) are sent, so the real spend is usually lower. Zero when paid checks are off.
+ */
+export function estimatedCredits(count: number, costPerCheck: number | null | undefined, paid: boolean): number {
+  if (!paid || count <= 0) return 0;
+  return Math.ceil(count * (costPerCheck ?? 1));
+}
+
+/** Clipboard text: one address per line, blanks and repeats dropped. */
+export function emailsToText(emails: Iterable<string | null | undefined>): string {
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const e of emails) {
+    const v = (e ?? "").trim();
+    if (v && !seen.has(v)) {
+      seen.add(v);
+      out.push(v);
+    }
+  }
+  return out.join("\n");
+}
+
+export interface CopyGroup {
+  key: string;
+  label: string;
+  statuses: string[];
+}
+
+export const COPY_GROUPS: CopyGroup[] = [
+  { key: "valid", label: "Copy Valid Emails", statuses: ["VALID"] },
+  { key: "invalid", label: "Copy Invalid Emails", statuses: ["INVALID"] },
+  { key: "risky", label: "Copy Risky Emails", statuses: ["RISKY"] },
+];
+
+type ItemPage = { items: object[]; has_more?: boolean };
+
+/**
+ * Every result email with one of `statuses`, read page by page through the same items
+ * endpoint the table uses (`fetchPage` receives its query), newline-joined for the clipboard.
+ */
+export async function collectEmails(
+  fetchPage: (query: Record<string, string | number>) => Promise<ItemPage>,
+  statuses: string[],
+  pageSize = 500,
+): Promise<string> {
+  const found: string[] = [];
+  const tab: ResultTab = { key: "copy", label: "copy", statuses };
+  for (let offset = 0; ; offset += pageSize) {
+    const page = await fetchPage(itemQuery(tab, {}, pageSize, offset));
+    for (const item of page.items) {
+      const email = (item as { email?: unknown }).email;
+      if (typeof email === "string") found.push(email);
+    }
+    if (!page.has_more || page.items.length === 0) break;
+  }
+  return emailsToText(found);
+}

@@ -354,6 +354,45 @@ class EmailJobApiTests(unittest.TestCase):
         self.assertEqual(self.client.post(f"{self.base}/email/jobs/{job['id']}/bogus").status_code, 404)
         self.assertEqual(self.client.delete(f"{self.base}/email/jobs/{job['id']}").status_code, 204)
 
+    def test_pasted_emails_use_the_same_job_pipeline(self) -> None:
+        """The dashboard's Paste Emails box posts the parsed addresses as a rows job (source_type
+        "manual", start=True); it must behave exactly like an uploaded file's job."""
+        pasted = ["ann.test@acme-test.example", "info@acme-test.example", "x@mailinator.com", "bob@nomx.example",
+                  "free.user@gmail.com"]
+        body = {"source": "rows", "source_type": "manual", "email_field": "email", "name": "Pasted emails (5)",
+                "rows": [{"email": e} for e in pasted], "start": True}
+        contacts_before = self.client.get(self.base + "/contacts").json()["total"]
+        # Paid checks need a configured AND verified EmailListVerify, exactly as for uploads.
+        r = self.client.post(self.base + "/email/jobs", json={**body, "settings": {"allow_paid": True}})
+        self.assertEqual(r.status_code, 422, r.text)
+        r = self.client.post(self.base + "/email/jobs", json={**body, "settings": {"allow_paid": False,
+                                                                                   "max_age_days": 30}})
+        self.assertEqual(r.status_code, 201, r.text)
+        job = r.json()
+        self.assertEqual((job["source_type"], job["email_column"], job["row_count"], job["status"]),
+                         ("manual", "email", 5, "queued"))
+        done = run_task_inline(self.platform, self.ws, job["task_id"])
+        self.assertEqual(done["status"], "completed")
+        job = self.client.get(f"{self.base}/email/jobs/{job['id']}").json()
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["counts"]["processed"], 5)
+        self.assertEqual([job["counts"].get(s) for s in ("INVALID", "ROLE", "DISPOSABLE", "FREE_PROVIDER", "UNKNOWN")],
+                         [1, 1, 1, 1, 1])
+        items = self.client.get(f"{self.base}/email/jobs/{job['id']}/items", params={"limit": 500}).json()["items"]
+        self.assertEqual(sorted(i["email"] for i in items), sorted(pasted))
+        invalid = self.client.get(f"{self.base}/email/jobs/{job['id']}/items", params={"status": "INVALID"}).json()
+        self.assertEqual([i["email"] for i in invalid["items"]], ["bob@nomx.example"])
+        for fmt in ("csv", "xlsx"):
+            r = self.client.get(f"{self.base}/email/jobs/{job['id']}/export", params={"format": fmt})
+            self.assertEqual(r.status_code, 200, fmt)
+            self.assertIn("attachment", r.headers["content-disposition"])
+        # Validation never touches the CRM on its own.
+        self.assertEqual(self.client.get(self.base + "/contacts").json()["total"], contacts_before)
+        # The file upload path still works alongside it.
+        r = self.client.post(self.base + "/email/jobs/upload", files={"files": ("leads.csv", SAMPLE, "text/csv")})
+        self.assertEqual(r.status_code, 201, r.text)
+        self.assertEqual(r.json()["email_column"], "Work Email")
+
     def test_bad_uploads_are_422(self) -> None:
         r = self.client.post(self.base + "/email/jobs/upload", files={"files": ("x.pdf", b"%PDF", "application/pdf")})
         self.assertEqual(r.status_code, 422)

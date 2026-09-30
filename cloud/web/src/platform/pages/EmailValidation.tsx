@@ -1,20 +1,28 @@
-// Email Validation: upload a CSV/XLSX (or validate a contact list), pick the email
-// column, run the built-in checks (plus EmailListVerify only when it is configured
-// AND verified), watch progress, filter results, export, and — only on request —
-// add the results to a list, a draft campaign or a sequence (pending approval).
+// Email Validation: paste addresses (or upload a CSV/XLSX, or validate a contact list),
+// run the built-in checks (plus EmailListVerify only when it is configured AND verified),
+// watch progress, filter results, export or copy them, and — only on request — add the
+// results to a list, a draft campaign or a sequence (pending approval). Pasted addresses
+// become an ordinary rows job, so every input goes through the same job pipeline.
 
-import { useEffect, useRef, useState, type DragEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type DragEvent, type ReactNode } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { EmptyState, ErrorBanner, Loading } from "../../components/Feedback";
 import { Icon } from "../../shell/Icon";
 import type { PageOf, Row } from "../api";
 import { fileSize } from "../logic/format";
 import {
+  COPY_GROUPS,
+  MAX_PASTED,
   RESULT_TABS,
+  collectEmails,
+  emailsToText,
+  estimatedCredits,
   exportPath,
   initialColumn,
   isActive,
   itemQuery,
+  parsePastedEmails,
+  pastedRows,
   progressPercent,
   providerState,
   reasonFor,
@@ -128,7 +136,106 @@ function ProviderPanel({ compact = false }: { compact?: boolean }) {
   );
 }
 
-// --- landing: upload, list validation, history -----------------------------------------
+/** Copy text to the clipboard; falls back to a hidden textarea where the async API is missing. */
+async function copyText(text: string): Promise<void> {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text);
+    return;
+  }
+  const area = document.createElement("textarea");
+  area.value = text;
+  area.setAttribute("readonly", "");
+  area.style.position = "fixed";
+  area.style.opacity = "0";
+  document.body.appendChild(area);
+  area.select();
+  const ok = document.execCommand("copy");
+  area.remove();
+  if (!ok) throw new Error("The browser blocked clipboard access.");
+}
+
+const plural = (n: number, what = "email") => `${fmt(n)} ${what}${n === 1 ? "" : what.endsWith("s") ? "es" : "s"}`;
+
+// --- landing: paste, upload, list validation, history ----------------------------------
+
+function PastePanel() {
+  const client = useWs();
+  const navigate = useNavigate();
+  const provider = useLoad((signal) => client.get<ProviderStatus>("/email/provider", undefined, signal), client.base + "/email/provider/paste");
+  const [text, setText] = useState("");
+  const [allowPaid, setAllowPaid] = useState(false);
+  const action = useAction();
+  const parsed = useMemo(() => parsePastedEmails(text), [text]);
+  const elv = provider.data?.emaillistverify;
+  const paidActive = providerState(elv).active;
+  const paid = allowPaid && paidActive;
+  const toValidate = parsed.emails.length;
+  const credits = estimatedCredits(toValidate, elv?.cost_per_check, paid);
+  return (
+    <div className="card pad ev-paste">
+      <h3>Paste emails</h3>
+      <p className="muted small">One per line, or separated by commas, semicolons, spaces or tabs. Duplicates are removed and addresses are lower-cased before checking.</p>
+      <textarea
+        className="input ev-paste__text"
+        rows={8}
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        placeholder="Paste email addresses here, one per line..."
+        aria-label="Email addresses to validate"
+        spellCheck={false}
+        autoComplete="off"
+      />
+      {parsed.total > 0 && (
+        <>
+          <div className="stats stats--wrap ev-paste__stats" aria-live="polite">
+            <Stat label="Pasted" value={fmt(parsed.total)} />
+            <Stat label="Unique" value={fmt(parsed.unique)} />
+            <Stat label="Duplicates" value={fmt(parsed.duplicates)} hint="removed" />
+            <Stat label="Invalid format" value={fmt(parsed.malformed.length)} hint="not sent" />
+            <Stat label="To validate" value={fmt(toValidate)} />
+            <Stat label="Est. credits" value={fmt(credits)} hint={paid ? "at most; built-in checks decide many" : "built-in checks only"} />
+          </div>
+          {parsed.malformed.length > 0 && (
+            <p className="muted small ev-paste__bad">
+              Invalid format: <span className="mono">{parsed.malformed.slice(0, 8).join(", ")}</span>
+              {parsed.malformed.length > 8 && ` and ${fmt(parsed.malformed.length - 8)} more`}
+            </p>
+          )}
+          {parsed.overLimit > 0 && (
+            <p className="alert alert--warning">Only the first {fmt(MAX_PASTED)} addresses are validated; {plural(parsed.overLimit, "address")} left out. Upload a file or split the list.</p>
+          )}
+        </>
+      )}
+      <label className="check ev-paid">
+        <input type="checkbox" checked={paid} disabled={!paidActive} onChange={(e) => setAllowPaid(e.target.checked)} />
+        <span>
+          Use EmailListVerify for addresses the built-in checks cannot decide
+          {!paidActive && <span className="muted small"> — unavailable: the provider is not configured and verified</span>}
+          {paidActive && <span className="muted small"> — spends about {elv?.cost_per_check ?? 1} credit per undecided address</span>}
+        </span>
+      </label>
+      <div className="actions">
+        <button type="button" className="button button--primary" disabled={toValidate === 0 || action.busy}
+          onClick={() => action.run(async () => {
+            const job = await client.post<Job>("/email/jobs", {
+              source: "rows",
+              source_type: "manual",
+              email_field: "email",
+              name: `Pasted emails (${fmt(toValidate)})`,
+              rows: pastedRows(parsed),
+              start: true,
+              settings: { allow_paid: paid, max_age_days: 30 },
+            });
+            navigate(`/email-validation/${job.id}`);
+          })}>
+          {action.busy ? "Starting…" : "Validate Emails"}
+        </button>
+        {text && <button type="button" className="button button--ghost" disabled={action.busy} onClick={() => setText("")}>Clear</button>}
+      </div>
+      {action.error && <ErrorBanner error={action.error} />}
+    </div>
+  );
+}
 
 function Dropzone({ onFile, busy }: { onFile: (file: File) => void; busy: boolean }) {
   const [over, setOver] = useState(false);
@@ -202,9 +309,11 @@ export function EmailValidation() {
   return (
     <div className="page">
       <PageHeader title="Email Validation" subtitle="Check addresses before they reach a campaign: syntax, domain/MX, disposable, role and free-provider checks, plus EmailListVerify when it is connected and verified. Nothing is ever sent." />
+      <PastePanel />
       <div className="grid-2">
         <div className="card pad">
           <h3>Upload a file</h3>
+          <p className="muted small">For large lists, or spreadsheets with more columns to keep in the export.</p>
           <Dropzone busy={upload.busy} onFile={(file) => upload.run(async () => {
             const job = await client.upload<Job>("/email/jobs/upload", [file], { name: file.name });
             navigate(`/email-validation/${job.id}`);
@@ -228,7 +337,7 @@ export function EmailValidation() {
           { key: "counts", label: "Valid / Invalid / Unknown", render: (r) => { const c = (r.counts ?? {}) as Counts; return <span className="tabular">{fmt(c.VALID ?? 0)} / {fmt(c.INVALID ?? 0)} / {fmt(c.UNKNOWN ?? 0)}</span>; } },
           { key: "created_at", label: "Created", render: (r) => fmtDate(r.created_at) },
         ]}
-        empty={{ title: "No validation jobs yet", description: "Upload a CSV or XLSX file, or validate a contact list, to see results here.", icon: "mailcheck" }}
+        empty={{ title: "No validation jobs yet", description: "Paste addresses, upload a CSV or XLSX file, or validate a contact list, to see results here.", icon: "mailcheck" }}
       />
     </div>
   );
@@ -364,8 +473,36 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
   const query = itemQuery(tab, filters, pageSize, offset);
   const items = useLoad((signal) => client.list<Row>(`/email/jobs/${job.id}/items`, query, signal), JSON.stringify(query) + job.id + reloadKey);
   const download = useAction();
+  const copy = useAction();
+  const [copied, setCopied] = useState<string | null>(null);
+  const [selected, setSelected] = useState<Map<string, string>>(() => new Map());
   useEffect(() => setOffset(0), [tabKey, JSON.stringify(filters)]);
   const page = items.data as PageOf<Row> | null;
+  const emailOf = (r: Row) => String(r.email ?? (r.row as Record<string, unknown>)?.[job.email_column ?? "email"] ?? "").trim();
+  const pageRows = (page?.items ?? []).filter((r) => emailOf(r));
+  const allOnPage = pageRows.length > 0 && pageRows.every((r) => selected.has(String(r.id)));
+  const toggle = (r: Row) => setSelected((cur) => {
+    const next = new Map(cur);
+    if (next.has(String(r.id))) next.delete(String(r.id));
+    else next.set(String(r.id), emailOf(r));
+    return next;
+  });
+  const togglePage = () => setSelected((cur) => {
+    const next = new Map(cur);
+    for (const r of pageRows) {
+      if (allOnPage) next.delete(String(r.id));
+      else next.set(String(r.id), emailOf(r));
+    }
+    return next;
+  });
+  const copyOut = (label: string, make: () => Promise<string>) => copy.run(async () => {
+    setCopied(null);
+    const text = await make();
+    const count = text ? text.split("\n").length : 0;
+    if (count) await copyText(text);
+    setCopied(count ? `${label}: ${plural(count)} copied to the clipboard.` : `${label}: nothing to copy.`);
+  });
+  const groupCount = (statuses: string[]) => statuses.reduce((sum, s) => sum + (job.counts[s] ?? 0), 0);
   return (
     <div className="card">
       <div className="ev-results__head">
@@ -379,6 +516,22 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
           </button>
         </div>
       </div>
+      <div className="ev-copy" role="group" aria-label="Copy email addresses">
+        {COPY_GROUPS.map((g) => (
+          <button key={g.key} type="button" className={`button button--small ${g.key === "valid" ? "button--primary" : "button--ghost"}`}
+            disabled={copy.busy || groupCount(g.statuses) === 0}
+            onClick={() => copyOut(g.label.replace(/^Copy /, ""), () => collectEmails((q) => client.list<Row>(`/email/jobs/${job.id}/items`, q), g.statuses))}>
+            <Icon name="copy" size={14} /> {g.label} <span className="tabular">({fmt(groupCount(g.statuses))})</span>
+          </button>
+        ))}
+        <button type="button" className="button button--ghost button--small" disabled={copy.busy || selected.size === 0}
+          onClick={() => copyOut("Selected emails", async () => emailsToText(selected.values()))}>
+          <Icon name="copy" size={14} /> Copy selected ({fmt(selected.size)})
+        </button>
+        {selected.size > 0 && <button type="button" className="button button--ghost button--small" onClick={() => setSelected(new Map())}>Clear selection</button>}
+      </div>
+      {copied && <p className="muted small ev-copy__note" role="status">{copied}</p>}
+      {copy.error && <ErrorBanner error={copy.error} />}
       <form className="filterbar" onSubmit={(e) => { e.preventDefault(); setFilters(draft); }}>
         <div className="filterbar__row ev-filters">
           <input className="input input--small" placeholder="Email contains…" value={draft.email ?? ""} onChange={(e) => setDraft({ ...draft, email: e.target.value })} aria-label="Email contains" />
@@ -401,6 +554,9 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
           <DataTable
             rows={page.items}
             columns={[
+              { key: "select", label: "", className: "ev-select", render: (r) => (emailOf(r) ? (
+                <input type="checkbox" checked={selected.has(String(r.id))} onChange={() => toggle(r)} aria-label={`Select ${emailOf(r)}`} />
+              ) : null) },
               { key: "row_number", label: "#", className: "tabular" },
               { key: "email", label: "Email", render: (r) => <span className="mono small">{fmt(r.email ?? (r.row as Record<string, unknown>)?.[job.email_column ?? "email"])}</span> },
               { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
@@ -415,6 +571,7 @@ function Results({ job, reloadKey }: { job: Job; reloadKey: string }) {
           <div className="pager">
             <span className="muted small tabular">{page.total === 0 ? "0 results" : `${page.offset + 1}–${page.offset + page.items.length} of ${page.total.toLocaleString()}`}</span>
             <div className="actions">
+              {pageRows.length > 0 && <button type="button" className="button button--ghost button--small" onClick={togglePage}>{allOnPage ? "Unselect page" : "Select page"}</button>}
               <button className="button button--ghost button--small" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - pageSize))}>Previous</button>
               <button className="button button--ghost button--small" disabled={!page.has_more} onClick={() => setOffset(offset + pageSize)}>Next</button>
             </div>
