@@ -36,7 +36,7 @@ export function WorkerBanner({ status, error }: { status: Status | null; error?:
     return (
       <div className="alert alert--error worker-banner" role="alert">
         <div>
-          <strong>CareerCloud is degraded.</strong>{" "}
+          <strong>SANA GTM is degraded.</strong>{" "}
           <span>The {which} cannot be reached, so new crawls cannot be accepted right now.</span>
           {database.detail && <div className="worker-banner__detail">{database.detail}</div>}
           {redis.detail && <div className="worker-banner__detail">{redis.detail}</div>}

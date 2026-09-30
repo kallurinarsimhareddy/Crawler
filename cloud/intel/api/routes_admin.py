@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import io
+import os
 from datetime import datetime, time, timezone
 from typing import Any, Dict, Optional
 
@@ -16,6 +17,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Request, Response, 
 from fastapi.encoders import jsonable_encoder
 
 from cloud.api.auth import Principal
+from cloud.api.middleware import RateLimiter, client_ip
 from cloud.api.routes import current_user
 from cloud.intel.api.deps import get_platform, http_error, page_response, workspace_ctx, write_ctx
 from cloud.intel.core.audit import audit
@@ -39,6 +41,39 @@ def _admin(platform: Platform):
     return platform.service("admin")
 
 
+def _app_url(request: Request) -> Optional[str]:
+    """Where invite links point: the calling dashboard when it is an allowed origin,
+    else ``CAREERCLOUD_PUBLIC_APP_URL``. Never an arbitrary Origin header."""
+    settings = getattr(request.app.state, "settings", None)
+    origin = (request.headers.get("origin") or "").rstrip("/")
+    if origin and settings is not None and origin in tuple(settings.cors_origins):
+        return origin
+    configured = os.environ.get("CAREERCLOUD_PUBLIC_APP_URL", "").strip().rstrip("/")
+    return configured or None
+
+
+def _throttle_invites(request: Request) -> None:
+    """Invitation preview/accept are reachable with nothing but a token: 20 tries per
+    client IP per 10 minutes, on top of the global per-IP limit."""
+    limiter = getattr(request.app.state, "invite_limiter", None)
+    if limiter is None:
+        limiter = request.app.state.invite_limiter = RateLimiter(capacity=20, refill_per_second=20 / 600)
+    settings = getattr(request.app.state, "settings", None)
+    allowed, wait = limiter.allow(f"invite:{client_ip(request, getattr(settings, 'trust_proxy', 'none'))}")
+    if not allowed:
+        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "too many invitation attempts; try again later",
+                            headers={"Retry-After": str(max(1, int(wait + 0.999)))})
+
+
+def _token(body: Dict[str, Any]) -> str:
+    return str(body.get("token") or "").strip()
+
+
+def _text(body: Dict[str, Any], key: str) -> Optional[str]:
+    value = body.get(key)
+    return str(value) if value not in (None, "") else None
+
+
 # --- members & permissions -----------------------------------------------------------
 
 
@@ -53,10 +88,21 @@ def members(ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_
 
 
 @ws.patch("/admin/members/{user_id}")
+@ws.patch("/admin/members/{user_id}/role")
 def change_role(user_id: str, body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(workspace_ctx),
                 platform: Platform = Depends(get_platform)):
     changes = body.get("changes") if isinstance(body.get("changes"), dict) else body
     return _run(lambda: _admin(platform).change_role(ctx, user_id, str(changes.get("role") or "")))
+
+
+@ws.patch("/admin/members/{user_id}/teams")
+def set_member_teams(user_id: str, body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(workspace_ctx),
+                     platform: Platform = Depends(get_platform)):
+    changes = body.get("changes") if isinstance(body.get("changes"), dict) else body
+    team_ids = changes.get("team_ids")
+    if not isinstance(team_ids, list):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "team_ids must be a list")
+    return _run(lambda: _admin(platform).set_member_teams(ctx, user_id, team_ids))
 
 
 @ws.delete("/admin/members/{user_id}")
@@ -73,10 +119,24 @@ def invitations(ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(
 
 
 @ws.post("/admin/invitations", status_code=status.HTTP_201_CREATED)
-def invite(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(workspace_ctx),
+def invite(request: Request, body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(workspace_ctx),
            platform: Platform = Depends(get_platform)):
-    return _run(lambda: _admin(platform).invite(ctx, str(body.get("email") or ""), str(body.get("role") or "member"),
-                                                days=int(body.get("days") or 7)))
+    return _run(lambda: _admin(platform).invite(
+        ctx, str(body.get("email") or ""), str(body.get("role") or "member"), first_name=_text(body, "first_name"),
+        last_name=_text(body, "last_name"), team_id=_text(body, "team_id"), days=int(body.get("days") or 7),
+        app_url=_app_url(request)))
+
+
+@ws.post("/admin/invitations/{invitation_id}/resend")
+def resend(invitation_id: str, request: Request, ctx: Ctx = Depends(workspace_ctx),
+           platform: Platform = Depends(get_platform)):
+    return _run(lambda: _admin(platform).resend_invitation(ctx, invitation_id, app_url=_app_url(request)))
+
+
+@ws.post("/admin/invitations/{invitation_id}/link")
+def invitation_link(invitation_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    """A new copyable invite link (the previous one stops working; tokens are stored hashed)."""
+    return _run(lambda: _admin(platform).invitation_link(ctx, invitation_id))
 
 
 @ws.post("/admin/invitations/{invitation_id}/revoke")
@@ -85,14 +145,34 @@ def revoke(invitation_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Plat
 
 
 @ws.post("/invitations/accept")
-def accept(workspace_id: str, body: Dict[str, Any] = Body(...), principal: Principal = Depends(current_user),
-           platform: Platform = Depends(get_platform)):
+def accept(workspace_id: str, request: Request, body: Dict[str, Any] = Body(...),
+           principal: Principal = Depends(current_user), platform: Platform = Depends(get_platform)):
     """The signed-in invitee (not yet a member, so no workspace context) redeems their token.
     The token names its workspace; it must match the path."""
-    token = str(body.get("token") or "")
+    _throttle_invites(request)
+    token = _token(body)
     if token.partition(".")[0] != workspace_id:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "this invitation is not valid")
     return _run(lambda: _admin(platform).accept_invitation(token, user_id=principal.user_id, email=principal.email))
+
+
+# --- the invite page (no workspace in the path: the token names it) ---------------------
+
+
+@router.post("/invitations/preview")
+def preview_invitation(request: Request, body: Dict[str, Any] = Body(...), platform: Platform = Depends(get_platform)):
+    """Shown before sign-in, so it needs no session: the token is the secret. Only a
+    matching token gets an answer; every other input gets the same 422."""
+    _throttle_invites(request)
+    return _run(lambda: _admin(platform).preview_invitation(_token(body)))
+
+
+@router.post("/invitations/accept")
+def accept_invitation(request: Request, body: Dict[str, Any] = Body(...), principal: Principal = Depends(current_user),
+                      platform: Platform = Depends(get_platform)):
+    _throttle_invites(request)
+    return _run(lambda: _admin(platform).accept_invitation(_token(body), user_id=principal.user_id,
+                                                           email=principal.email))
 
 
 # --- teams ----------------------------------------------------------------------------------

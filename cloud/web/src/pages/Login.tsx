@@ -7,11 +7,13 @@ export function Login() {
   const { mode, session, signIn, signUp, requestPasswordReset, configured } = useAuth();
   const navigate = useNavigate();
   const location = useLocation();
-  const from = (location.state as { from?: string } | null)?.from ?? "/";
+  const state = location.state as { from?: string; email?: string; create?: boolean } | null;
+  const from = state?.from ?? "/";
 
-  const [email, setEmail] = useState("");
+  // Arriving from an invitation: the invited address, and "create an account" if asked.
+  const [email, setEmail] = useState(state?.email ?? "");
   const [password, setPassword] = useState("");
-  const [creating, setCreating] = useState(false);
+  const [creating, setCreating] = useState(!!state?.create);
   const [forgot, setForgot] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<Error | null>(null);

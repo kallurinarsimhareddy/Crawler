@@ -4,6 +4,7 @@ import { EmptyState } from "./components/Feedback";
 import { Layout } from "./components/Layout";
 import { JobDetail } from "./pages/JobDetail";
 import { Jobs } from "./pages/Jobs";
+import { Invite } from "./pages/Invite";
 import { Login } from "./pages/Login";
 import { NewCrawl } from "./pages/NewCrawl";
 import { ResetPassword } from "./pages/ResetPassword";
@@ -36,6 +37,9 @@ export function App() {
     <Routes>
       <Route path="login" element={<Login />} />
       <Route path="reset-password" element={<ResetPassword />} />
+      {/* Public: shows the invitation before sign-in, accepts it after. */}
+      <Route path="invite" element={<Invite />} />
+      <Route path="invite/:token" element={<Invite />} />
       <Route
         element={
           <RequireAuth>

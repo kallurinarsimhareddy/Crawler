@@ -23,6 +23,11 @@ function remembered(): string | null {
   }
 }
 
+/** Make ``id`` the workspace the app opens next (e.g. right after accepting an invitation). */
+export function rememberWorkspace(id: string): void {
+  remember(id);
+}
+
 function remember(id: string): void {
   try {
     window.localStorage.setItem(STORAGE_KEY, id);
