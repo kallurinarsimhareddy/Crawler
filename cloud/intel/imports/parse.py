@@ -12,9 +12,9 @@ import io
 import json
 from dataclasses import dataclass, field
 from datetime import date, datetime
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, BinaryIO, Dict, Iterator, List, Optional, Tuple
 
-__all__ = ["ParseError", "ParsedFile", "detect_format", "parse_file", "iter_rows"]
+__all__ = ["ParseError", "ParsedFile", "detect_format", "parse_file", "iter_rows", "iter_rows_stream"]
 
 DEFAULT_MAX_ROWS = 200_000
 
@@ -75,7 +75,14 @@ def _csv_rows(data: bytes) -> Iterator[List[str]]:
         dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
     except csv.Error:
         dialect = csv.excel
-    for row in csv.reader(io.StringIO(text, newline=""), dialect):
+    reader = csv.reader(io.StringIO(text, newline=""), dialect)
+    while True:
+        try:
+            row = next(reader)
+        except StopIteration:
+            return
+        except csv.Error as error:  # an oversized field, a NUL byte ...: a file problem, not a crash
+            raise ParseError(f"malformed CSV near line {reader.line_num}: {error}") from None
         yield [cell.strip() for cell in row]
 
 
@@ -153,6 +160,88 @@ def iter_rows(fmt: str, data: bytes, *, sheet: Optional[str] = None, max_rows: i
             if not any(raw):
                 continue
             header = raw
+            continue
+        if not any(raw):
+            continue
+        number += 1
+        if number > max_rows:
+            return
+        record: Dict[str, str] = {}
+        for index, name in enumerate(header):
+            if name and name not in record:
+                record[name] = raw[index] if index < len(raw) else ""
+        yield number, record
+
+
+def _stream_text(handle: BinaryIO) -> io.TextIOWrapper:
+    """A text view of a binary file without reading it all: the encoding is chosen from the
+    first 64 KB (UTF-8 with or without BOM, else cp1252, as :func:`_decode` does); a later
+    undecodable UTF-8 byte becomes U+FFFD instead of failing the whole file."""
+    head = handle.read(65536)
+    handle.seek(0)
+    encoding = "cp1252"
+    try:
+        head.decode("utf-8-sig")
+        encoding = "utf-8-sig"
+    except UnicodeDecodeError as error:
+        if error.start >= len(head) - 4:  # only a multi-byte character cut at the sample edge
+            encoding = "utf-8-sig"
+    return io.TextIOWrapper(handle, encoding=encoding, errors="replace", newline="")
+
+
+def iter_rows_stream(fmt: str, handle: BinaryIO, *, max_rows: int = DEFAULT_MAX_ROWS
+                     ) -> Iterator[Tuple[int, Dict[str, str]]]:
+    """:func:`iter_rows` over a seekable binary file handle with memory bounded by the row,
+    not the file: CSV is decoded and parsed incrementally, XLSX is read in openpyxl's
+    read-only (streaming) mode. Malformed CSV raises :class:`ParseError` (never ``csv.Error``)."""
+    if fmt == "csv":
+        text = _stream_text(handle)
+        sample = text.read(20000)
+        text.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=",;\t|")
+        except csv.Error:
+            dialect = csv.excel
+
+        def rows() -> Iterator[List[str]]:
+            reader = csv.reader(text, dialect)
+            while True:
+                try:
+                    row = next(reader)
+                except StopIteration:
+                    return
+                except csv.Error as error:
+                    raise ParseError(f"malformed CSV near line {reader.line_num}: {error}") from None
+                yield [cell.strip() for cell in row]
+
+        raw_rows: Iterator[List[str]] = rows()
+    elif fmt == "xlsx":
+        from openpyxl import load_workbook
+
+        try:
+            workbook = load_workbook(handle, read_only=True, data_only=True)
+        except Exception as error:  # noqa: BLE001 - any openpyxl failure means "not a readable workbook"
+            raise ParseError(f"not a readable XLSX workbook ({type(error).__name__})") from error
+
+        def xlsx() -> Iterator[List[str]]:
+            for name in workbook.sheetnames:  # the first sheet with data, as _xlsx_rows does
+                sheet_rows = ([_cell(v) for v in row] for row in workbook[name].iter_rows(values_only=True))
+                first = next((r for r in sheet_rows if any(r)), None)
+                if first is None:
+                    continue
+                yield first
+                yield from sheet_rows
+                return
+
+        raw_rows = xlsx()
+    else:
+        raise ParseError(f"unsupported format {fmt}")
+    header: Optional[List[str]] = None
+    number = 0
+    for raw in raw_rows:
+        if header is None:
+            if any(raw):
+                header = raw
             continue
         if not any(raw):
             continue

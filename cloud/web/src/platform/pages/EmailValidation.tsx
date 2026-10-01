@@ -16,6 +16,7 @@ import {
   FINAL_LABELS,
   MAX_PASTED,
   MAX_UPLOAD_ROWS,
+  PASTE_BACKGROUND_ROWS,
   RESULT_TABS,
   SUMMARY_LABELS,
   collectEmails,
@@ -34,10 +35,13 @@ import {
   reasonFor,
   signalTone,
   sourceLabel,
+  stageMeta,
+  stageTone,
   tabCount,
   uploadProblem,
   type Candidate,
   type Counts,
+  type EvidenceStage,
   type EvidenceSummary,
   type FinalStatus,
   type ItemFilters,
@@ -86,13 +90,19 @@ type Job = Row & {
     public_evidence?: boolean;
     smtp_preflight?: boolean;
     /** Large uploads are read into the job by the background worker. */
-    ingest?: { state: "pending" | "done"; rows?: number };
+    ingest?: { state: "pending" | "done" | "failed"; rows?: number; error?: string | null };
+    /** Large pastes: validation starts by itself once the background read finishes. */
+    start_after_ingest?: Record<string, unknown>;
+    recheck_unknowns?: boolean;
+    paid_budget?: number | null;
+    paid_used?: number;
   };
   task?: { status: string; progress?: Record<string, unknown>; error?: string | null } | null;
   error?: string | null;
 };
 
-type Item = Row & { final_status?: FinalStatus; summary?: EvidenceSummary; checks?: Record<string, unknown> };
+type Item = Row & { final_status?: FinalStatus; summary?: EvidenceSummary; stages?: EvidenceStage[]; reason?: string;
+  checks?: Record<string, unknown> };
 
 // --- provider panel ------------------------------------------------------------------
 
@@ -279,6 +289,9 @@ function PastePanel() {
               {malformed.length > 8 && ` and ${fmt(malformed.length - 8)} more`}
             </p>
           )}
+          {toValidate > PASTE_BACKGROUND_ROWS && overLimit === 0 && (
+            <p className="muted small">A large paste is saved first and read in the background; validation then starts by itself.</p>
+          )}
           {overLimit > 0 && (
             <p className="alert alert--warning">Only the first {fmt(MAX_PASTED)} are validated here; {fmt(overLimit)} left out. Upload a file for larger lists — it is split into batches automatically.</p>
           )}
@@ -376,9 +389,9 @@ function ListValidation() {
 
 /** Valid / Invalid / Not verified for a job row (older jobs have only internal counts). */
 function finalCounts(c: Counts): [number, number, number] {
-  if (c.final_valid !== undefined) return [c.final_valid ?? 0, c.final_invalid ?? 0, c.final_not_verified ?? 0];
-  const valid = c.VALID ?? 0, invalid = c.INVALID ?? 0;
-  return [valid, invalid, Math.max(0, (c.processed ?? 0) - valid - invalid)];
+  // The server's counts come from its one resolver; older job rows only have internal counts.
+  const valid = c.final_valid ?? c.VALID ?? 0, invalid = c.final_invalid ?? c.INVALID ?? 0;
+  return [valid, invalid, c.final_not_verified ?? Math.max(0, (c.processed ?? 0) - valid - invalid)];
 }
 
 export function EmailValidation() {
@@ -477,7 +490,7 @@ function ColumnStep({ job, onChanged }: { job: Job; onChanged: () => void }) {
         <h3>2 · Checks</h3>
         {reading && (
           <p className="alert alert--info" role="status">
-            Reading the file in the background… {fmt(job.settings.ingest?.rows ?? job.row_count)} rows so far. You can choose the email column and options now; validation can start when reading has finished.
+            Reading {job.source_type === "manual" ? "the pasted rows" : "the file"} in the background… {fmt(job.settings.ingest?.rows ?? job.row_count)} rows so far. {job.settings.start_after_ingest ? "Validation starts automatically when reading has finished." : "You can choose the email column and options now; validation can start when reading has finished."}
           </p>
         )}
         <ProviderPanel compact />
@@ -512,6 +525,9 @@ function RunPanel({ job, onChanged }: { job: Job; onChanged: () => void }) {
   const [valid, invalid, notVerified] = finalCounts(c);
   const act = (verb: string) => action.run(async () => { await client.post(`/email/jobs/${job.id}/${verb}`); onChanged(); });
   const fill = job.status === "completed" ? "completed" : job.status === "cancelled" || job.status === "failed" ? "cancelled" : "running";
+  const ingestFailed = job.settings.ingest?.state === "failed";
+  // A failed or cancelled job continues from where it stopped: checked rows keep their results.
+  const canRetry = (job.status === "failed" || job.status === "cancelled") && (ingestFailed || (c.pending ?? 0) > 0);
   const signals = [["Role / shared inbox", c.ROLE], ["Free provider", c.FREE_PROVIDER], ["Disposable", c.DISPOSABLE], ["Catch-all or risky", c.RISKY]]
     .filter(([, n]) => (n as number) > 0) as [string, number][];
   return (
@@ -523,6 +539,7 @@ function RunPanel({ job, onChanged }: { job: Job; onChanged: () => void }) {
         {isActive(job.status) && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => act("pause")}>Pause</button>}
         {job.status === "paused" && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => act("resume")}>Resume</button>}
         {(isActive(job.status) || job.status === "paused") && <button type="button" className="button button--danger button--small" disabled={action.busy} onClick={() => act("cancel")}>Cancel</button>}
+        {canRetry && <button type="button" className="button button--primary button--small" disabled={action.busy} onClick={() => act("retry")}>Retry</button>}
       </div>
       <div className="progress">
         <div className="progress__track" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}>
@@ -543,7 +560,8 @@ function RunPanel({ job, onChanged }: { job: Job; onChanged: () => void }) {
       {signals.length > 0 && (
         <p className="muted small ev-signals">Signals inside Not verified: {signals.map(([label, n]) => `${label} ${fmt(n)}`).join(" · ")}</p>
       )}
-      {job.error && <p className="error-text">{job.error}</p>}
+      {job.error && <p className="error-text">{ingestFailed ? "Reading the file failed: " : ""}{job.error}</p>}
+      {canRetry && <p className="muted small">Retry continues with the {fmt(c.pending ?? 0)} row{(c.pending ?? 0) === 1 ? "" : "s"} not checked yet{job.settings.recheck_unknowns ? " (paid checks stay within the credits you confirmed)" : " (built-in checks only)"}.</p>}
       {action.error && <ErrorBanner error={action.error} />}
     </div>
   );
@@ -685,16 +703,31 @@ function DetailsDrawer({ item, job, onClose }: { item: Item; job: Job; onClose: 
           </div>
           <button type="button" className="button button--ghost button--small" onClick={onClose} aria-label="Close">✕</button>
         </div>
-        <p><FinalPill item={item} /> <span className="small">{reasonFor(String(item.status), checks)}</span></p>
+        <p><FinalPill item={item} /> <span className="small">{item.reason ?? reasonFor(String(item.status), checks)}</span></p>
         {summary && (
           <dl className="ev-evidence">
             {SUMMARY_LABELS.map(([key, label]) => (
               <div key={key} className="ev-evidence__row">
                 <dt>{label}</dt>
-                <dd className={`ev-signal ev-signal--${signalTone(key, summary[key])}`}>{summary[key]}</dd>
+                <dd className={`ev-signal ev-signal--${signalTone(key, summary[key] ?? "UNKNOWN")}`}>{summary[key] ?? "UNKNOWN"}</dd>
               </div>
             ))}
           </dl>
+        )}
+        {(item.stages ?? []).length > 0 && (
+          <>
+            <h4 className="ev-subhead">Evidence by stage</h4>
+            <p className="muted small">Only the mailbox stage can confirm a mailbox. Domain, MX, SPF and DMARC describe the domain, not this address.</p>
+            <ol className="ev-stages small">
+              {(item.stages ?? []).map((st) => (
+                <li key={st.stage} className={`ev-stage ev-stage--${stageTone(st)}`}>
+                  <span className="ev-stage__label">{st.label}</span>
+                  <span className="ev-stage__result">{String(st.result ?? "")}</span>
+                  <span className="ev-stage__meta muted">{stageMeta(st)}{st.checked_at ? ` · ${fmtDate(st.checked_at)}` : ""}</span>
+                </li>
+              ))}
+            </ol>
+          </>
         )}
         <h4 className="ev-subhead">Details</h4>
         <ul className="ev-details small">

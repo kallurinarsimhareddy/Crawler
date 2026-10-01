@@ -10,6 +10,8 @@ export interface ResultTab {
   statuses: string[];
   /** Only rows this provider answered: "local" (built-in) or "emaillistverify". */
   provider?: string;
+  /** A user-facing status; the server resolves it with its one resolver (engine.final_filters). */
+  final?: FinalStatus;
 }
 
 // --- the three user-facing statuses -------------------------------------------------------
@@ -33,9 +35,9 @@ export function finalStatus(status: unknown, provider: unknown): FinalStatus {
 
 export const RESULT_TABS: (ResultTab & { countKey?: string })[] = [
   { key: "all", label: "All", statuses: [] },
-  { key: "valid", label: "Valid", statuses: ["VALID"], provider: "emaillistverify", countKey: "final_valid" },
-  { key: "invalid", label: "Invalid", statuses: ["INVALID"], countKey: "final_invalid" },
-  { key: "not_verified", label: "Not Verified", statuses: NOT_VERIFIED_STATUSES, countKey: "final_not_verified" },
+  { key: "valid", label: "Valid", statuses: ["VALID"], provider: "emaillistverify", final: "VALID", countKey: "final_valid" },
+  { key: "invalid", label: "Invalid", statuses: ["INVALID"], final: "INVALID", countKey: "final_invalid" },
+  { key: "not_verified", label: "Not Verified", statuses: NOT_VERIFIED_STATUSES, final: "NOT_VERIFIED", countKey: "final_not_verified" },
 ];
 
 export const ACCEPTED_EXTENSIONS = [".csv", ".xlsx"];
@@ -83,6 +85,9 @@ export function itemQuery(tab: ResultTab, filters: ItemFilters, limit: number, o
   else if (tab.statuses.length > 1) query.status__in = tab.statuses.join(",");
   if (filters.email?.trim()) query.email__ilike = filters.email.trim();
   if (filters.domain?.trim()) query.domain = filters.domain.trim().toLowerCase();
+  // The server applies its own resolver for final_status; status/provider say the same thing
+  // in store terms (pinned by a server test), so older servers filter identically.
+  if (tab.final) query.final_status = tab.final;
   if (tab.provider) query.provider = tab.provider;
   else if (filters.provider?.trim()) query.provider = filters.provider.trim();
   if (filters.from) query.validated_at__gte = filters.from;
@@ -94,6 +99,7 @@ export function exportPath(jobId: string, format: "csv" | "xlsx", tab: ResultTab
   const params = [`format=${format}`];
   if (tab.statuses.length) params.push(`status_filter=${encodeURIComponent(tab.statuses.join(","))}`);
   if (tab.provider) params.push(`provider_filter=${encodeURIComponent(tab.provider)}`);
+  if (tab.final) params.push(`final_status=${tab.final}`);
   return `/email/jobs/${encodeURIComponent(jobId)}/export?${params.join("&")}`;
 }
 
@@ -120,7 +126,8 @@ export function reasonFor(status: string, checks: Record<string, unknown> | null
       return "Mailbox verified by the external provider";
     case "INVALID":
       if (c.syntax === false) return "Not a valid email address";
-      if (c.placeholder) return "Placeholder address";
+      if (c.reserved_domain) return "Reserved example/test domain (never receives mail)";
+      if (c.domain_invalid) return `The domain does not accept email (${String(c.domain_invalid)})`;
       if (c.mx === false) return "The domain does not accept email";
       return c.result_code ? `Rejected by the external provider (${String(c.result_code)})` : "Undeliverable";
     case "DISPOSABLE":
@@ -135,6 +142,9 @@ export function reasonFor(status: string, checks: Record<string, unknown> | null
       if (c.dns === "transient failure") return "DNS lookup failed temporarily; try again later";
       if (c.result_code) return `EmailListVerify could not confirm the mailbox (${String(c.result_code)})`;
       if (c.strict_demoted) return "Not externally verified (strict validation)";
+      if (c.error) return `Could not be checked (${String(c.error)})`;
+      if (c.no_reply) return "No-reply address; mailbox not verified";
+      if (c.placeholder) return "Looks like a placeholder address; mailbox not verified";
       return "Mail server exists; mailbox not verified";
     case "PENDING":
       return "Waiting to be checked";
@@ -172,6 +182,7 @@ export interface EvidenceSummary {
   role: string;
   disposable: string;
   free_provider: string;
+  no_reply?: string;
   person_match: string;
   public_evidence: string;
   mailbox_verification: string;
@@ -181,15 +192,20 @@ export interface EvidenceSummary {
 export const SUMMARY_LABELS: [keyof EvidenceSummary, string][] = [
   ["technical", "Syntax"], ["domain", "Domain"], ["mx", "MX"], ["spf", "SPF"], ["dmarc", "DMARC"],
   ["smtp", "SMTP"], ["catch_all", "Catch-all"], ["role", "Role"], ["disposable", "Disposable"],
-  ["free_provider", "Free provider"], ["person_match", "Person match"], ["public_evidence", "Public evidence"],
-  ["mailbox_verification", "Mailbox verification"], ["source", "Source"],
+  ["free_provider", "Free provider"], ["no_reply", "No-reply"], ["person_match", "Person match"],
+  ["public_evidence", "Public evidence"], ["mailbox_verification", "Mailbox verification"], ["source", "Source"],
 ];
 
-/** Tone for an evidence value: good, bad or neutral (UNKNOWN/NO for neutral signals). */
+/** Tone for an evidence value: good, bad or neutral (UNKNOWN/NO for neutral signals). Only
+ * "Mailbox verification" can be VERIFIED; a PASS on syntax/domain/MX is a domain-level fact. */
 export function signalTone(key: keyof EvidenceSummary, value: string): "good" | "bad" | "neutral" {
   if (key === "source") return "neutral";
-  const risky = key === "catch_all" || key === "role" || key === "disposable" || key === "free_provider";
+  const risky = key === "catch_all" || key === "role" || key === "disposable" || key === "free_provider" || key === "no_reply";
   if (risky) return value === "YES" ? "bad" : value === "NO" ? "good" : "neutral";
+  // Green is reserved for evidence about the person/mailbox; a domain-level PASS (syntax,
+  // domain, MX, SPF, DMARC, SMTP) stays neutral so it never reads as "this mailbox is valid".
+  const domainLevel = key === "technical" || key === "domain" || key === "mx" || key === "spf" || key === "dmarc" || key === "smtp";
+  if (value === "PASS" && domainLevel) return "neutral";
   if (value === "PASS" || value === "YES" || value === "VERIFIED") return "good";
   if (value === "FAIL" || value === "INVALID") return key === "spf" || key === "dmarc" ? "neutral" : "bad";
   return "neutral";
@@ -214,8 +230,11 @@ export function isActive(status: string): boolean {
 
 // --- pasted emails ------------------------------------------------------------------------
 
-/** Same row cap as the server's file upload (MAX_ROWS in cloud/intel/email/jobs.py). */
+/** Most addresses one paste sends (a browser-side limit; files take up to MAX_UPLOAD_ROWS).
+ * Pastes larger than PASTE_BACKGROUND_ROWS are read into the job by the background worker. */
 export const MAX_PASTED = 50_000;
+/** Mirrors INLINE_ROWS in cloud/intel/email/jobs.py. */
+export const PASTE_BACKGROUND_ROWS = 5_000;
 
 // A deliberately loose shape check that only catches obviously broken entries; the server's
 // syntax/MX/disposable/role checks (and EmailListVerify) still decide every address.
@@ -244,14 +263,32 @@ function cleanToken(token: string): string {
   return t.trim().toLowerCase();
 }
 
-/** Split pasted text on newlines, commas, semicolons, tabs and spaces; normalize and de-duplicate. */
+/**
+ * The entries in pasted text. Entries are separated by newlines, commas, semicolons and tabs;
+ * inside an entry, spaces separate several addresses ("a@x.com b@y.com"), and words next to an
+ * address are its display name ("Jane Doe <jane@x.com>" -> jane@x.com), not separate entries.
+ * An entry with no "@" at all stays one entry ("John Smith"), reported as malformed once.
+ */
+function pastedTokens(text: string): string[] {
+  const out: string[] = [];
+  for (const segment of (text ?? "").split(/[\r\n,;\t]+/)) {
+    const words = segment.split(/\s+/).filter(Boolean);
+    if (!words.length) continue;
+    const addresses = words.filter((w) => w.includes("@"));
+    if (addresses.length) out.push(...addresses);
+    else out.push(words.join(" "));
+  }
+  return out;
+}
+
+/** Split pasted text into entries (see pastedTokens); normalize and de-duplicate. */
 export function parsePastedEmails(text: string, max: number = MAX_PASTED): PastedEmails {
   const seen = new Set<string>();
   const malformed: string[] = [];
   const emails: string[] = [];
   let total = 0;
   let overLimit = 0;
-  for (const raw of (text ?? "").split(/[\s,;]+/)) {
+  for (const raw of pastedTokens(text)) {
     const token = cleanToken(raw);
     if (!token) continue;
     total += 1;
@@ -290,6 +327,43 @@ export function emailsToText(emails: Iterable<string | null | undefined>): strin
     }
   }
   return out.join("\n");
+}
+
+// --- per-stage evidence ---------------------------------------------------------------------
+
+/** One layer's evidence as the server returns it in `item.stages` (engine.evidence_stages). */
+export interface EvidenceStage {
+  stage: string;
+  label: string;
+  /** pass / fail / warn / unknown / skipped / error / info, or the final status in lower case. */
+  status: string;
+  result: unknown;
+  confidence: string | null;
+  source: string;
+  checked_at: string | null;
+  latency_ms: number | null;
+  error_code: string | null;
+  details: Record<string, unknown>;
+}
+
+/** Display tone for a stage. A domain-level PASS (DNS, MX ...) is shown as "info", not "good":
+ * only the mailbox stage, or a VALID final status, may look like a confirmed mailbox. */
+export function stageTone(stage: Pick<EvidenceStage, "stage" | "status">): "good" | "bad" | "warn" | "neutral" {
+  if (stage.stage === "final") return stage.status === "valid" ? "good" : stage.status === "invalid" ? "bad" : "warn";
+  if (stage.status === "fail") return "bad";
+  if (stage.status === "error" || stage.status === "warn") return "warn";
+  if (stage.status === "pass") return stage.stage === "mailbox" ? "good" : "neutral";
+  return "neutral";
+}
+
+/** A short "pass · 12 ms · high" line for a stage's metadata. */
+export function stageMeta(stage: EvidenceStage): string {
+  const parts: string[] = [stage.status];
+  if (stage.confidence) parts.push(`${stage.confidence} confidence`);
+  if (typeof stage.latency_ms === "number") parts.push(`${Math.round(stage.latency_ms)} ms`);
+  if (stage.error_code) parts.push(`error: ${stage.error_code}`);
+  if (stage.source && stage.source !== "built-in") parts.push(stage.source);
+  return parts.join(" · ");
 }
 
 export interface CopyGroup {

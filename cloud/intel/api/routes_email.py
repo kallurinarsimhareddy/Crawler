@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, File, Form, HTTPException, Request, UploadFile, status
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from cloud.intel.api.crud import list_filters
 from cloud.intel.api.deps import get_platform, http_error, page_response, workspace_ctx, write_ctx
@@ -135,6 +135,8 @@ def job_action(job_id: str, action: str, body: Optional[Dict[str, Any]] = Body(N
     body = body or {}
     actions = {
         "pause": lambda: service.pause(ctx, job_id),
+        # Continue a failed / cancelled job from where it stopped (checked rows are kept).
+        "retry": lambda: service.retry(ctx, job_id),
         "resume": lambda: service.resume(ctx, job_id),
         "cancel": lambda: service.cancel(ctx, job_id),
         "add-to-list": lambda: service.add_to_list(
@@ -173,12 +175,17 @@ def job_items(job_id: str, request: Request, limit: int = 50, offset: int = 0, o
 
 @router.get("/email/jobs/{job_id}/export")
 def export_job(job_id: str, format: str = "csv", status_filter: Optional[str] = None,
-               provider_filter: Optional[str] = None, ctx: Ctx = Depends(workspace_ctx),
-               platform: Platform = Depends(get_platform)):
+               provider_filter: Optional[str] = None, final_status: Optional[str] = None,
+               ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    """CSV is streamed (constant memory for any job size); XLSX is built in one piece.
+    ``final_status`` (VALID / INVALID / NOT_VERIFIED) filters by the user-facing status."""
     try:
-        filename, content, media = platform.service("email_jobs").export(ctx, job_id, format,
-                                                                         _statuses(status_filter),
-                                                                         provider=provider_filter)
+        filename, content, media = platform.service("email_jobs").export(
+            ctx, job_id, format, _statuses(status_filter), provider=provider_filter, final=final_status,
+            stream=format == "csv")
     except PlatformError as error:
         raise http_error(error) from error
-    return Response(content, media_type=media, headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
+    if isinstance(content, (bytes, bytearray)):
+        return Response(content, media_type=media, headers=headers)
+    return StreamingResponse(content, media_type=media, headers=headers)

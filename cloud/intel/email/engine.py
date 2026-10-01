@@ -38,15 +38,18 @@ import hashlib
 import json
 import re
 import socket
+import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from cloud.intel.core.normalize import FREE_EMAIL_DOMAINS
 
 __all__ = ["DnsAnswer", "DnsPythonClient", "FINAL_STATUSES", "PublicEvidenceFinder", "SmtpPreflight", "VERIFIERS",
-           "catch_all_from", "check_format", "contact_signals", "detect_contact_columns", "evidence_summary",
-           "final_status", "inspect_domain", "mailbox_verification", "risk_signals", "sha256", "source_label",
-           "to_ascii_email", "INTERNAL_BY_FINAL", "PAID_CANDIDATE_STATUSES"]
+           "catch_all_from", "check_format", "contact_signals", "detect_contact_columns", "evidence_stages",
+           "evidence_summary", "final_filters", "final_status", "inspect_domain", "is_reserved_domain",
+           "mailbox_verification", "risk_signals", "sha256", "source_label", "to_ascii_email", "INTERNAL_BY_FINAL",
+           "PAID_CANDIDATE_STATUSES"]
 
 #: The only statuses a user sees.
 FINAL_STATUSES = ("VALID", "INVALID", "NOT_VERIFIED")
@@ -71,6 +74,28 @@ _ELV_CATCH_ALL = {"ok_for_all", "accept_all"}
 
 def sha256(value: str) -> str:
     return hashlib.sha256(value.strip().lower().encode("utf-8")).hexdigest()
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+#: RFC 2606 / RFC 6761 names that can never receive mail on the public internet. An address on
+#: one of them is definitively undeliverable; every other "placeholder-looking" address
+#: (test@, user@, @company.com ...) may be a real mailbox and is only a risk signal.
+#: The reserved ``.example`` / ``.test`` TLDs are left to DNS (they never resolve, so the DNS
+#: layer reports NXDOMAIN -> INVALID in production), which keeps offline test fixtures usable.
+_RESERVED_DOMAINS = frozenset({"example.com", "example.net", "example.org", "localhost"})
+_RESERVED_TLDS = frozenset({"invalid", "localhost", "local"})
+
+
+def is_reserved_domain(domain: str) -> bool:
+    domain = (domain or "").strip().lower().rstrip(".")
+    if not domain:
+        return False
+    if domain in _RESERVED_DOMAINS or any(domain.endswith("." + d) for d in _RESERVED_DOMAINS):
+        return True
+    return domain.rpartition(".")[2] in _RESERVED_TLDS
 
 
 # ---------------------------------------------------------------------------
@@ -138,7 +163,8 @@ def check_format(email: str) -> Dict[str, Any]:
             if tld in _TLD_TYPOS and head:
                 suggestion = f"{local}@{head}.{_TLD_TYPOS[tld]}"
     return {"ok": ok, "email": text, "local": local, "domain": domain, "idn": idn, "issues": issues,
-            "placeholder": bool(ok and email_rule.is_placeholder(text)), "did_you_mean": suggestion}
+            "placeholder": bool(ok and email_rule.is_placeholder(text)),
+            "reserved_domain": bool(ok and is_reserved_domain(domain)), "did_you_mean": suggestion}
 
 
 # ---------------------------------------------------------------------------
@@ -203,9 +229,15 @@ def inspect_domain(domain: str, dns: Any) -> Dict[str, Any]:
     """Layers 2-3 for one domain. ``mail`` is True (accepts mail: MX, or an A/AAAA fallback),
     False (NXDOMAIN, RFC 7505 null MX, or no MX and no address) or None (a transient DNS
     failure: nothing can be concluded). ``verdict`` is "invalid" only when mail is False."""
+    started = time.monotonic()
     info: Dict[str, Any] = {"domain": domain, "exists": None, "dns_error": None, "mx": [], "null_mx": False,
                             "a_fallback": False, "mail": None, "spf": "unknown", "spf_all": None,
-                            "dmarc": "unknown", "dmarc_policy": None}
+                            "dmarc": "unknown", "dmarc_policy": None, "checked_at": _now_iso()}
+    if is_reserved_domain(domain):  # RFC 2606/6761: never on the public DNS, no lookup needed
+        info.update(exists=False, dns_error="reserved", mail=False, spf="missing", dmarc="missing",
+                    verdict="invalid", invalid_reason="the domain is reserved for documentation/testing",
+                    latency_ms=0.0)
+        return info
     mx = dns.lookup(domain, "MX")
     if mx.error == "nxdomain":
         info.update(exists=False, dns_error="nxdomain", mail=False)
@@ -252,6 +284,7 @@ def inspect_domain(domain: str, dns: Any) -> Dict[str, Any]:
         info["invalid_reason"] = ("the domain does not exist" if info["exists"] is False else
                                   "the domain publishes a null MX (it accepts no email)" if info["null_mx"] else
                                   "the domain has no mail server")
+    info["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
     return info
 
 
@@ -259,21 +292,41 @@ def inspect_domain(domain: str, dns: Any) -> Dict[str, Any]:
 # Layer 4: SMTP preflight (connection only, opt-in)
 # ---------------------------------------------------------------------------
 
+def _public_addresses(host: str) -> List[str]:
+    """The public addresses of a mail host (raises UnsafeTargetError if any is not public)."""
+    from cloud.shared.urls import resolve_public_addresses
+
+    return resolve_public_addresses(host, 25)
+
+
 class SmtpPreflight:
     """Connect to a mail server, EHLO, read STARTTLS support, QUIT. No MAIL FROM, no
     RCPT TO: it learns whether the server talks, never whether a mailbox exists. A
     timeout (often an ISP blocking outbound port 25) is "unknown", not a failure."""
 
-    def __init__(self, *, timeout: float = 8.0, connect: Optional[Callable[[str], Dict[str, Any]]] = None) -> None:
+    def __init__(self, *, timeout: float = 8.0, connect: Optional[Callable[[str], Dict[str, Any]]] = None,
+                 resolve_public: Optional[Callable[[str], List[str]]] = None) -> None:
         self.timeout = timeout
         self._connect = connect or self._smtplib
+        self._resolve_public = resolve_public or _public_addresses
 
     def _smtplib(self, host: str) -> Dict[str, Any]:
         import smtplib
 
+        # An MX record is attacker-controlled input (any domain can point its MX at 127.0.0.1 or a
+        # private address): connect only to a public address, and to that exact address.
+        try:
+            addresses = self._resolve_public(host)
+        except Exception as error:  # noqa: BLE001 - UnsafeTargetError, resolution failures
+            unsafe = type(error).__name__ == "UnsafeTargetError"
+            return {"smtp": "unknown", "error_code": "unsafe_target" if unsafe else "resolve_failed",
+                    "detail": "the mail host resolves to a non-public address; not contacted" if unsafe
+                    else "the mail host could not be resolved"}
+        if not addresses:
+            return {"smtp": "unknown", "error_code": "resolve_failed", "detail": "the mail host has no address"}
         try:
             with smtplib.SMTP(timeout=self.timeout) as server:
-                code, _ = server.connect(host, 25)
+                code, _ = server.connect(addresses[0], 25)
                 if code != 220:
                     return {"smtp": "fail", "code": code, "detail": "the server refused the connection greeting"}
                 code, _ = server.ehlo()
@@ -527,13 +580,44 @@ def public_evidence_for(email: str, scan: Optional[Mapping[str, Any]], contact: 
 # ---------------------------------------------------------------------------
 
 def final_status(status: Optional[str], provider: Optional[str]) -> str:
-    """VALID only when a mailbox-level verifier said so; INVALID when confirmed unusable;
-    everything else (catch-all, role, free, disposable, unknown, transient) NOT_VERIFIED."""
+    """THE authoritative resolver: every API response, worker count, export, notification,
+    contact update and UI filter derives the user-facing status from this one function
+    (filters through :func:`final_filters`, which encodes the same rules for the store).
+
+    Rules (an internal ``status`` is written only by the layers listed):
+
+    * **VALID** — the internal status is VALID *and* it came from a mailbox-level verifier in
+      :data:`VERIFIERS` (EmailListVerify ``ok``). Syntax, DNS, MX, SPF, DMARC, SMTP preflight,
+      public-web evidence, a person/company match or a non-disposable domain can never
+      produce it: the built-in layers do not write VALID at all, and a VALID from any other
+      provider resolves to NOT_VERIFIED.
+    * **INVALID** — strong evidence the address cannot receive mail: malformed syntax; a
+      domain that does not exist (NXDOMAIN), is reserved (RFC 2606/6761), publishes a null
+      MX (RFC 7505) or has no MX and no address; or a verifier's definitive rejection
+      (``email_disabled``, ``dead_server``, ``invalid_mx``, ``invalid_syntax``, ``spamtrap``).
+    * **NOT_VERIFIED** — everything else: catch-all / accept-all, anti-spam or protocol
+      blocks, the verifier's ``unknown``, provider timeouts/errors, transient DNS failures,
+      role / free-provider / disposable / no-reply / placeholder-looking addresses, and good
+      addresses nobody has verified yet. Uncertainty is never turned into INVALID.
+    """
     if status == "INVALID":
         return "INVALID"
     if status == "VALID" and provider in VERIFIERS:
         return "VALID"
     return "NOT_VERIFIED"
+
+
+def final_filters(final: str) -> Dict[str, Any]:
+    """Store filters selecting exactly the rows :func:`final_status` maps to ``final``."""
+    if final == "VALID":
+        return {"status": "VALID", "provider__in": list(VERIFIERS)}
+    if final == "INVALID":
+        return {"status": "INVALID"}
+    if final == "NOT_VERIFIED":
+        # VALID from a non-verifier is NOT VERIFIED too; no layer writes one, so the internal
+        # statuses below are the complete set (a test pins this).
+        return {"status__in": list(INTERNAL_BY_FINAL["NOT_VERIFIED"])}
+    raise ValueError(f"unknown final status {final!r}")
 
 
 def mailbox_verification(status: Optional[str], provider: Optional[str]) -> str:
@@ -586,11 +670,140 @@ def evidence_summary(status: Optional[str], provider: Optional[str], checks: Opt
         "role": _yn(bool(risk.get("role", checks.get("role")))),
         "disposable": _yn(bool(risk.get("disposable", checks.get("disposable")))),
         "free_provider": _yn(bool(risk.get("free_provider", checks.get("free_provider")))),
+        "no_reply": _yn(risk.get("no_reply")) if risk else "UNKNOWN",
         "person_match": {"yes": "YES", "no": "NO"}.get(contact.get("person_name_match"), "UNKNOWN"),
         "public_evidence": _yn(public.get("public_email_evidence")),
         "mailbox_verification": mailbox_verification(status, provider),
         "source": source_label(provider, checks),
     }
+
+
+def _stage(stage: str, label: str, status: str, result: Any, *, confidence: Optional[str] = None,
+           source: str = "built-in", checked_at: Any = None, latency_ms: Any = None, error_code: Optional[str] = None,
+           details: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+    return {"stage": stage, "label": label, "status": status, "result": result, "confidence": confidence,
+            "source": source, "checked_at": checked_at, "latency_ms": latency_ms, "error_code": error_code,
+            "details": dict(details or {})}
+
+
+def _flag(stage: str, label: str, value: Any, source: str, checked_at: Any) -> Dict[str, Any]:
+    if value is None:
+        return _stage(stage, label, "unknown", "not checked", source=source, checked_at=checked_at)
+    return _stage(stage, label, "warn" if value else "pass", "yes" if value else "no", confidence="high",
+                  source=source, checked_at=checked_at)
+
+
+def evidence_stages(status: Optional[str], provider: Optional[str], checks: Optional[Mapping[str, Any]], *,
+                    validated_at: Any = None) -> List[Dict[str, Any]]:
+    """The per-layer evidence of one result as uniform records — ``{stage, label, status,
+    result, confidence, source, checked_at, latency_ms, error_code, details}`` — derived from
+    what the run stored (so older rows render too). ``status`` is pass / fail / warn / unknown /
+    skipped / error / info; only the ``final`` stage carries the user-facing result, and only the
+    ``mailbox`` stage can say a mailbox was verified."""
+    checks = checks or {}
+    ev = checks.get("evidence") or {}
+    at = validated_at.isoformat() if hasattr(validated_at, "isoformat") else validated_at
+    out: List[Dict[str, Any]] = []
+    fmt = ev.get("format") or {}
+    syntax = fmt.get("ok") if fmt else checks.get("syntax")
+    if checks.get("empty"):
+        out.append(_stage("normalization", "Normalization", "fail", "no address in this row", confidence="high",
+                          checked_at=at, error_code="empty"))
+    else:
+        out.append(_stage("normalization", "Normalization", "pass", "trimmed, lower-cased"
+                          + (", IDN domain converted to punycode" if fmt.get("idn") else ""), checked_at=at,
+                          details={"issues": [i for i in fmt.get("issues") or [] if i == "surrounding whitespace"]}))
+    out.append(_stage("syntax", "Syntax", "pass" if syntax else "fail" if syntax is False else "unknown",
+                      "valid format" if syntax else "malformed" if syntax is False else "not checked",
+                      confidence="high" if syntax is not None else None, checked_at=at,
+                      error_code=None if syntax is not False else "malformed",
+                      details={k: v for k, v in (("issues", fmt.get("issues")), ("did_you_mean", fmt.get("did_you_mean")),
+                                                 ("placeholder", fmt.get("placeholder", checks.get("placeholder"))),
+                                                 ("reserved_domain", fmt.get("reserved_domain")))
+                               if v}))
+    dom = ev.get("domain") or {}
+    if dom or "mx" in checks:
+        dns_error = dom.get("dns_error") if dom else ("transient" if checks.get("dns") else None)
+        exists = dom.get("exists") if dom else (False if checks.get("mx") is False else None if dns_error else True)
+        transient = dns_error in ("servfail", "timeout", "error", "transient")
+        out.append(_stage("domain", "Domain / DNS", "pass" if exists else "fail" if exists is False else "unknown",
+                          "exists" if exists else ("reserved (never on the public internet)" if dns_error == "reserved"
+                                                   else "does not exist") if exists is False
+                          else "DNS lookup failed temporarily" if transient else "not checked",
+                          confidence="low" if transient else "high", checked_at=dom.get("checked_at") or at,
+                          latency_ms=dom.get("latency_ms"), error_code=dns_error))
+        mail = dom.get("mail") if dom else checks.get("mx")
+        out.append(_stage("mx", "MX", "pass" if mail else "fail" if mail is False else "unknown",
+                          ("MX present" if not dom.get("a_fallback") else "no MX; A/AAAA fallback") if mail
+                          else ("null MX: accepts no email" if dom.get("null_mx") else "no mail server")
+                          if mail is False else "unknown",
+                          confidence="low" if mail is None else "high", checked_at=dom.get("checked_at") or at,
+                          error_code=dns_error if mail is None else None,
+                          details={"mx_hosts": dom.get("mx_hosts"), "null_mx": dom.get("null_mx"),
+                                   "a_fallback": dom.get("a_fallback"),
+                                   "note": "MX shows the domain takes mail; it says nothing about this mailbox"}))
+        for key, label in (("spf", "SPF"), ("dmarc", "DMARC")):
+            value = dom.get(key, "unknown") if dom else "unknown"
+            out.append(_stage(key, label, "info" if value in ("present", "missing") else "unknown", value,
+                              confidence="medium" if value != "unknown" else None,
+                              checked_at=dom.get("checked_at") or at,
+                              details={"policy": dom.get("dmarc_policy") if key == "dmarc" else dom.get("spf_all"),
+                                       "note": "supporting signal only; never makes an address valid or invalid"}))
+    risk = ev.get("risk") or {}
+    for key, label in (("role", "Role account"), ("disposable", "Disposable domain"),
+                       ("free_provider", "Free provider"), ("no_reply", "No-reply")):
+        value = risk.get(key, checks.get(key))
+        out.append(_flag(key, label, value, "built-in", at))
+    contact = ev.get("contact") or {}
+    if contact:
+        for key, label in (("person_name_match", "Person match"), ("company_match", "Company match")):
+            value = contact.get(key)
+            out.append(_stage(key.replace("_name", ""), label, {"yes": "pass", "no": "warn"}.get(value, "unknown"),
+                              value or "unknown", confidence=contact.get("contact_confidence_label"), checked_at=at,
+                              details={"pattern": contact.get("name_pattern")} if key == "person_name_match" else {}))
+    public = ev.get("public") or {}
+    if public:
+        value = public.get("public_email_evidence")
+        out.append(_stage("public_evidence", "Public company evidence",
+                          "pass" if value else "info" if value is False else "unknown",
+                          "address published on the company's site" if value else "not found on the pages read"
+                          if value is False else public.get("reason") or "not checked",
+                          confidence=public.get("evidence_confidence"), source="company website",
+                          checked_at=public.get("checked_at") or at,
+                          details={k: public.get(k) for k in ("source_url", "source_type", "pages_read") if public.get(k)}))
+    smtp = ev.get("smtp") or {}
+    if smtp:
+        out.append(_stage("smtp_preflight", "Mail-server preflight",
+                          {"pass": "pass", "fail": "fail"}.get(smtp.get("smtp"), "unknown"),
+                          {"pass": "server answered", "fail": "server refused"}.get(smtp.get("smtp"), "unknown"),
+                          checked_at=at, error_code=smtp.get("error_code"),
+                          details={"detail": smtp.get("detail"), "starttls": smtp.get("starttls"),
+                                   "note": "connect + EHLO only; no mailbox is probed"}))
+    if ev.get("catch_all") is not None:
+        out.append(_stage("catch_all", "Catch-all domain", "warn" if ev["catch_all"] else "pass",
+                          "yes" if ev["catch_all"] else "no", confidence="medium",
+                          source=VERIFIERS.get("emaillistverify", {}).get("label", "verifier"), checked_at=at))
+    # The mailbox stage: the only one that can verify a mailbox.
+    if provider in VERIFIERS:
+        code = checks.get("result_code")
+        mailbox = mailbox_verification(status, provider)
+        out.append(_stage("mailbox", "Mailbox verification",
+                          {"VERIFIED": "pass", "INVALID": "fail"}.get(mailbox, "unknown"), code or "answered",
+                          confidence="high" if mailbox != "UNKNOWN" else "low", source=VERIFIERS[provider]["label"],
+                          checked_at=at, latency_ms=checks.get("latency_ms"),
+                          details={"result_code": code, "mapping_verified": checks.get("mapping_verified"),
+                                   "builtin_status": checks.get("builtin_status")}))
+    elif checks.get("paid_error"):
+        out.append(_stage("mailbox", "Mailbox verification", "error", "provider check failed",
+                          source="EmailListVerify", checked_at=at, error_code=checks.get("paid_error_code") or "provider_error",
+                          details={"detail": checks.get("paid_error")}))
+    else:
+        out.append(_stage("mailbox", "Mailbox verification", "skipped", "not verified",
+                          checked_at=at, details={"reason": checks.get("paid_skipped") or
+                                                  "no mailbox-level check was run (built-in checks only)"}))
+    out.append(_stage("final", "Final status", final_status(status, provider).lower(), final_status(status, provider),
+                      source=source_label(provider, checks), checked_at=at))
+    return out
 
 
 def cache_json(value: Any) -> Any:

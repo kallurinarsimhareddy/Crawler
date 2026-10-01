@@ -25,6 +25,8 @@ import {
   providerState,
   reasonFor,
   signalTone,
+  stageMeta,
+  stageTone,
   sourceLabel,
   tabCount,
   uploadProblem,
@@ -56,9 +58,10 @@ test("strict 3-status UI: the main filters are All, Valid, Invalid, Not Verified
 
 test("Not Verified covers every internal signal status", () => {
   assert.deepEqual(NOT_VERIFIED_STATUSES, ["UNKNOWN", "RISKY", "ROLE", "DISPOSABLE", "FREE_PROVIDER"]);
-  assert.deepEqual(itemQuery(tab("not_verified"), {}, 50, 0), { limit: 50, offset: 0, status__in: "UNKNOWN,RISKY,ROLE,DISPOSABLE,FREE_PROVIDER" });
-  assert.deepEqual(itemQuery(tab("valid"), {}, 50, 0), { limit: 50, offset: 0, status: "VALID", provider: "emaillistverify" });
-  assert.equal(exportPath("evj_1", "csv", tab("valid")), "/email/jobs/evj_1/export?format=csv&status_filter=VALID&provider_filter=emaillistverify");
+  // final_status lets the server apply its one resolver; status/provider are the same rule in store terms.
+  assert.deepEqual(itemQuery(tab("not_verified"), {}, 50, 0), { limit: 50, offset: 0, status__in: "UNKNOWN,RISKY,ROLE,DISPOSABLE,FREE_PROVIDER", final_status: "NOT_VERIFIED" });
+  assert.deepEqual(itemQuery(tab("valid"), {}, 50, 0), { limit: 50, offset: 0, status: "VALID", provider: "emaillistverify", final_status: "VALID" });
+  assert.equal(exportPath("evj_1", "csv", tab("valid")), "/email/jobs/evj_1/export?format=csv&status_filter=VALID&provider_filter=emaillistverify&final_status=VALID");
   assert.equal(exportPath("evj_1", "csv", tab("all")), "/email/jobs/evj_1/export?format=csv");
 });
 
@@ -119,8 +122,10 @@ test("source labels: Built-in, EmailListVerify, Built-in + EmailListVerify, Publ
 
 test("evidence card lists every signal; risk signals read as bad when present", () => {
   assert.deepEqual(SUMMARY_LABELS.map(([k]) => k), ["technical", "domain", "mx", "spf", "dmarc", "smtp", "catch_all", "role",
-    "disposable", "free_provider", "person_match", "public_evidence", "mailbox_verification", "source"]);
-  assert.equal(signalTone("mx", "PASS"), "good");
+    "disposable", "free_provider", "no_reply", "person_match", "public_evidence", "mailbox_verification", "source"]);
+  // A domain-level PASS is neutral: green is kept for mailbox/person evidence, so MX never looks like "valid".
+  for (const key of ["technical", "domain", "mx", "spf", "dmarc", "smtp"] as const) assert.equal(signalTone(key, "PASS"), "neutral", key);
+  assert.equal(signalTone("no_reply", "YES"), "bad");
   assert.equal(signalTone("mx", "FAIL"), "bad");
   assert.equal(signalTone("spf", "FAIL"), "neutral"); // missing SPF is a supporting signal, not a failure
   assert.equal(signalTone("role", "YES"), "bad");
@@ -251,4 +256,32 @@ test("paste: leading, trailing and doubled dots in the local part are malformed"
   const p = parsePastedEmails("bad..dots@domain.com\n.lead@domain.com\ntrail.@domain.com\ngood.dots@domain.com");
   assert.deepEqual(p.malformed, ["bad..dots@domain.com", ".lead@domain.com", "trail.@domain.com"]);
   assert.deepEqual(p.emails, ["good.dots@domain.com"]);
+});
+
+// --- hardening -----------------------------------------------------------------------------
+
+test("pasted names and display names do not become separate malformed entries", () => {
+  const parsed = parsePastedEmails(["Jane Doe <Jane.Doe@Acme.com>, \"bob@acme.com\"", "John Smith", "a@x.com b@y.com",
+    " mailto:C@Z.io ;"].join("\n"));
+  assert.deepEqual(parsed.emails, ["jane.doe@acme.com", "bob@acme.com", "a@x.com", "b@y.com", "c@z.io"]);
+  assert.deepEqual(parsed.malformed, ["john smith"]);
+  const dupes = parsePastedEmails(["A@x.com", "a@x.com ", " a@X.COM", "\"a@x.com\""].join("\n"));
+  assert.deepEqual([dupes.total, dupes.unique, dupes.duplicates, dupes.emails.length], [4, 1, 3, 1]);
+});
+
+test("stage evidence: only the mailbox stage or a VALID final looks confirmed", () => {
+  assert.equal(stageTone({ stage: "mx", status: "pass" }), "neutral");
+  assert.equal(stageTone({ stage: "domain", status: "pass" }), "neutral");
+  assert.equal(stageTone({ stage: "mailbox", status: "pass" }), "good");
+  assert.equal(stageTone({ stage: "domain", status: "fail" }), "bad");
+  assert.equal(stageTone({ stage: "final", status: "not_verified" }), "warn");
+  assert.equal(stageTone({ stage: "final", status: "valid" }), "good");
+  assert.equal(stageMeta({ stage: "domain", label: "Domain", status: "unknown", result: "", confidence: "low", source: "built-in",
+    checked_at: null, latency_ms: 12.4, error_code: "timeout", details: {} }), "unknown · low confidence · 12 ms · error: timeout");
+});
+
+test("reasons explain the corrected placeholder and reserved-domain rules", () => {
+  assert.match(reasonFor("INVALID", { reserved_domain: true }), /Reserved/);
+  assert.match(reasonFor("UNKNOWN", { placeholder: true }), /placeholder.*not verified/);
+  assert.match(reasonFor("UNKNOWN", { no_reply: true }), /No-reply/);
 });

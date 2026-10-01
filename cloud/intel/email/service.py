@@ -25,15 +25,16 @@ from __future__ import annotations
 import logging
 import time
 from datetime import timedelta
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from cloud.intel.core.audit import audit
 from cloud.intel.core.context import ConflictError, Ctx, utcnow
 from cloud.intel.core.normalize import normalize_email
+from cloud.intel.email.engine import final_status
 from cloud.intel.email.providers import FATAL_CODES, EmailListVerifyProvider, elv_enabled, LocalValidator, ValidationResult
 from cloud.intel.providers.base import PaidCallRefused, ProviderError
 
-__all__ = ["EmailValidationService", "is_unresolved", "run_validation_task"]
+__all__ = ["EmailValidationService", "is_unresolved", "max_age", "run_validation_task"]
 
 log = logging.getLogger(__name__)
 
@@ -41,6 +42,20 @@ CACHE_DAYS = 30
 MAX_SYNC = 25
 #: Addresses per paid batch (one ledger reservation each).
 PAID_BATCH = 50
+#: Consecutive transient provider failures (timeouts, 5xx, 429 after retries) after which a
+#: run stops calling the provider, and how long the workspace then waits before trying again.
+BREAKER_FAILURES = 5
+BREAKER_COOLDOWN = 120.0
+
+
+def max_age(value: Any, default: int = CACHE_DAYS) -> int:
+    """Cache age in days. ``0`` is honoured (re-run the checks now); missing/invalid -> default."""
+    if value is None or value == "":
+        return default
+    try:
+        return max(0, min(365, int(value)))
+    except (TypeError, ValueError):
+        return default
 
 
 def is_unresolved(row: Optional[Dict[str, Any]], paid_statuses: Iterable[str] = ("UNKNOWN",)) -> bool:
@@ -50,6 +65,15 @@ def is_unresolved(row: Optional[Dict[str, Any]], paid_statuses: Iterable[str] = 
     return bool(row) and row.get("status") in tuple(paid_statuses) and row.get("provider") != "emaillistverify"
 
 
+def _superseded(row: Dict[str, Any]) -> bool:
+    """A cached built-in result produced by a rule that has since been corrected, so it is
+    checked again instead of being served for the rest of its cache life: older versions
+    marked placeholder-looking addresses (test@, user@, @company.com) INVALID outright."""
+    checks = row.get("checks") or {}
+    return (row.get("provider") == "local" and row.get("status") == "INVALID" and bool(checks.get("placeholder"))
+            and not checks.get("reserved_domain") and checks.get("mx") is not False)
+
+
 class EmailValidationService:
     def __init__(self, platform: Any, *, local: Optional[LocalValidator] = None) -> None:
         self.platform = platform
@@ -57,6 +81,8 @@ class EmailValidationService:
         self.local = local or LocalValidator()
         #: Tests (and a future provider factory) may inject the paid provider.
         self.paid_factory = None
+        #: workspace id -> monotonic time before which paid calls are not attempted (breaker).
+        self._cooldown: Dict[str, float] = {}
 
     def _paid(self, ctx: Ctx) -> Optional[EmailListVerifyProvider]:
         if self.paid_factory is not None:
@@ -74,16 +100,10 @@ class EmailValidationService:
             return None
         return row
 
-    def validate(self, ctx: Ctx, emails: Iterable[str], *, allow_paid: bool = False, max_age_days: int = CACHE_DAYS,
-                 task_id: Optional[str] = None, paid_statuses: Iterable[str] = ("UNKNOWN",)) -> List[Dict[str, Any]]:
-        """``paid_statuses``: built-in results a paid check may settle. The default sends only
-        undecided (UNKNOWN) addresses; a confirmed "verify" run may add ROLE and FREE_PROVIDER.
-        DISPOSABLE and INVALID are never sent."""
-        paid_statuses = tuple(s for s in paid_statuses if s not in ("DISPOSABLE", "INVALID", "VALID"))
-        ctx.require_write()
-        results: List[Dict[str, Any]] = []
-        undecided: List[ValidationResult] = []
-        to_save: List[ValidationResult] = []
+    def _plan(self, ctx: Ctx, emails: Iterable[str], *, allow_paid: bool, max_age_days: int,
+              paid_statuses: Tuple[str, ...]):
+        """Shared by :meth:`validate` and :meth:`estimate_paid`: dedupe (normalized), read the
+        cache once, run the free checks, and split into (cached results, decided, undecided)."""
         ordered: List[str] = []
         seen = set()
         for raw in emails:
@@ -95,29 +115,74 @@ class EmailValidationService:
         # One cache read for the whole call instead of one per address.
         existing = self._prefetch(ctx, [e for e in ordered if normalize_email(e)])
         cutoff = utcnow() - timedelta(days=max_age_days)
+        cached: List[Dict[str, Any]] = []
+        decided: List[ValidationResult] = []
+        undecided: List[ValidationResult] = []
         for email in ordered:
             hit = existing.get(email) if normalize_email(email) else None
-            if hit is not None and hit["validated_at"] < cutoff:
+            if hit is not None and (hit["validated_at"] < cutoff or _superseded(hit)):
                 hit = None
             if hit is not None and not (allow_paid and is_unresolved(hit, paid_statuses)):
-                results.append(self._out(hit, cached=True))
+                cached.append(self._out(hit, cached=True))
                 continue
             local = self.local.check(email)
             if not local.decisive or (allow_paid and local.status in paid_statuses):
                 undecided.append(local)
             else:
-                to_save.append(local)
+                decided.append(local)
+        return existing, cached, decided, undecided
 
+    def estimate_paid(self, ctx: Ctx, emails: Iterable[str], *, max_age_days: int = CACHE_DAYS,
+                      paid_statuses: Iterable[str] = ("UNKNOWN",)) -> Dict[str, Any]:
+        """Exactly how many paid checks :meth:`validate` with ``allow_paid`` would make for
+        ``emails`` right now (free: cache + built-in checks only, nothing is saved or sent)."""
+        paid_statuses = tuple(s for s in paid_statuses if s not in ("DISPOSABLE", "INVALID", "VALID"))
+        _, cached, decided, undecided = self._plan(ctx, emails, allow_paid=True, max_age_days=max_age_days,
+                                                   paid_statuses=paid_statuses)
+        provider = self._paid(ctx)
+        cost = float(getattr(provider, "cost_per_check", 1.0) or 1.0) if provider is not None else 1.0
+        return {"addresses": len(cached) + len(decided) + len(undecided), "cached": len(cached),
+                "decided_free": len(decided), "to_check": len(undecided), "cost_per_check": cost,
+                "credits": round(len(undecided) * cost, 4), "provider_active": provider is not None}
+
+    def validate(self, ctx: Ctx, emails: Iterable[str], *, allow_paid: bool = False, max_age_days: int = CACHE_DAYS,
+                 task_id: Optional[str] = None, paid_statuses: Iterable[str] = ("UNKNOWN",),
+                 paid_budget: Optional[int] = None, on_credit_error: str = "raise") -> List[Dict[str, Any]]:
+        """``paid_statuses``: built-in results a paid check may settle. The default sends only
+        undecided (UNKNOWN) addresses; a confirmed "verify" run may add ROLE and FREE_PROVIDER.
+        DISPOSABLE and INVALID are never sent.
+
+        ``paid_budget``: the most paid checks this call may make (a confirmed estimate); the
+        rest keep their free result with ``paid_skipped`` saying why. ``on_credit_error``:
+        ``"raise"`` (interactive callers) or ``"record"`` (jobs: a refused reservation is
+        recorded on the affected rows instead of failing the whole batch)."""
+        paid_statuses = tuple(s for s in paid_statuses if s not in ("DISPOSABLE", "INVALID", "VALID"))
+        ctx.require_write()
+        existing, results, to_save, undecided = self._plan(ctx, emails, allow_paid=allow_paid,
+                                                           max_age_days=max_age_days, paid_statuses=paid_statuses)
         if undecided:
             provider = self._paid(ctx) if allow_paid else None
-            if provider is None:
-                reason = ("allow_paid was not set" if not allow_paid
-                          else "no paid validation provider is connected")
+            reason = None
+            if not allow_paid:
+                reason = "allow_paid was not set"
+            elif provider is None:
+                reason = "no paid validation provider is connected"
+            elif self._cooldown.get(ctx.workspace_id, 0.0) > time.monotonic():
+                reason = "the provider failed repeatedly; paid checks are paused for a few minutes"
+            if reason is not None:
                 for result in undecided:
                     result.checks["paid_skipped"] = reason
                 to_save.extend(undecided)
             else:
-                results.extend(self._paid_checks(ctx, provider, undecided, task_id=task_id))
+                if paid_budget is not None and len(undecided) > max(0, paid_budget):
+                    over = undecided[max(0, paid_budget):]
+                    undecided = undecided[:max(0, paid_budget)]
+                    for result in over:
+                        result.checks["paid_skipped"] = "the confirmed credit budget for this run is used up"
+                    to_save.extend(over)
+                if undecided:
+                    results.extend(self._paid_checks(ctx, provider, undecided, task_id=task_id,
+                                                     on_credit_error=on_credit_error))
         results.extend(self._save_many(ctx, to_save, existing))
         return results
 
@@ -172,48 +237,76 @@ class EmailValidationService:
         for contact in contacts:
             self._emit_validated(ctx, contact, by_email[contact["email"]])
 
-    def _paid_checks(self, ctx: Ctx, provider, undecided: List[ValidationResult], *, task_id: Optional[str]
-                     ) -> List[Dict[str, Any]]:
+    def _paid_checks(self, ctx: Ctx, provider, undecided: List[ValidationResult], *, task_id: Optional[str],
+                     on_credit_error: str = "raise") -> List[Dict[str, Any]]:
         """Paid checks in batches of :data:`PAID_BATCH`, each against its own ledger
         reservation that is consumed for the calls actually made (released when none
-        were). An account-level failure (bad key, no credits) stops further calls; the
-        remaining addresses keep their local result with the reason recorded."""
+        were). An account-level failure (bad key, no credits) stops further calls; so do
+        :data:`BREAKER_FAILURES` consecutive transient failures (and the workspace then
+        waits :data:`BREAKER_COOLDOWN` seconds). The remaining addresses keep their free
+        result with the reason recorded, so a later "Verify Unknowns" can still settle them.
+        A failure after which the provider may have charged anyway (read timeout, HTTP
+        500/504, an unrecognized reply) is counted as used, so the ledger never under-reports."""
+        from cloud.intel.providers.credits import CreditError
+
         ledger = self.platform.service("credits")
         cost = float(getattr(provider, "cost_per_check", 1.0) or 1.0)
         out: List[Dict[str, Any]] = []
-        fatal: Optional[str] = None
+        stop: Optional[str] = None
+        consecutive = 0
         for offset in range(0, len(undecided), PAID_BATCH):
             batch = undecided[offset:offset + PAID_BATCH]
-            if fatal is not None:
+            if stop is not None:
                 for local in batch:
-                    local.checks["paid_error"] = fatal
+                    local.checks["paid_error"] = stop
                     out.append(self._save(ctx, local))
                 continue
-            reservation = ledger.reserve(ctx, "emaillistverify", len(batch) * cost, task_id=task_id,
-                                         reason=f"validate {len(batch)} email(s)", action="email_validation")
+            try:
+                reservation = ledger.reserve(ctx, "emaillistverify", len(batch) * cost, task_id=task_id,
+                                             reason=f"validate {len(batch)} email(s)", action="email_validation")
+            except CreditError as error:
+                if on_credit_error != "record":
+                    raise
+                stop = f"credits could not be reserved: {error}"[:300]
+                for local in batch:
+                    local.checks.update(paid_error=stop, paid_error_code="no_credits")
+                    out.append(self._save(ctx, local))
+                continue
             used = 0
             try:
                 for local in batch:
-                    if fatal is not None:
-                        local.checks["paid_error"] = fatal
+                    if stop is not None:
+                        local.checks["paid_error"] = stop
                         out.append(self._save(ctx, local))
                         continue
                     started = time.monotonic()
                     try:
                         result = provider.check(local.email)
                         used += 1
+                        consecutive = 0
                         # Provenance: the built-in verdict this external answer replaces.
                         result.checks = {**local.checks, **result.checks, "builtin_status": local.status}
                         ledger.record_usage(ctx, "emaillistverify", "verify_email", task_id=task_id, units=1,
                                             latency_ms=round((time.monotonic() - started) * 1000, 1))
                     except (ProviderError, PaidCallRefused) as error:
                         code = getattr(error, "code", "provider_error")
-                        ledger.record_usage(ctx, "emaillistverify", "verify_email", success=False, units=0,
-                                            error=f"{code}: {error}", task_id=task_id)
+                        uncertain = bool(getattr(error, "charge_uncertain", False))
+                        used += 1 if uncertain else 0
+                        ledger.record_usage(ctx, "emaillistverify", "verify_email", success=False,
+                                            units=1 if uncertain else 0, error=f"{code}: {error}"[:500],
+                                            task_id=task_id)
                         local.checks["paid_error"] = str(error)[:300]
                         local.checks["paid_error_code"] = code
+                        if uncertain:
+                            local.checks["paid_charge_uncertain"] = True
                         if code in FATAL_CODES:
-                            fatal = f"stopped after an account error ({code}): {error}"[:300]
+                            stop = f"stopped after an account error ({code}): {error}"[:300]
+                        else:
+                            consecutive += 1
+                            if consecutive >= BREAKER_FAILURES:
+                                stop = (f"stopped after {consecutive} provider failures in a row "
+                                        f"(last: {code}); try again later")
+                                self._cooldown[ctx.workspace_id] = time.monotonic() + BREAKER_COOLDOWN
                         result = local
                     out.append(self._save(ctx, result))
             finally:
@@ -226,7 +319,8 @@ class EmailValidationService:
     @staticmethod
     def _out(row: Dict[str, Any], *, cached: bool) -> Dict[str, Any]:
         return {"email": row["email"], "status": row["status"], "score": row["score"], "checks": row["checks"],
-                "provider": row["provider"], "validated_at": row["validated_at"], "cached": cached}
+                "provider": row["provider"], "validated_at": row["validated_at"], "cached": cached,
+                "final_status": final_status(row["status"], row["provider"])}
 
     def _save(self, ctx: Ctx, result: ValidationResult) -> Dict[str, Any]:
         now = utcnow()
@@ -247,9 +341,12 @@ class EmailValidationService:
 
     @staticmethod
     def _contact_values(row: Dict[str, Any]) -> Dict[str, Any]:
+        # email_status keeps the detailed result (evidence); validation_status follows the one
+        # resolver, so a contact is "verified" only for a mailbox-verified address and
+        # "rejected" only for a confirmed-invalid one (a disposable domain is a risk, not proof).
+        final = final_status(row["status"], row["provider"])
         return {"email_status": row["status"], "email_score": row["score"], "email_validated_at": row["validated_at"],
-                "validation_status": "verified" if row["status"] == "VALID" else (
-                    "rejected" if row["status"] in ("INVALID", "DISPOSABLE") else "needs_verification")}
+                "validation_status": {"VALID": "verified", "INVALID": "rejected"}.get(final, "needs_verification")}
 
     def _emit_validated(self, ctx: Ctx, contact: Dict[str, Any], row: Dict[str, Any]) -> None:
         try:
@@ -298,8 +395,8 @@ def run_validation_task(platform: Any, ctx: Ctx, task: Dict[str, Any], reporter:
             raise TaskPaused({"done": offset, "counts": counts})
         batch = emails[offset:offset + 50]
         for result in service.validate(ctx, batch, allow_paid=bool(params.get("allow_paid")),
-                                       max_age_days=int(params.get("max_age_days") or CACHE_DAYS),
-                                       task_id=task["id"]):
+                                       max_age_days=max_age(params.get("max_age_days")),
+                                       task_id=task["id"], on_credit_error="record"):
             counts[result["status"]] = counts.get(result["status"], 0) + 1
         reporter.progress(f"validated {min(offset + 50, len(emails))} of {len(emails)}",
                           done=min(offset + 50, len(emails)), total=len(emails))
