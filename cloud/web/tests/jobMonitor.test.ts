@@ -96,7 +96,7 @@ test("an import mapping needs Job URL and Job Title", () => {
   assert.equal(checkMapping({ "Job URL": "URL", "Job Title": "Position" }, headers).ok, false);
   assert.deepEqual(checkMapping({ "Job URL": "Link", "Job Title": "Link" }, headers).reused, ["Link"]);
   const full = normalizeMapping({ "Job URL": "Link", "Company Name": "Employer", "Location": "Nope" }, headers);
-  assert.equal(Object.keys(full).length, 14);
+  assert.equal(Object.keys(full).length, 16);                 // the 14 job fields + Source Board + Search Term
   assert.equal(full["Job URL"], "Link");
   assert.equal(full["Location"], null);
   assert.equal(full["Job Title"], null);

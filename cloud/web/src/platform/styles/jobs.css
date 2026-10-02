@@ -64,3 +64,10 @@
 .jm-set__head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
 .jm-try { display: flex; flex-direction: column; gap: 8px; }
 .jm-block { display: block; }
+
+/* Jobs CSV download panel */
+.jm-csv { margin-bottom: 1rem; }
+.jm-csv__scopes { border: 0; padding: 0; margin: 0 0 0.5rem; display: grid; gap: 0.4rem; }
+.jm-csv__scope { display: flex; gap: 0.5rem; align-items: flex-start; cursor: pointer; }
+.jm-csv__scope input { margin-top: 0.25rem; }
+.jm-csv__status { margin-top: 0.75rem; }

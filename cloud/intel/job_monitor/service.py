@@ -36,7 +36,8 @@ from cloud.intel.core.context import ConflictError, Ctx, NotFoundError, Validati
 from cloud.intel.core.normalize import normalize_name
 from cloud.intel.job_monitor import diff as jdiff
 from cloud.intel.job_monitor.profiles import PROFILES, profile_for_url
-from cloud.intel.job_monitor.schema import JOB_FIELDS, KEYWORD_COLUMNS, content_hash, field_values, normalize_job
+from cloud.intel.job_monitor.schema import (HASH_COLUMNS, JOB_FIELDS, KEYWORD_COLUMNS, content_hash, field_values,
+                                            normalize_job)
 from cloud.intel.job_monitor.relevance import ENGINE_VERSION, RelevanceEngine, parse_keyword_workbook
 from cloud.intel.jobs.classify import classify as classify_job
 
@@ -520,7 +521,7 @@ class JobMonitorService:
         UNKNOWN, and an existing job only gains values it is missing — older data never
         overwrites what a monitor observed)."""
         stats = {"found": len(records), "new": 0, "changed": 0, "unchanged": 0, "reopened": 0, "duplicates": 0,
-                 "filled": 0, "linked": 0, "review": 0}
+                 "filled": 0, "updated": 0, "linked": 0, "review": 0}
         observing = run is not None
         unique: Dict[str, Mapping[str, Any]] = {}
         for values in records:
@@ -583,6 +584,8 @@ class JobMonitorService:
                     "source_monitor_id": monitor_id, "first_seen_run_id": run_id, "last_seen_run_id": run_id,
                     "observation_count": 1 if observing else 0, **relevance,
                 }
+                if import_id:
+                    insert["last_import_id"] = import_id
                 if insert["company_match"] == "matched":
                     stats["linked"] += 1
                 elif insert["company_match"] == "review":
@@ -592,15 +595,42 @@ class JobMonitorService:
                 continue
 
             if not observing:
-                # Historical data never overwrites a stored job; it only fills blanks.
-                fill = {c: values[c] for c in (*OBSERVED_COLUMNS, "source", "scraped_date")
+                if import_id and row.get("last_import_id") == import_id:
+                    stats["duplicates"] += 1        # the same URL earlier in this file (another batch)
+                    continue
+                patch_i: Dict[str, Any] = {"last_import_id": import_id} if import_id else {}
+                fill = {c: values[c] for c in (*OBSERVED_COLUMNS, "source", "scraped_date", "source_board",
+                                               "search_term")
                         if c != "content_hash" and row.get(c) in (None, "") and values.get(c) not in (None, "")}
-                if fill:
-                    merged = {**row, **fill}
-                    fill["content_hash"] = content_hash(merged)
-                    updates.append((row["id"], fill))
-                    stats["filled"] += 1
-                stats["duplicates"] += 1
+                changed = []
+                if not row.get("observation_count"):
+                    # Import-owned job (no monitor has observed it): a newer file may correct its
+                    # meaningful fields. Blank cells never erase a stored value; a job a monitor
+                    # observed is never overwritten by a file — only its blanks are filled.
+                    changed = [c for c in HASH_COLUMNS if values.get(c) not in (None, "") and
+                               row.get(c) not in (None, "") and
+                               (str(values.get(c)).strip().casefold() != str(row.get(c)).strip().casefold())]
+                if changed or fill:
+                    merged = {**row, **fill, **{c: values.get(c) for c in changed}}
+                    patch_i.update(fill)
+                    patch_i.update({c: values.get(c) for c in changed})
+                    patch_i["content_hash"] = content_hash(merged)
+                    if changed:
+                        patch_i["last_changed_at"] = observed_at
+                        history.append({"job_posting_id": row["id"], "monitor_id": None, "run_id": None,
+                                        "import_id": import_id, "change": "changed", "changed_fields": changed,
+                                        "before": _jsonable({c: row.get(c) for c in changed}),
+                                        "after": _jsonable({c: values.get(c) for c in changed}),
+                                        "detected_at": observed_at})
+                        if engine is not None:
+                            patch_i.update(self._relevance(engine, merged))
+                    stats["updated"] += 1
+                    if fill and not changed:
+                        stats["filled"] += 1
+                else:
+                    stats["unchanged"] += 1
+                if patch_i:
+                    updates.append((row["id"], patch_i))
                 continue
 
             change = jdiff.classify(row, values)
@@ -702,7 +732,9 @@ class JobMonitorService:
         # absence says nothing about closure, so it EXPIRES (kept, history recorded) instead.
         horizon = (started.date() - timedelta(days=int(window))) if window else None
         stats = {"missed": 0, "closed": 0, "expired": 0}
-        base = {**self.close_scope(ctx, monitor), "status": list(SWEEP_STATES), "last_seen_at__lt": started}
+        # Missed = not seen BY THIS RUN (run id, not timestamps: robust to clock resolution).
+        base = {"all_of": [self.close_scope(ctx, monitor), {"status": list(SWEEP_STATES)},
+                           {"any_of": [{"last_seen_run_id__ne": run["id"]}, {"last_seen_run_id__isnull": True}]}]}
         last_id = ""
         while True:
             filters = dict(base)

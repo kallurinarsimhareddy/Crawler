@@ -133,7 +133,9 @@ def resolve_row(batch_id: str, row_id: str, body: Dict[str, Any] = Body(...), ct
 @router.get(W + "/exports", tags=["exports"])
 def list_exports(limit: int = 50, offset: int = 0, ctx: Ctx = Depends(workspace_ctx),
                  platform: Platform = Depends(get_platform)):
-    return page_response(platform.store.list(ctx, "exports", limit=limit, offset=offset))
+    # Job exports are private to their creator (admins see all); other exports are workspace-wide.
+    filters = {} if ctx.can_admin else {"any_of": [{"entity_type__ne": "job_postings"}, {"created_by": ctx.user_id}]}
+    return page_response(platform.store.list(ctx, "exports", filters, limit=limit, offset=offset))
 
 
 @router.post(W + "/exports", status_code=status.HTTP_201_CREATED, tags=["exports"])
@@ -150,15 +152,23 @@ def create_export(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx
 @router.get(W + "/exports/{export_id}", tags=["exports"])
 def get_export(export_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
     try:
-        return jsonable_encoder(platform.store.get(ctx, "exports", export_id))
+        return jsonable_encoder(_readable_export(ctx, platform, export_id))
     except PlatformError as error:
         raise http_error(error) from error
+
+
+def _readable_export(ctx: Ctx, platform: Platform, export_id: str):
+    """A job export is private to the person who made it (or a workspace admin)."""
+    record = platform.store.get(ctx, "exports", export_id)
+    if record.get("entity_type") == "job_postings":
+        return platform.service("job_exports").get(ctx, export_id)
+    return record
 
 
 @router.get(W + "/exports/{export_id}/download", tags=["exports"])
 def download_export(export_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
     try:
-        record = platform.store.get(ctx, "exports", export_id)
+        record = _readable_export(ctx, platform, export_id)
     except PlatformError as error:
         raise http_error(error) from error
     if record["status"] != "completed" or not record["storage_key"]:

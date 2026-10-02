@@ -6,7 +6,8 @@ import { useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
-import { JOB_FIELDS, checkMapping, normalizeMapping, type JobField } from "../logic/jobFields";
+import { IMPORT_COUNTERS, importPercent } from "../logic/jobCsv";
+import { IMPORT_FIELDS, checkMapping, normalizeMapping, type ImportField } from "../logic/jobFields";
 import { jobsLink } from "../logic/jobFilters";
 import { DataTable, PageHeader, Pill, Stat, fmt, useAction, useLoad } from "../ui";
 import { useWs } from "../workspace";
@@ -64,9 +65,9 @@ export function JobImportPage() {
     <div className="page">
       <Link to="/jobs" className="back">← Jobs</Link>
       <PageHeader
-        title="Import historical jobs"
-        subtitle="Upload a CSV or XLSX of jobs. Map its columns to the 14 job fields, validate, then import. Existing jobs (same Job URL) are never duplicated."
-        crumbTitle="Import"
+        title="Upload CSV"
+        subtitle="Upload a UTF-8 CSV (or XLSX) of jobs, any size. Columns are detected and mapped automatically — check the mapping, validate, then import in the background. The same Job URL is never stored twice."
+        crumbTitle="Upload CSV"
         actions={importId ? <button type="button" className="button button--ghost" onClick={() => open(null)}>New import</button> : undefined}
       />
       {importId ? (
@@ -76,7 +77,7 @@ export function JobImportPage() {
           <h3>1. Upload</h3>
           <div className="form-grid">
             <label className="field field--wide">
-              <span className="field__label">CSV or XLSX file</span>
+              <span className="field__label">CSV file (UTF-8) or XLSX</span>
               <input className="input" type="file" accept=".csv,.xlsx,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" onChange={(e) => setFile(e.target.files?.[0] ?? null)} />
             </label>
             <label className="field">
@@ -103,9 +104,13 @@ export function JobImportPage() {
               { key: "row_count", label: "Rows", className: "tabular", render: (r) => n(r.row_count) },
               { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
               { key: "new", label: "New", className: "tabular", render: (r) => n(r.stats?.new) },
+              { key: "updated", label: "Updated", className: "tabular", render: (r) => n(r.stats?.updated) },
+              { key: "unchanged", label: "Unchanged", className: "tabular", render: (r) => n(r.stats?.unchanged) },
               { key: "duplicates", label: "Duplicates", className: "tabular", render: (r) => n(r.stats?.duplicates) },
               { key: "rejected", label: "Rejected", className: "tabular", render: (r) => n(r.stats?.rejected) },
+              { key: "errors", label: "Errors", className: "tabular", render: (r) => n(r.stats?.errors) },
               { key: "created_at", label: "Uploaded", render: (r) => fmt(r.created_at) },
+              { key: "finished", label: "Completed", render: (r) => fmt(r.stats?.finished_at) },
               { key: "view", label: "", render: (r) => (r.status === "completed" ? <Link className="link small" to={jobsLink({ import: r.id })}>View jobs</Link> : null) },
             ]}
           />
@@ -136,7 +141,7 @@ function ImportWizard({ importId, onChanged }: { importId: string; onChanged: ()
 function Wizard({ row, onRow }: { row: ImportRow; onRow: () => void }) {
   const client = useWs();
   const headers = row.headers ?? [];
-  const [mapping, setMapping] = useState<Record<JobField, string | null>>(() => normalizeMapping(row.mapping, headers));
+  const [mapping, setMapping] = useState<Record<ImportField, string | null>>(() => normalizeMapping(row.mapping, headers));
   const [defaultSource, setDefaultSource] = useState(row.default_source ?? "");
   const [dirty, setDirty] = useState(false);
   const action = useAction();
@@ -166,6 +171,8 @@ function Wizard({ row, onRow }: { row: ImportRow; onRow: () => void }) {
   const stats = (row.stats ?? {}) as Record<string, unknown>;
   const total = Number(row.row_count ?? 0);
   const at = Number(row.checkpoint?.row ?? stats.rows ?? 0);
+  const percent = importPercent(stats, total, at, status);
+  const report = () => action.run(() => client.download(`/job-imports/${encodeURIComponent(row.id)}/report`, `import-report-${row.id}.csv`));
 
   return (
     <>
@@ -180,9 +187,9 @@ function Wizard({ row, onRow }: { row: ImportRow; onRow: () => void }) {
 
       <div className="card pad form">
         <h3>2. Map columns</h3>
-        <p className="muted small">Choose the file column for each field. Job URL and Job Title are required; a field that is not in the file stays blank — nothing is guessed.</p>
+        <p className="muted small">Columns were matched automatically by name — check and correct them. Job URL and Job Title are required; a field that is not in the file stays blank — nothing is guessed.</p>
         <div className="jm-mapping">
-          {JOB_FIELDS.map((field) => (
+          {IMPORT_FIELDS.map((field) => (
             <label key={field} className="field">
               <span className="field__label">{field}{field === "Job URL" || field === "Job Title" ? <span aria-hidden="true"> *</span> : null}</span>
               <select
@@ -244,18 +251,17 @@ function Wizard({ row, onRow }: { row: ImportRow; onRow: () => void }) {
 
       {(busy || done || status === "failed" || status === "cancelled") && (
         <div className="card pad">
-          <h3>{busy ? "Importing…" : done ? "Import finished" : "Import stopped"}</h3>
+          <h3>{busy ? `Importing ${n(total)} rows` : done ? "Import completed" : "Import stopped"}</h3>
           {total > 0 && (
-            <div className="bars__track jm-progress" role="progressbar" aria-valuemin={0} aria-valuemax={total} aria-valuenow={Math.min(at, total)}>
-              <span className="bars__fill" style={{ width: `${Math.min(100, (at / total) * 100)}%` }} />
-            </div>
+            <>
+              <div className="bars__track jm-progress" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}>
+                <span className="bars__fill" style={{ width: `${percent}%` }} />
+              </div>
+              <p className="muted small">Progress: {percent}% · row {n(Math.min(at, total))} of {n(total)}</p>
+            </>
           )}
           <div className="stats stats--wrap">
-            <Stat label="Rows" value={`${n(at)} / ${n(total)}`} />
-            <Stat label="New" value={n(stats.new)} />
-            <Stat label="Duplicates" value={n(stats.duplicates)} />
-            <Stat label="Updated (filled)" value={n(stats.filled)} />
-            <Stat label="Rejected" value={n(stats.rejected)} />
+            {IMPORT_COUNTERS.map(([key, label]) => <Stat key={key} label={label} value={n(stats[key])} />)}
             <Stat label="Linked to companies" value={n(stats.linked)} />
             <Stat label="Company review" value={n(stats.review)} />
           </div>
@@ -263,6 +269,7 @@ function Wizard({ row, onRow }: { row: ImportRow; onRow: () => void }) {
           {done && (
             <div className="actions">
               <Link className="button button--primary" to={jobsLink({ import: row.id })}>View imported jobs</Link>
+              <button type="button" className="button button--ghost" onClick={() => void report()}>Download import report</button>
               {Number(stats.review ?? 0) > 0 && <Link className="button button--ghost" to="/jobs?tab=reviews">Review company names</Link>}
             </div>
           )}

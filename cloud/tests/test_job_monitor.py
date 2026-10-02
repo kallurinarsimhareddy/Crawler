@@ -314,10 +314,12 @@ class ImportTests(_Base):
 
     def test_reimport_fills_blanks_but_never_overwrites(self) -> None:
         self.do_import(self.csv_bytes([self.row(1, **{"Salary Budget": ""})]))
-        self.store.update(self.ctx, "job_postings", self.jobs()[0]["id"], {"title": "Engineer 1 (observed)"})
+        self.store.update(self.ctx, "job_postings", self.jobs()[0]["id"], {"title": "Engineer 1 (observed)",
+                                                                           "observation_count": 1})
         stats = self.do_import(self.csv_bytes([self.row(1, **{"Job Title": "Old title", "Salary Budget": "$5k"})]),
                                name="again.csv")["stats"]
-        self.assertEqual((stats["new"], stats["duplicates"], stats["filled"]), (0, 1, 1))
+        # a monitor-observed job: the file only fills its blanks (counted as updated), never overwrites
+        self.assertEqual((stats["new"], stats["duplicates"], stats["updated"], stats["filled"]), (0, 0, 1, 1))
         stored = self.jobs()[0]
         self.assertEqual((stored["title"], stored["salary_budget"]), ("Engineer 1 (observed)", "$5k"))
 
@@ -609,7 +611,7 @@ class MonitorTests(_Base):
         self.store.update(self.ctx, "job_source_monitors", monitor["id"], {
             "next_run_at": now - timedelta(minutes=1), "next_full_sweep_at": now - timedelta(minutes=1)})
         self.assertEqual(self.svc.tick(self.ctx), 1)
-        latest = self.store.all(self.ctx, "job_monitor_runs", {"monitor_id": monitor["id"]}, order="-created_at")[0]
+        latest = self.store.first(self.ctx, "job_monitor_runs", {"monitor_id": monitor["id"], "status": "queued"})
         self.assertEqual(latest["mode"], "full")
         run_task_inline(self.platform, self.ctx.workspace_id, latest["task_id"])
         after = self.store.get(self.ctx, "job_source_monitors", monitor["id"])

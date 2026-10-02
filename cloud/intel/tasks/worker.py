@@ -65,6 +65,7 @@ HANDLERS: Dict[str, str] = {
     "job_monitor": "cloud.intel.job_monitor.runner:run_job_monitor_task",
     "job_import": "cloud.intel.job_monitor.importer:run_job_import_task",
     "job_lifecycle": "cloud.intel.job_monitor.runner:run_job_lifecycle_task",
+    "job_export": "cloud.intel.job_monitor.exports:run_job_export_task",
 }
 
 

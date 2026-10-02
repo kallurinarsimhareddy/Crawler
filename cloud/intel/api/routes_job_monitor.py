@@ -17,6 +17,8 @@ from cloud.intel.platform import Platform
 
 router = APIRouter(tags=["job-monitors"])
 W = "/w/{workspace_id}"
+#: Free disk space an upload must leave untouched (bytes).
+UPLOAD_DISK_RESERVE = 512 * 1024 * 1024
 
 
 def _call(fn: Callable[[], Any]) -> Any:
@@ -172,11 +174,54 @@ def resolve_review(review_id: str, body: Dict[str, Any] = Body(...), ctx: Ctx = 
 @router.post(W + "/job-imports", status_code=status.HTTP_201_CREATED)
 async def upload_import(file: UploadFile = File(...), sheet: Optional[str] = Form(None),
                         ctx: Ctx = Depends(write_ctx), platform: Platform = Depends(get_platform)):
-    data = await file.read(MAX_IMPORT_BYTES + 1)
-    if len(data) > MAX_IMPORT_BYTES:
-        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                            f"the file is larger than {MAX_IMPORT_BYTES // 2**20} MB")
-    return _call(lambda: platform.service("job_imports").upload(ctx, file.filename or "jobs.csv", data, sheet=sheet))
+    """The body is streamed to a temp file in 1 MB chunks (never held in memory), then scanned.
+    The copy is made next to the platform's file storage (not the system temp drive) and only
+    when that disk has room for it, so a large upload can never fill the disk under the API."""
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    work = Path(platform.config.files_dir) / "upload-tmp"
+    work.mkdir(parents=True, exist_ok=True)
+    expected = file.size or 0
+    free = shutil.disk_usage(work).free
+    if free < max(expected, 0) * 2 + UPLOAD_DISK_RESERVE:
+        raise HTTPException(status.HTTP_507_INSUFFICIENT_STORAGE,
+                            "the server does not have enough free disk space for this upload right now")
+    with tempfile.TemporaryDirectory(dir=work) as scratch:
+        path = Path(scratch) / "upload"
+        size = 0
+        with path.open("wb") as out:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_IMPORT_BYTES:
+                    raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                                        f"the file is larger than {MAX_IMPORT_BYTES // 2**20} MB")
+                if size % (64 * 1024 * 1024) < len(chunk) and shutil.disk_usage(work).free < UPLOAD_DISK_RESERVE:
+                    raise HTTPException(status.HTTP_507_INSUFFICIENT_STORAGE,
+                                        "the server ran out of free disk space during the upload")
+                out.write(chunk)
+        return _call(lambda: platform.service("job_imports").upload_file(ctx, file.filename or "jobs.csv", path,
+                                                                         sheet=sheet))
+
+
+@router.get(W + "/job-imports/{import_id}/report")
+def import_report(import_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    """Summary + rejected rows of one import as CSV (only for members of its workspace)."""
+    from fastapi.responses import Response
+
+    from cloud.intel.job_monitor.importer import import_report_csv
+
+    try:
+        row = platform.store.get(ctx, "job_imports", import_id)
+    except PlatformError as error:
+        raise http_error(error) from error
+    return Response("\ufeff" + import_report_csv(row), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="import-report-{import_id}.csv"',
+                             "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 @router.get(W + "/job-imports")
@@ -207,6 +252,56 @@ def validate_import(import_id: str, body: Dict[str, Any] = Body(...), ctx: Ctx =
 @router.post(W + "/job-imports/{import_id}/start")
 def start_import(import_id: str, ctx: Ctx = Depends(write_ctx), platform: Platform = Depends(get_platform)):
     return _call(lambda: platform.service("job_imports").start(ctx, import_id))
+
+
+# --- jobs CSV export ------------------------------------------------------------------------------
+
+def _export_svc(platform: Platform):
+    return platform.service("job_exports")
+
+
+@router.get(W + "/job-exports/estimate")
+def export_estimate(request: Request, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    return _call(lambda: _export_svc(platform).estimate(ctx, dict(request.query_params)))
+
+
+@router.post(W + "/job-exports", status_code=status.HTTP_201_CREATED)
+def create_export(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
+                  platform: Platform = Depends(get_platform)):
+    """{scope: current|all, params: <the Jobs page filters>, page: {order, limit, offset} for current}"""
+    params = body.get("params") or {}
+    if not isinstance(params, dict):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "params must be an object of filters")
+    return _call(lambda: _export_svc(platform).create(ctx, scope=str(body.get("scope") or "all"), params=params,
+                                                      page=body.get("page") if isinstance(body.get("page"), dict)
+                                                      else None))
+
+
+@router.get(W + "/job-exports")
+def list_exports(limit: int = 20, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    return _call(lambda: {"items": _export_svc(platform).history(ctx, limit=limit)})
+
+
+@router.get(W + "/job-exports/{export_id}")
+def get_job_export(export_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    return _call(lambda: _export_svc(platform).get(ctx, export_id))
+
+
+@router.get(W + "/job-exports/{export_id}/download")
+def download_job_export(export_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    from fastapi.responses import StreamingResponse
+
+    try:
+        record = _export_svc(platform).get(ctx, export_id)
+    except PlatformError as error:
+        raise http_error(error) from error
+    if record["status"] != "completed":
+        raise HTTPException(status.HTTP_409_CONFLICT, f"export is {record['status']}")
+    if not record["available"]:
+        raise HTTPException(status.HTTP_410_GONE, "the export file is no longer available")
+    return StreamingResponse(platform.storage.iter_bytes(record["storage_key"]), media_type="text/csv; charset=utf-8",
+                             headers={"Content-Disposition": f'attachment; filename="{record["filename"]}"',
+                                      "X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"})
 
 
 # --- relevance keyword universe ------------------------------------------------------------------

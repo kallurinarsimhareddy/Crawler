@@ -3,6 +3,7 @@
 // advanced AND/OR conditions, the job page with its change history, and the
 // company-name review queue.
 
+import { DownloadCsvPanel } from "./JobCsv";
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { EmptyState, ErrorBanner, Loading } from "../../components/Feedback";
@@ -83,6 +84,7 @@ export function JobsPage() {
   const [params] = useSearchParams();
   const tab = params.get("tab") === "reviews" ? "reviews" : "jobs";
   const navigate = useNavigate();
+  const [downloading, setDownloading] = useState(false);
   return (
     <div className="page">
       <PageHeader
@@ -92,11 +94,13 @@ export function JobsPage() {
           <>
             <Link className="button button--ghost" to="/monitors">Monitors</Link>
             <Link className="button button--ghost" to="/jobs/keywords">Relevance keywords</Link>
-            <Link className="button button--primary" to="/jobs/import">Import historical jobs</Link>
+            <Link className="button button--primary" to="/jobs/import">Upload CSV</Link>
+            <button type="button" className="button button--primary" aria-expanded={downloading} onClick={() => setDownloading((d) => !d)}>Download CSV</button>
           </>
         }
         tabs={<Tabs active={tab} onChange={(k) => navigate(k === "reviews" ? "/jobs?tab=reviews" : "/jobs")} tabs={[{ key: "jobs", label: "Jobs" }, { key: "reviews", label: "Company review" }]} />}
       />
+      {downloading && tab === "jobs" && <DownloadCsvPanel onClose={() => setDownloading(false)} />}
       {tab === "reviews" ? <CompanyReviews /> : <JobsTable />}
     </div>
   );

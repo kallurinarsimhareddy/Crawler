@@ -1640,6 +1640,26 @@ entity("signal_outcomes", "so", {
                "meeting, opportunity, no response, disqualified), linked to the signal, company, prospect and "
                "campaign.")
 
+# ---------------------------------------------------------------------------
+# 0014: job CSV import/export at scale
+# ---------------------------------------------------------------------------
+# Exports run in the background with progress and a duplicate guard (dedupe_key = one
+# active export per user + scope + filters); job_postings remembers the import that last
+# touched it, so a URL repeated anywhere in one file counts as a duplicate with bounded memory.
+_widen("exports", "status", "running", version="0014")
+_widen("platform_tasks", "kind", "job_export", version="0014")
+TASK_KINDS = ENTITIES["platform_tasks"].columns["kind"].choices
+_add("exports", {
+    "scope": _t(20),                                   # job exports: "current" (shown page) or "all" (every match)
+    "total_rows": Col("int", minimum=0),
+    "progress_rows": Col("int", required=True, default=0, minimum=0),
+    "task_id": _t(40),
+    "dedupe_key": _t(64, index=True),
+    "finished_at": Col("ts"),
+}, version="0014")
+_add("job_postings", {"last_import_id": _t(40, index=True)}, version="0014")
+
+
 def entities() -> Iterable[EntitySpec]:
     return ENTITIES.values()
 

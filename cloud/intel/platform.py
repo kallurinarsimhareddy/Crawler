@@ -76,6 +76,8 @@ SERVICES: Dict[str, str] = {
     "job_imports": "cloud.intel.job_monitor.importer:JobImportService",
     # Signal outcomes / contact snapshots (migration 0013)
     "signal_outcomes": "cloud.intel.signals.outcomes:SignalOutcomeService",
+    # Jobs CSV export (migration 0014)
+    "job_exports": "cloud.intel.job_monitor.exports:JobExportService",
 }
 
 

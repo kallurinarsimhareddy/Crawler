@@ -214,7 +214,10 @@ class ImportService:
         return row
 
     def files(self, ctx: Ctx, batch_id: str) -> List[Dict[str, Any]]:
-        return self.store.all(ctx, "import_files", {"batch_id": batch_id}, order="created_at")
+        rows = self.store.all(ctx, "import_files", {"batch_id": batch_id}, order="created_at")
+        # Files added in the same request can share a created_at to the millisecond: a stable
+        # tie-break keeps the merge order (and so which value wins) deterministic.
+        return sorted(rows, key=lambda r: (r["created_at"], str(r.get("filename") or ""), r["id"]))
 
     def _custom_defs(self, ctx: Ctx) -> Dict[str, List[str]]:
         defs: Dict[str, List[str]] = {}

@@ -268,6 +268,10 @@ export function tableCell(job: JobLike, column: JobTableColumn): string {
 
 export type ImportMapping = Partial<Record<string, string | null>>;
 
+/** Fields an upload can map: the 14 job fields plus the optional source context. */
+export const IMPORT_FIELDS = [...JOB_FIELDS, "Source Board", "Search Term"] as const;
+export type ImportField = (typeof IMPORT_FIELDS)[number];
+
 export interface MappingCheck {
   ok: boolean;
   missing: JobField[];
@@ -286,7 +290,7 @@ export function checkMapping(mapping: ImportMapping, headers?: string[]): Mappin
   const missing = REQUIRED_IMPORT_FIELDS.filter((label) => !valid(label));
   const counts = new Map<string, number>();
   let mapped = 0;
-  for (const label of JOB_FIELDS) {
+  for (const label of IMPORT_FIELDS) {
     if (!valid(label)) continue;
     mapped += 1;
     const header = mapping[label] as string;
@@ -297,10 +301,10 @@ export function checkMapping(mapping: ImportMapping, headers?: string[]): Mappin
 }
 
 /** A complete mapping object (every field present; null for "not in file"), from the server's suggestion. */
-export function normalizeMapping(suggested: ImportMapping | null | undefined, headers: string[]): Record<JobField, string | null> {
+export function normalizeMapping(suggested: ImportMapping | null | undefined, headers: string[]): Record<ImportField, string | null> {
   const known = new Set(headers);
-  const out = {} as Record<JobField, string | null>;
-  for (const label of JOB_FIELDS) {
+  const out = {} as Record<ImportField, string | null>;
+  for (const label of IMPORT_FIELDS) {
     const header = suggested?.[label];
     out[label] = typeof header === "string" && known.has(header) ? header : null;
   }

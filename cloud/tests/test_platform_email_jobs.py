@@ -461,8 +461,8 @@ class VerifyUnknownsTests(unittest.TestCase):
         # Exports of VALID contain only VALID rows, with their source.
         _, content, _ = self.jobs.export(self.ctx, strict["id"], "csv", ["VALID"])
         self.assertEqual(len(list(csv.reader(io.StringIO(content.decode("utf-8-sig"))))), 1)  # header only
-        self.verify(self.built_in_job(["ann", "cara", "dan"]))
-        latest = self.platform.store.list(self.ctx, "email_validation_jobs", {}, order="-created_at", limit=1).rows[0]
+        latest = self.built_in_job(["ann", "cara", "dan"])   # this job itself: "-created_at" can tie within a ms
+        self.verify(latest)
         _, content, _ = self.jobs.export(self.ctx, latest["id"], "csv", ["VALID"], provider="emaillistverify")
         rows = list(csv.DictReader(io.StringIO(content.decode("utf-8-sig"))))
         self.assertEqual([(r["validation_email"], r["validation_status"], r["validation_source"]) for r in rows],
