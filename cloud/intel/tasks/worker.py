@@ -321,4 +321,10 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    # ``python -m cloud.intel.tasks.worker`` loads this file as ``__main__``; handlers import
+    # ``cloud.intel.tasks.worker`` and would get a SECOND copy of TaskPaused / TaskCancelled /
+    # PermanentTaskError that this loop's ``except`` clauses never match (a pause or cancel then
+    # looked like a crash and was retried). Run the canonical module's loop instead.
+    from cloud.intel.tasks import worker as _canonical
+
+    raise SystemExit(_canonical.main())
