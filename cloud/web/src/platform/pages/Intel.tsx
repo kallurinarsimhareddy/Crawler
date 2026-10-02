@@ -1,7 +1,8 @@
 // Contacts, job postings, hiring intelligence and company discovery.
 
-import { useState } from "react";
+import { useState, type FormEvent } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
+import "../styles/jobs.css";
 import { ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
 import { CreateForm } from "../ResourcePage";
@@ -173,35 +174,145 @@ export function Postings() {
   );
 }
 
-const SIGNAL_TYPES = ["NEW_ROLE", "MULTIPLE_RELEVANT_ROLES", "HIRING_SPIKE", "HIRING_VELOCITY", "LONG_OPEN_ROLE", "HARD_TO_FILL", "SPECIALIZED_TECHNOLOGY", "PROJECT_IMPLEMENTATION", "EXPANSION_HIRING", "BACKFILL_REPLACEMENT", "LEADERSHIP_HIRING"];
+const SIGNAL_TYPES = [
+  "NEW_ROLE", "MULTIPLE_RELEVANT_ROLES", "HIRING_SPIKE", "HIRING_VELOCITY", "LONG_OPEN_ROLE", "HARD_TO_FILL",
+  "SPECIALIZED_TECHNOLOGY", "PROJECT_IMPLEMENTATION", "EXPANSION_HIRING", "BACKFILL_REPLACEMENT", "LEADERSHIP_HIRING",
+  "HIRING_CLUSTER", "STACK_MIGRATION", "DEPARTURE",
+];
+const SIGNAL_OUTCOMES = ["contacted", "replied", "meeting", "opportunity", "no_response", "disqualified"];
+
+/** "replied 2 · meeting 1" from a signal's outcome_counts. */
+function outcomeCounts(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  return SIGNAL_OUTCOMES.filter((o) => Number((value as Record<string, unknown>)[o]) > 0)
+    .map((o) => `${o.replace(/_/g, " ")} ${Number((value as Record<string, unknown>)[o])}`)
+    .join(" · ");
+}
+
+/** The closed loop for one signal: what happened after it produced a prospect / campaign. */
+function SignalOutcomes({ signal, onClose, onRecorded }: { signal: Row; onClose: () => void; onRecorded: () => void }) {
+  const client = useWs();
+  const action = useAction();
+  const [reload, setReload] = useState(0);
+  const [outcome, setOutcome] = useState("meeting");
+  const [note, setNote] = useState("");
+  const list = useLoad((s) => client.get<{ rows: Row[] }>(`/hiring-signals/${encodeURIComponent(signal.id)}/outcomes`, undefined, s), `${client.base}|outcomes|${signal.id}|${reload}`);
+  const rows = list.data?.rows ?? [];
+  const record = (event: FormEvent) => {
+    event.preventDefault();
+    void action.run(async () => {
+      await client.post(`/hiring-signals/${encodeURIComponent(signal.id)}/outcomes`, { outcome, note: note.trim() || undefined });
+      setNote("");
+      setReload((n) => n + 1);
+      onRecorded();
+    });
+  };
+  return (
+    <div className="card pad jm-outcomes">
+      <div className="title-row">
+        <h3>Outcomes · <Pill value={signal.signal_type} /> {String(signal.company_name ?? "") || null}</h3>
+        <button type="button" className="button button--ghost button--small" onClick={onClose}>Close</button>
+      </div>
+      {signal.summary ? <p className="small">{String(signal.summary)}</p> : null}
+      {(list.error || action.error) && <ErrorBanner error={(list.error ?? action.error)!} onRetry={list.refresh} />}
+      {list.loading && !list.data ? <Loading /> : rows.length === 0 ? (
+        <p className="muted small">No outcome yet. Outcomes are written back automatically when a prospect from this signal is contacted, replies, finishes a sequence without a reply, or becomes an opportunity.</p>
+      ) : (
+        <div className="table-wrap">
+          <table className="table">
+            <thead><tr><th>Outcome</th><th>When</th><th>Source</th><th>Prospect</th><th>Campaign</th><th>Note</th></tr></thead>
+            <tbody>
+              {rows.map((r) => (
+                <tr key={r.id} className="table__row">
+                  <td data-label="Outcome"><Pill value={r.outcome} /></td>
+                  <td data-label="When">{fmt(r.occurred_at)}</td>
+                  <td data-label="Source">{String(r.source ?? "")}</td>
+                  <td data-label="Prospect">{r.contact_id ? <Link className="link mono small" to={`/contacts/${r.contact_id}`}>{String(r.contact_id)}</Link> : <span className="muted">—</span>}</td>
+                  <td data-label="Campaign">{r.campaign_id ? <Link className="link mono small" to={`/campaigns/${r.campaign_id}`}>{String(r.campaign_id)}</Link> : <span className="muted">—</span>}</td>
+                  <td data-label="Note" className="small">{String(r.note ?? "") || <span className="muted">—</span>}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+      <form className="jm-outcomes__form" onSubmit={record}>
+        <label className="field">
+          <span className="field__label">Record an outcome</span>
+          <select className="input input--small" value={outcome} onChange={(e) => setOutcome(e.target.value)}>
+            {SIGNAL_OUTCOMES.map((o) => <option key={o} value={o}>{o.replace(/_/g, " ")}</option>)}
+          </select>
+        </label>
+        <label className="field field--wide">
+          <span className="field__label">Note (optional)</span>
+          <input className="input input--small" value={note} maxLength={2000} onChange={(e) => setNote(e.target.value)} />
+        </label>
+        <button type="submit" className="button button--primary button--small" disabled={action.busy}>{action.busy ? "Saving…" : "Record"}</button>
+      </form>
+    </div>
+  );
+}
 
 export function HiringIntel({ title = "Hiring intelligence" }: { title?: string }) {
   const client = useWs();
   const action = useAction();
-  const counts = useLoad((signal) => client.get<Record<string, unknown>>("/analytics/dashboard", undefined, signal).catch(() => null), client.base + "dash");
-  const bySignal = ((counts.data?.hiring_signals as Record<string, unknown> | undefined)?.by_type ?? {}) as Record<string, number>;
+  const [selected, setSelected] = useState<Row | null>(null);
+  const [reload, setReload] = useState(0);
+  const [jobRun, setJobRun] = useState<Record<string, unknown> | null>(null);
+  const counts = useLoad((signal) => client.get<Record<string, unknown>>("/analytics/dashboard", undefined, signal).catch(() => null), client.base + "dash" + reload);
+  // The dashboard reports active signals under "signals" (older payloads used "hiring_signals").
+  const bySignal = (((counts.data?.signals ?? counts.data?.hiring_signals) as Record<string, unknown> | undefined)?.by_type ?? {}) as Record<string, number>;
   return (
     <div className="page">
       <PageHeader
         title={title}
-        subtitle="Eleven evidence-backed signals. Backfill is only claimed when the posting says so."
-        actions={<button className="button button--primary" disabled={action.busy} onClick={() => action.run(() => client.post("/signals/run", {}))}>Detect signals now</button>}
+        subtitle="Evidence-backed signals from jobs, hiring patterns and authorized provider refreshes. Backfill is only claimed when the posting says so; a departure only when the provider reports it."
+        actions={
+          <>
+            <button className="button button--ghost" disabled={action.busy} onClick={() => action.run(async () => { setJobRun(await client.post<Record<string, unknown>>("/signals/jobs/run", {})); setReload((n) => n + 1); })}>Detect job signals now</button>
+            <button className="button button--primary" disabled={action.busy} onClick={() => action.run(() => client.post("/signals/run", {}))}>Detect signals now</button>
+          </>
+        }
       />
       {action.error && <ErrorBanner error={action.error} />}
+      {jobRun && (
+        <p className="alert alert--info small" role="status">
+          Job signals: {["HIRING_CLUSTER", "STACK_MIGRATION", "DEPARTURE"].map((t) => `${Number(jobRun[t] ?? 0).toLocaleString()} ${t.replace(/_/g, " ").toLowerCase()}`).join(" · ")}
+          {" "}({Number(jobRun.inserted ?? 0).toLocaleString()} new, {Number(jobRun.expired ?? 0).toLocaleString()} expired)
+        </p>
+      )}
       <div className="stats stats--wrap">
         {SIGNAL_TYPES.map((t) => (
           <Stat key={t} label={t.replace(/_/g, " ").toLowerCase()} value={bySignal[t] ?? 0} />
         ))}
       </div>
+      {selected && <SignalOutcomes key={selected.id} signal={selected} onClose={() => setSelected(null)} onRecorded={() => setReload((n) => n + 1)} />}
       <ResourceList
+        reloadKey={String(reload)}
         load={(query, signal) => client.list("/hiring-signals", query, signal)}
         columns={[
           { key: "signal_type", label: "Signal", render: (r) => <Pill value={r.signal_type} /> },
-          { key: "company_id", label: "Company", render: (r) => <Link className="link" to={`/companies/${r.company_id}`}>open</Link> },
+          {
+            key: "company_id", label: "Company",
+            render: (r) => (r.company_id
+              ? <Link className="link" to={`/companies/${r.company_id}`}>{String(r.company_name ?? "") || "open"}</Link>
+              : r.company_name ? <span title="Not a CRM company yet">{String(r.company_name)}</span> : <span className="muted">—</span>),
+          },
           { key: "summary", label: "Evidence summary" },
+          { key: "technologies", label: "Technologies", render: (r) => <Tags values={r.technologies} /> },
           { key: "confidence", label: "Confidence" },
           { key: "reason_codes", label: "Reason codes", render: (r) => <Tags values={r.reason_codes} /> },
           { key: "detected_at", label: "Detected", render: (r) => fmtDate(r.detected_at) },
+          {
+            key: "outcome", label: "Outcome",
+            render: (r) => (
+              <span>
+                {r.outcome ? <Pill value={r.outcome} /> : <span className="muted">—</span>}
+                {outcomeCounts(r.outcome_counts) && <span className="muted small jm-block">{outcomeCounts(r.outcome_counts)}</span>}
+                <button type="button" className="link-button small" onClick={(e) => { e.stopPropagation(); setSelected(r); }}>Outcomes</button>
+              </span>
+            ),
+          },
         ]}
         filters={[{ key: "signal_type", label: "Signal", options: SIGNAL_TYPES }, { key: "status", label: "Status", options: ["active", "expired", "dismissed"] }]}
       />

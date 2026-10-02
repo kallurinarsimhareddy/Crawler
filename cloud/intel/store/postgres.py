@@ -98,7 +98,29 @@ class PostgresStore(Store):
 
         clauses = [sql.SQL("workspace_id = %s")]
         params: List[Any] = [ctx.workspace_id]
+        clauses.extend(self._clauses(spec, filters, params))
+        if q and spec.searchable:
+            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            ors = [sql.SQL("{}::text ilike %s").format(sql.Identifier(c)) for c in spec.searchable]
+            clauses.append(sql.SQL("(") + sql.SQL(" or ").join(ors) + sql.SQL(")"))
+            params.extend([f"%{escaped}%"] * len(ors))
+        return sql.SQL(" and ").join(clauses), params
+
+    def _clauses(self, spec: EntitySpec, filters, params: List[Any]) -> List[Any]:
+        """One SQL clause per parsed filter; ``or`` groups recurse (each group is ANDed inside).
+        ``params`` is appended to in clause order."""
+        from psycopg import sql
+
+        clauses: List[Any] = []
         for name, op, value in filters:
+            if op in ("or", "and"):
+                groups = []
+                for group in value:
+                    inner = self._clauses(spec, group, params)
+                    groups.append(sql.SQL("(") + sql.SQL(" and ").join(inner or [sql.SQL("true")]) + sql.SQL(")"))
+                joiner, empty = (" or ", "false") if op == "or" else (" and ", "true")
+                clauses.append(sql.SQL("(") + sql.SQL(joiner).join(groups or [sql.SQL(empty)]) + sql.SQL(")"))
+                continue
             ident = sql.Identifier(name)
             col = spec.columns.get(name) or COMMON_COLUMNS.get(name)
             if op == "isnull":
@@ -127,12 +149,7 @@ class PostgresStore(Store):
                 symbol = {"eq": "=", "ne": "is distinct from", "gte": ">=", "lte": "<=", "gt": ">", "lt": "<"}[op]
                 clauses.append(sql.SQL("{} " + symbol + " %s").format(ident))
                 params.append(self._adapt(spec, name, value))
-        if q and spec.searchable:
-            escaped = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            ors = [sql.SQL("{}::text ilike %s").format(sql.Identifier(c)) for c in spec.searchable]
-            clauses.append(sql.SQL("(") + sql.SQL(" or ").join(ors) + sql.SQL(")"))
-            params.extend([f"%{escaped}%"] * len(ors))
-        return sql.SQL(" and ").join(clauses), params
+        return clauses
 
     def _table(self, spec: EntitySpec):
         from psycopg import sql
@@ -273,6 +290,17 @@ class PostgresStore(Store):
             row = conn.execute(query, [row_id, ctx.workspace_id]).fetchone()
         return _plain(row) if row else None
 
+    def _rows(self, ctx: Ctx, spec: EntitySpec, filters, q, order, limit) -> List[Dict[str, Any]]:
+        from psycopg import sql
+
+        where, params = self._where(spec, ctx, filters, q)
+        order_sql = sql.SQL(", ").join(
+            sql.SQL("{} {} nulls last").format(sql.Identifier(n), sql.SQL("desc" if d else "asc")) for n, d in order)
+        with self._tx(self._scope(ctx)) as conn:
+            rows = conn.execute(sql.SQL("select * from {} where {} order by {} limit %s").format(
+                self._table(spec), where, order_sql), params + [limit]).fetchall()
+        return [_plain(r) for r in rows]
+
     def _list(self, ctx: Ctx, spec: EntitySpec, filters, q, order, limit, offset) -> Page:
         from psycopg import sql
 
@@ -299,6 +327,17 @@ class PostgresStore(Store):
         with self._tx(self._scope(ctx)) as conn:
             rows = conn.execute(query, params).fetchall()
         return {(str(r["value"]) if isinstance(r["value"], uuid.UUID) else r["value"]): r["n"] for r in rows}
+
+    def _count_by_day(self, ctx: Ctx, spec: EntitySpec, column: str, filters) -> Dict[str, int]:
+        from psycopg import sql
+
+        where, params = self._where(spec, ctx, filters, None)
+        query = sql.SQL("select (({} at time zone 'UTC')::date)::text as day, count(*) as n from {} where {} "
+                        "and {} is not null group by 1").format(sql.Identifier(column), self._table(spec), where,
+                                                                sql.Identifier(column))
+        with self._tx(self._scope(ctx)) as conn:
+            rows = conn.execute(query, params).fetchall()
+        return {r["day"]: r["n"] for r in rows}
 
     # --- workspaces --------------------------------------------------------
 

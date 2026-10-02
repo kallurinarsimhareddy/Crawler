@@ -261,6 +261,10 @@ class CampaignService:
                 score=best["score"], score_breakdown={"campaign_match": best["reasons"]}, reason=reason[:2000],
                 campaign_id=campaign["id"], evidence=evidence, source="campaign_mapping")
             proposal.update({"created": True, "opportunity": opportunity, "status": "created"})
+            try:
+                self.platform.service("signal_outcomes").on_opportunity(ctx, opportunity)
+            except Exception:  # noqa: BLE001 - the opportunity exists; the outcome is best effort
+                log.exception("could not write the opportunity outcome back to its signals")
             audit(self.store, ctx, "campaign.map_opportunity", entity_type="opportunities",
                   entity_id=opportunity.get("id"), summary=title[:200],
                   changes={"campaign_id": campaign["id"], "score": best["score"]})

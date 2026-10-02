@@ -26,9 +26,9 @@ export function JobsTable({ jobs, compact = false }: Props) {
         </thead>
         <tbody>
           {jobs.map((job) => (
-            <tr key={job.job_id} className="table__row" onClick={() => navigate(`/jobs/${job.job_id}`)}>
+            <tr key={job.job_id} className="table__row" onClick={() => navigate(`/settings/crawls/${job.job_id}`)}>
               <td data-label="Job ID">
-                <Link to={`/jobs/${job.job_id}`} className="mono" onClick={(event) => event.stopPropagation()} title={job.job_id}>
+                <Link to={`/settings/crawls/${job.job_id}`} className="mono" onClick={(event) => event.stopPropagation()} title={job.job_id}>
                   {shortId(job.job_id)}
                 </Link>
               </td>

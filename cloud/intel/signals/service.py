@@ -40,6 +40,7 @@ SIGNAL_WEIGHTS = {
     "NEW_ROLE": 15, "MULTIPLE_RELEVANT_ROLES": 15, "HIRING_SPIKE": 20, "HIRING_VELOCITY": 15, "LONG_OPEN_ROLE": 10,
     "HARD_TO_FILL": 10, "SPECIALIZED_TECHNOLOGY": 15, "PROJECT_IMPLEMENTATION": 20, "EXPANSION_HIRING": 10,
     "BACKFILL_REPLACEMENT": 5, "LEADERSHIP_HIRING": 15,
+    "HIRING_CLUSTER": 15, "STACK_MIGRATION": 20, "DEPARTURE": 15,
 }
 
 #: Used when no campaign states its own fit rules (campaign.rules.{industries,countries,min_employees,max_employees}).
@@ -129,6 +130,119 @@ class SignalService:
                                                          "hiring_velocity": float(agg["velocity_30d"])})
         self.score_company(ctx, company_id)
         return [s for s in kept if s]
+
+    # --- job- and contact-derived signals (migration 0013) ---------------------------
+
+    JOB_SIGNAL_TYPES = ("HIRING_CLUSTER", "STACK_MIGRATION", "DEPARTURE")
+    _SLIM = ("id", "company_id", "company_name", "domain", "title", "job_url", "status", "relevance_class",
+             "matched_keywords", "technologies", "skills", "keyword_1", "keyword_2", "keyword_3", "keyword_4",
+             "keyword_5", "first_seen_at", "last_seen_at")
+
+    def _iter_jobs(self, ctx: Ctx, filters: Mapping[str, Any], *, batch: int = 2000):
+        last_id = ""
+        while True:
+            page = dict(filters)
+            if last_id:
+                page["id__gt"] = last_id
+            rows = self.store.rows(ctx, "job_postings", page, order="id", limit=batch)
+            if not rows:
+                return
+            last_id = rows[-1]["id"]
+            for row in rows:
+                yield {k: row.get(k) for k in self._SLIM} | {"description": (row.get("description") or "")[:5000]}
+
+    def detect_job_signals(self, ctx: Ctx, *, now: Optional[datetime] = None) -> Dict[str, int]:
+        """HIRING_CLUSTER / STACK_MIGRATION from the job database and DEPARTURE from provider
+        contact snapshots (rules in :mod:`cloud.intel.signals.jobsignals`). Idempotent: signals
+        are upserted by fingerprint in bulk; ones no longer supported expire; dismissed ones stay."""
+        from datetime import timedelta
+
+        from cloud.intel.signals import jobsignals
+
+        now = now or utcnow()
+        relevant = list(self._iter_jobs(ctx, {"status": list(jobsignals.ACTIVE),
+                                              "relevance_class": list(jobsignals.RELEVANT)}))
+        recent = list(self._iter_jobs(ctx, {"last_seen_at__gte": now - timedelta(
+            days=jobsignals.MIGRATION_WINDOW_DAYS)}))
+        found = jobsignals.detect_clusters(relevant, now=now) + jobsignals.detect_migrations(recent, now=now)
+        found += self.detect_departures(ctx)
+        stats = self._persist_job_signals(ctx, found, now=now)
+        stats.update({"jobs_considered": len(recent), "relevant_open_jobs": len(relevant)})
+        return stats
+
+    def detect_departures(self, ctx: Ctx) -> List[Any]:
+        from cloud.intel.signals import jobsignals
+
+        snapshots = self.store.all(ctx, "contact_snapshots", {"provider": ["zoominfo", "seamless"]},
+                                   order="observed_at", cap=200_000)
+        ids = sorted({s["contact_id"] for s in snapshots})
+        contacts = {c["id"]: c for c in self.store.all(ctx, "contacts", {"id": ids}, cap=len(ids) + 1)} if ids else {}
+        return jobsignals.detect_departures(contacts, snapshots)
+
+    def _persist_job_signals(self, ctx: Ctx, found: Sequence[Any], *, now: datetime) -> Dict[str, int]:
+        existing = {r["fingerprint"]: r for r in self.store.all(
+            ctx, "hiring_signals", {"signal_type": list(self.JOB_SIGNAL_TYPES)}, cap=500_000)}
+        stats = {t: 0 for t in self.JOB_SIGNAL_TYPES} | {"inserted": 0, "refreshed": 0, "expired": 0}
+        inserts: List[Dict[str, Any]] = []
+        updates: List[tuple] = []
+        seen = set()
+        for sig in found:
+            if sig.fingerprint in seen:
+                continue
+            seen.add(sig.fingerprint)
+            stats[sig.signal_type] += 1
+            values = {"company_id": sig.company_id, "company_name": (sig.company_name or "")[:300] or None,
+                      "domain": sig.domain, "contact_id": sig.contact_id, "signal_type": sig.signal_type,
+                      "window_start": sig.window_start, "window_end": sig.window_end,
+                      "confidence": round(sig.confidence, 3), "strength": round(sig.strength, 1),
+                      "reason_codes": sig.reason_codes[:30], "summary": sig.summary[:1000],
+                      "evidence": sig.evidence, "job_posting_ids": sig.job_posting_ids[:200],
+                      "technologies": sig.technologies[:50], "source": "job_signals"}
+            row = existing.get(sig.fingerprint)
+            if row is None:
+                inserts.append({**values, "detected_at": now, "status": "active", "fingerprint": sig.fingerprint})
+            elif row["status"] != "dismissed":
+                updates.append((row["id"], {**values, "status": "active"}))
+        for old in existing.values():
+            if old["status"] == "active" and old.get("source") == "job_signals" and old["fingerprint"] not in seen:
+                updates.append((old["id"], {"status": "expired"}))
+                stats["expired"] += 1
+        for start in range(0, len(inserts), 500):
+            try:
+                self.store.insert_many(ctx, "hiring_signals", inserts[start:start + 500])
+            except ConflictError:   # a concurrent detection stored one first: insert one by one
+                for one in inserts[start:start + 500]:
+                    try:
+                        self.store.insert(ctx, "hiring_signals", one)
+                    except ConflictError:
+                        pass
+        for start in range(0, len(updates), 500):
+            self.store.update_many(ctx, "hiring_signals", updates[start:start + 500])
+        stats["inserted"] = len(inserts)
+        stats["refreshed"] = len(updates) - stats["expired"]
+        return stats
+
+    def record_contact_snapshot(self, ctx: Ctx, contact: Mapping[str, Any], *, provider: str,
+                                person: Mapping[str, Any], company: Optional[Mapping[str, Any]] = None,
+                                observed_at: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+        """Store what an authorized provider just reported about a person (the evidence a later
+        DEPARTURE needs). The provider's own employment status is kept when it gives one;
+        otherwise a person returned *for* a company is current at that company."""
+        if provider not in ("zoominfo", "seamless") or not contact.get("id"):
+            return None
+        pid = person.get("zoominfo_id") or person.get("provider_contact_id") or person.get("seamless_id") \
+            or person.get("id")
+        status = str(person.get("employment_status") or "").lower()
+        if status not in ("current", "left_company"):
+            status = "current" if company is not None else "unknown"
+        return self.store.insert(ctx, "contact_snapshots", {
+            "contact_id": contact["id"], "provider": provider, "provider_contact_id": str(pid)[:200] if pid else None,
+            "company_id": (company or {}).get("id") or contact.get("company_id"),
+            "company_name": (person.get("company_name") or (company or {}).get("name") or "")[:300] or None,
+            "title": (person.get("title") or "")[:300] or None, "employment_status": status,
+            "observed_at": observed_at or utcnow(), "evidence": {k: person.get(k) for k in (
+                "full_name", "title", "company_name", "employment_status", "contact_accuracy_score") if
+                person.get(k) is not None}})
 
     def dismiss(self, ctx: Ctx, signal_id: str) -> Dict[str, Any]:
         row = self.store.update(ctx, "hiring_signals", signal_id, {"status": "dismissed"})

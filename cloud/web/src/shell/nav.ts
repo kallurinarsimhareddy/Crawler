@@ -55,7 +55,9 @@ export const NAV: NavGroup[] = [
     title: "Intelligence",
     icon: "spark",
     items: [
-      { to: "/hiring", label: "Hiring Intelligence", icon: "trend", also: ["/postings"], keywords: "jobs postings trends technology" },
+      { to: "/hiring", label: "Hiring Intelligence", icon: "trend", keywords: "jobs postings trends technology" },
+      { to: "/jobs", label: "Jobs", icon: "briefcase", also: ["/postings"], keywords: "job feed postings openings new changed closed import historical" },
+      { to: "/monitors", label: "Monitors", icon: "eye", keywords: "job source monitor careers page schedule new jobs changed closed" },
       { to: "/signals", label: "Signals", icon: "signal", keywords: "hiring signals" },
       { to: "/research", label: "Research Agent", icon: "bot", also: ["/ai"], keywords: "ai control room research" },
       { to: "/scraper", label: "AI Scraper", icon: "scraper", keywords: "extract crawl websites urls" },
@@ -67,7 +69,7 @@ export const NAV: NavGroup[] = [
     icon: "workflow",
     items: [
       { to: "/workflows", label: "Workflows", icon: "workflow", keywords: "automation builder" },
-      { to: "/monitors", label: "Monitors", icon: "eye", keywords: "watch changes alerts" },
+      { to: "/change-monitors", label: "Change monitors", icon: "eye", keywords: "watch changes alerts companies lists segments" },
     ],
   },
   { key: "analytics", title: "Analytics", icon: "chart", to: "/analytics", items: [{ to: "/analytics", label: "Analytics", icon: "chart", also: ["/dashboard"] }] },
@@ -84,7 +86,7 @@ export const NAV: NavGroup[] = [
       { to: "/settings/integrations", label: "Integrations", icon: "plug", keywords: "slack webhooks calendar google workspace microsoft" },
       { to: "/settings/users", label: "Users & Permissions", icon: "shield", keywords: "team members roles invite admin manager read-only" },
       { to: "/settings/audit", label: "Audit Log", icon: "history", keywords: "history who changed activity log security" },
-      { to: "/settings", label: "Settings", icon: "settings", also: ["/credits", "/background", "/jobs", "/new", "/ai/memory"], keywords: "credits background jobs crawls ai memory workspace" },
+      { to: "/settings", label: "Settings", icon: "settings", also: ["/credits", "/background", "/new", "/ai/memory"], keywords: "credits background jobs crawls ai memory workspace" },
     ],
   },
 ];
@@ -117,7 +119,8 @@ export function destinations(): { to: string; label: string; section: string; ic
   ).concat([
     { to: "/ai", label: "AI workspace (Control Room)", section: "Intelligence", icon: "bot", keywords: "ask ai plan run canvas" },
     { to: "/dashboard", label: "Workspace overview", section: "Analytics", icon: "chart", keywords: "dashboard" },
-    { to: "/postings", label: "Jobs", section: "Intelligence", icon: "briefcase", keywords: "postings openings" },
+    { to: "/jobs/import", label: "Import historical jobs", section: "Intelligence", icon: "upload", keywords: "job postings csv xlsx history upload" },
+    { to: "/jobs/keywords", label: "Relevance keywords", section: "Intelligence", icon: "filter", keywords: "job relevance keyword workbook score high review reject" },
     { to: "/segments", label: "Segments", section: "CRM", icon: "filter", keywords: "saved filters" },
     { to: "/suppressions", label: "Suppression list", section: "GTM", icon: "block", keywords: "unsubscribe bounce do not contact blocklist compliance" },
     { to: "/notifications", label: "Notifications", section: "", icon: "bell", keywords: "alerts inbox" },
@@ -125,7 +128,7 @@ export function destinations(): { to: string; label: string; section: string; ic
     { to: "/credits", label: "Credits", section: "Admin", icon: "coin", keywords: "billing usage providers" },
     { to: "/background", label: "Background jobs", section: "Admin", icon: "clock", keywords: "tasks queue" },
     { to: "/ai/memory", label: "AI memory", section: "Admin", icon: "bot", keywords: "aliases preferences" },
-    { to: "/jobs", label: "Crawls", section: "Admin", icon: "scraper", keywords: "careers crawler" },
+    { to: "/settings/crawls", label: "Crawls", section: "Admin", icon: "scraper", keywords: "careers crawler" },
     // Task shortcuts: common jobs by what people want to do, not by page name.
     { to: "/email-validation", label: "Validate a file of emails", section: "Do", icon: "mailcheck", keywords: "upload csv xlsx verify clean list" },
     { to: "/internal-data", label: "Import a batch of files", section: "Do", icon: "layers", keywords: "internal data multi-file merge" },

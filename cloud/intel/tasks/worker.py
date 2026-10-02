@@ -62,6 +62,9 @@ HANDLERS: Dict[str, str] = {
     "scoring": "cloud.intel.scoring.service:run_scoring_task",
     "internal_data": "cloud.intel.imports.internal:run_internal_data_task",
     "integration": "cloud.intel.integrations.service:run_integration_task",
+    "job_monitor": "cloud.intel.job_monitor.runner:run_job_monitor_task",
+    "job_import": "cloud.intel.job_monitor.importer:run_job_import_task",
+    "job_lifecycle": "cloud.intel.job_monitor.runner:run_job_lifecycle_task",
 }
 
 
@@ -84,7 +87,7 @@ class TaskCancelled(Exception):
 #: Services whose ``tick(ctx) -> int`` runs on every maintenance pass, per workspace.
 #: A tick must be cheap when there is nothing due and must never send email unless
 #: every sending gate allows it.
-PERIODIC_SERVICES = ("outbox", "automation")
+PERIODIC_SERVICES = ("outbox", "automation", "job_monitors")
 
 
 def resolve_handler(kind: str) -> Callable[..., Dict[str, Any]]:

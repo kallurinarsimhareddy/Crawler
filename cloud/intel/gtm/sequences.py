@@ -594,11 +594,14 @@ class SequenceService:
     def _event(self, ctx: Ctx, enrollment: Mapping[str, Any], event: str, *, provider: Optional[str] = None,
                provider_message_id: Optional[str] = None, data: Optional[Mapping[str, Any]] = None,
                mailbox_id: Optional[str] = None) -> Dict[str, Any]:
-        return self.store.insert(ctx, "message_events", {
+        row = self.store.insert(ctx, "message_events", {
             "enrollment_id": enrollment.get("id"), "contact_id": enrollment.get("contact_id"),
             "campaign_id": enrollment.get("campaign_id"), "event": event, "provider": provider,
             "provider_message_id": provider_message_id, "occurred_at": utcnow(), "data": dict(data or {}),
             "mailbox_id": mailbox_id})
+        if enrollment.get("signal_id"):
+            self.platform.service("signal_outcomes").on_message_event(ctx, row)   # never raises
+        return row
 
     def _stop(self, ctx: Ctx, enrollment: Mapping[str, Any], status: str, reason: str) -> None:
         self.store.update(ctx, "sequence_enrollments", enrollment["id"], {
@@ -639,9 +642,11 @@ class SequenceService:
         steps = self.steps(ctx, enrollment["sequence_id"])
         position = enrollment["current_step"]
         if position >= len(steps):
-            self.store.update(ctx, "sequence_enrollments", enrollment["id"], {"status": "completed",
-                                                                              "next_step_at": None})
+            done = self.store.update(ctx, "sequence_enrollments", enrollment["id"], {"status": "completed",
+                                                                                     "next_step_at": None})
             stats["completed"] += 1
+            if done.get("signal_id"):
+                self.platform.service("signal_outcomes").on_enrollment_finished(ctx, done)
             return
         step = steps[position]
         contact = self.store.get(ctx, "contacts", enrollment["contact_id"])
@@ -749,7 +754,11 @@ class SequenceService:
             stats["completed"] += 1
         else:
             changes["next_step_at"] = now + timedelta(days=steps[next_position]["delay_days"])
-        self.store.update(ctx, "sequence_enrollments", enrollment["id"], changes)
+        updated = self.store.update(ctx, "sequence_enrollments", enrollment["id"], changes)
+        if changes.get("status") == "completed" and updated.get("signal_id"):
+            # The sequence ran out without a reply: NO RESPONSE for the signal (a later reply
+            # still records REPLIED, which then becomes the signal's latest outcome).
+            self.platform.service("signal_outcomes").on_enrollment_finished(ctx, updated)
 
     def _queue(self, ctx: Ctx, enrollment: Mapping[str, Any], step: int, to: str, subject: str, body: str,
                mailbox: Optional[Mapping[str, Any]], now: datetime) -> Dict[str, Any]:

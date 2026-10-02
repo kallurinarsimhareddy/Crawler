@@ -55,7 +55,7 @@ export function Dashboard() {
       <section className="card">
         <div className="card__header">
           <h2>Recent crawls</h2>
-          <Link to="/jobs" className="link">
+          <Link to="/settings/crawls" className="link">
             View all
           </Link>
         </div>

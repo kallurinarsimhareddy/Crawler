@@ -216,6 +216,11 @@ class EventService:
                     self.store.update(ctx, "suppressions", row["id"], {"reason": precise})
             if kind == "replied" and result.get("contact_id"):
                 self._after_reply(ctx, result["contact_id"], provider)
+                try:
+                    self.platform.service("signal_outcomes").on_reply(ctx, result["contact_id"],
+                                                                      occurred_at=event.get("occurred_at"))
+                except Exception:  # noqa: BLE001 - the outcome loop never blocks reply handling
+                    log.exception("could not write the reply outcome back to its signal")
             return {"action": stop_kind, **result}
         # Informational events: record on the enrollment's timeline, change nothing else.
         event_name = {"bounced": "bounced", "deferred": "deferred", "delivered": "delivered", "opened": "opened",

@@ -1,4 +1,4 @@
-import { Link, Route, Routes } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { RequireAuth } from "./auth/RequireAuth";
 import { EmptyState } from "./components/Feedback";
 import { Layout } from "./components/Layout";
@@ -9,7 +9,11 @@ import { Login } from "./pages/Login";
 import { NewCrawl } from "./pages/NewCrawl";
 import { ResetPassword } from "./pages/ResetPassword";
 import { CompanyDetail } from "./platform/pages/Companies";
-import { ContactDetail, Discovery, HiringIntel, Postings, Provenance } from "./platform/pages/Intel";
+import { ContactDetail, Discovery, HiringIntel, Provenance } from "./platform/pages/Intel";
+import { JobView, JobsPage } from "./platform/pages/JobFeed";
+import { JobImportPage } from "./platform/pages/JobImport";
+import { JobKeywordsPage } from "./platform/pages/JobKeywords";
+import { MonitorDetail, MonitorsPage } from "./platform/pages/JobMonitors";
 import { Home } from "./platform/pages/Home";
 import { Analytics } from "./platform/pages/Analytics";
 import { AuditLog, Integrations, Notifications, UsersPermissions } from "./platform/pages/Admin";
@@ -32,6 +36,12 @@ function W({ children }: { children: React.ReactNode }) {
   return <RequireWorkspace>{children}</RequireWorkspace>;
 }
 
+/** /postings moved to /jobs (D1); old links keep their filters. */
+function PostingsRedirect() {
+  const { search } = useLocation();
+  return <Navigate to={`/jobs${search}`} replace />;
+}
+
 export function App() {
   return (
     <Routes>
@@ -49,10 +59,10 @@ export function App() {
           </RequireAuth>
         }
       >
-        {/* CareerCloud crawl pages, unchanged, under "Crawls" in the navigation. */}
+        {/* CareerCloud crawl pages, unchanged, under Settings → Crawls. */}
         <Route path="new" element={<NewCrawl />} />
-        <Route path="jobs" element={<Jobs />} />
-        <Route path="jobs/:jobId" element={<JobDetail />} />
+        <Route path="settings/crawls" element={<Jobs />} />
+        <Route path="settings/crawls/:jobId" element={<JobDetail />} />
 
         {/* The platform. Every page below is scoped to the selected workspace. */}
         <Route index element={<W><Home /></W>} />
@@ -63,7 +73,11 @@ export function App() {
         <Route path="companies/:companyId" element={<W><CompanyDetail /></W>} />
         <Route path="contacts" element={<W><ContactsSection /></W>} />
         <Route path="contacts/:contactId" element={<W><ContactDetail /></W>} />
-        <Route path="postings" element={<W><Postings /></W>} />
+        <Route path="postings" element={<PostingsRedirect />} />
+        <Route path="jobs" element={<W><JobsPage /></W>} />
+        <Route path="jobs/import" element={<W><JobImportPage /></W>} />
+        <Route path="jobs/keywords" element={<W><JobKeywordsPage /></W>} />
+        <Route path="jobs/:jobId" element={<W><JobView /></W>} />
         <Route path="opportunities" element={<W><Opportunities /></W>} />
         <Route path="opportunities/:id" element={<W><RecordView path="/opportunities" back="/opportunities" backLabel="Opportunities" /></W>} />
         <Route path="tasks" element={<W><ResourcePage config={TASKS} /></W>} />
@@ -88,7 +102,9 @@ export function App() {
         <Route path="lists/:listId" element={<W><ListDetail /></W>} />
         <Route path="segments" element={<W><ResourcePage config={SEGMENTS} /></W>} />
         <Route path="workflows" element={<W><AutomationBuilder /></W>} />
-        <Route path="monitors" element={<W><ResourcePage config={MONITORS} /></W>} />
+        <Route path="monitors" element={<W><MonitorsPage /></W>} />
+        <Route path="monitors/:monitorId" element={<W><MonitorDetail /></W>} />
+        <Route path="change-monitors" element={<W><ResourcePage config={MONITORS} /></W>} />
         <Route path="imports" element={<W><Imports /></W>} />
         <Route path="imports/:batchId" element={<W><ImportDetail /></W>} />
         <Route path="internal-data" element={<W><InternalData /></W>} />

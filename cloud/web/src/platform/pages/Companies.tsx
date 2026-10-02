@@ -7,6 +7,7 @@ import { CreateForm } from "../ResourcePage";
 import { OPPORTUNITY_COLUMNS } from "../resources";
 import { DataTable, KeyValues, PageHeader, Pill, ResourceList, Score, Stat, Tabs, Tags, fmt, fmtDate, useAction, useLoad, type Empty } from "../ui";
 import { useWs } from "../workspace";
+import { CompanyJobActivity } from "./CompanyJobActivity";
 import { ScorePanel } from "./Scoring";
 
 const COMPANY_FIELDS = [
@@ -190,6 +191,9 @@ export function CompanyDetail() {
           </div>
         )}
         {tab === "jobs" && (
+          <>
+            <CompanyJobActivity companyId={companyId} />
+            <h3 className="section-title">Crawled postings</h3>
           <SubList
             path={`/jobs?company_id=${companyId}`}
             empty="No jobs recorded for this company yet. Run a careers crawl."
@@ -203,6 +207,7 @@ export function CompanyDetail() {
               { key: "status", label: "Status", render: (r) => <Pill value={r.status} /> },
             ]}
           />
+          </>
         )}
         {tab === "contacts" && <CompanyContacts companyId={companyId} />}
         {tab === "technology" && (

@@ -37,6 +37,10 @@ def _sort_key(value: Any) -> Tuple[int, Any]:
 
 
 def _matches(row: Dict[str, Any], name: str, op: str, value: Any) -> bool:
+    if op == "or":
+        return any(all(_matches(row, n, o, v) for n, o, v in group) for group in value)
+    if op == "and":
+        return all(all(_matches(row, n, o, v) for n, o, v in group) for group in value)
     current = row.get(name)
     if op == "isnull":
         return (current is None) == bool(value)
@@ -291,6 +295,22 @@ class MemoryStore(Store):
                 for value in (values if isinstance(values, list) else [values]):
                     counts[value] = counts.get(value, 0) + 1
             return counts
+
+
+def _memory_count_by_day(self: MemoryStore, ctx: Ctx, spec: EntitySpec, column: str, filters) -> Dict[str, int]:
+    from datetime import timezone as _tz
+
+    with self._lock:
+        counts: Dict[str, int] = {}
+        for row in self._filtered(ctx, spec, filters, None):
+            value = row.get(column)
+            if value is not None:
+                day = str(value.astimezone(_tz.utc).date())
+                counts[day] = counts.get(day, 0) + 1
+        return counts
+
+
+MemoryStore._count_by_day = _memory_count_by_day  # type: ignore[attr-defined]
 
 
 def _memory_list_workspace_ids(self: MemoryStore) -> List[str]:

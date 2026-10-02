@@ -97,6 +97,51 @@ def dismiss_signal(signal_id: str, ctx: Ctx = Depends(write_ctx), platform: Plat
         raise http_error(error) from error
 
 
+@router.get("/w/{workspace_id}/hiring-signals/{signal_id}/outcomes", tags=["hiring-intelligence"])
+def signal_outcomes(signal_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    try:
+        return jsonable_encoder({"rows": platform.service("signal_outcomes").outcomes(ctx, signal_id)})
+    except PlatformError as error:
+        raise http_error(error) from error
+
+
+@router.post("/w/{workspace_id}/hiring-signals/{signal_id}/outcomes", status_code=status.HTTP_201_CREATED,
+             tags=["hiring-intelligence"])
+def record_signal_outcome(signal_id: str, body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
+                          platform: Platform = Depends(get_platform)):
+    """A person records what happened (meeting, opportunity, disqualified, ...) for a signal."""
+    try:
+        ctx.require_write()
+        row = platform.service("signal_outcomes").record(
+            ctx, signal_id, str(body.get("outcome") or ""), contact_id=body.get("contact_id"),
+            campaign_id=body.get("campaign_id"), enrollment_id=body.get("enrollment_id"),
+            opportunity_id=body.get("opportunity_id"), source="manual", note=body.get("note"))
+        return jsonable_encoder({"outcome": row, "duplicate": row is None})
+    except PlatformError as error:
+        raise http_error(error) from error
+
+
+@router.post("/w/{workspace_id}/sequence-enrollments/{enrollment_id}/signal", tags=["hiring-intelligence"])
+def link_enrollment_signal(enrollment_id: str, body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
+                           platform: Platform = Depends(get_platform)):
+    try:
+        return jsonable_encoder(platform.service("signal_outcomes").link_enrollment(
+            ctx, enrollment_id, str(body.get("signal_id") or "")))
+    except PlatformError as error:
+        raise http_error(error) from error
+
+
+@router.post("/w/{workspace_id}/signals/jobs/run", tags=["hiring-intelligence"])
+def run_job_signals(ctx: Ctx = Depends(write_ctx), platform: Platform = Depends(get_platform)):
+    """Job-derived signals (hiring clusters, stack migration) and provider-evidenced departures now
+    (the daily job_lifecycle task runs the same detection)."""
+    try:
+        ctx.require_write()
+        return jsonable_encoder(platform.service("signals").detect_job_signals(ctx))
+    except PlatformError as error:
+        raise http_error(error) from error
+
+
 @router.post("/w/{workspace_id}/signals/run", status_code=status.HTTP_201_CREATED, tags=["hiring-intelligence"])
 def run_signals(request: Request, body: Dict[str, Any] = Body(default={}), ctx: Ctx = Depends(write_ctx),
                 platform: Platform = Depends(get_platform)):

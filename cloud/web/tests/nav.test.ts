@@ -54,3 +54,22 @@ test("palette destinations are unique by route and label (React keys)", () => {
   const ids = destinations().map((d) => `${d.to}:${d.label}`);
   assert.equal(new Set(ids).size, ids.length);
 });
+
+test("job source monitor routing (D1): /jobs is the Jobs area, crawls moved under Settings", () => {
+  assert.equal(locate("/jobs")?.item?.label, "Jobs");
+  assert.equal(locate("/jobs/jp_1")?.item?.label, "Jobs");
+  assert.equal(locate("/jobs/import")?.item?.label, "Jobs");
+  assert.equal(locate("/postings")?.item?.label, "Jobs");
+  assert.equal(locate("/monitors/jm_1")?.item?.label, "Monitors");
+  assert.equal(locate("/settings/crawls")?.item?.label, "Settings");
+  assert.equal(locate("/settings/crawls/job_1")?.item?.label, "Settings");
+  const palette = destinations();
+  assert.equal(palette.find((d) => d.label === "Jobs")?.to, "/jobs");
+  assert.equal(palette.find((d) => d.label === "Crawls")?.to, "/settings/crawls");
+  for (const path of ["/jobs", "/jobs/import", "/jobs/keywords", "/jobs/:jobId", "/monitors", "/monitors/:monitorId", "/postings", "/settings/crawls", "/settings/crawls/:jobId"]) {
+    assert.ok(routes.has(path), `missing route ${path}`);
+  }
+  const intel = NAV.find((g) => g.key === "intel")!;
+  assert.ok(intel.items.some((i) => i.to === "/jobs" && i.label === "Jobs"));
+  assert.ok(intel.items.some((i) => i.to === "/monitors" && i.label === "Monitors"));
+});

@@ -1,0 +1,4 @@
+# Optional: the JobSpy job source (cloud/intel/job_monitor/jobspy_source.py).
+# Not installed by default. Every JobSpy board stays disabled until SANA_JOBSPY_BOARDS
+# lists it after access to that board has been authorized.
+python-jobspy==1.1.82

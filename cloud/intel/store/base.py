@@ -15,7 +15,10 @@ a list means "any of"; ``None`` means "is null". Suffixes add operators:
 ``col__gte``, ``col__lte``, ``col__gt``, ``col__lt``, ``col__ne``,
 ``col__contains`` (tags contain the value), ``col__ilike`` (substring,
 case-insensitive), ``col__isnull`` (bool). ``q`` searches the spec's
-searchable columns.
+searchable columns. ``any_of`` takes a list of filter dicts and matches rows
+that satisfy at least one of them (each dict is ANDed inside; groups nest), so
+callers can express ``a AND (b OR c)`` without leaving the spec's columns.
+``all_of`` is the AND twin (two conditions on one column).
 """
 
 from __future__ import annotations
@@ -34,6 +37,10 @@ __all__ = ["Page", "Store", "clean_values", "parse_filters", "OPERATORS", "MAX_P
 
 MAX_PAGE = 500
 OPERATORS = ("eq", "gte", "lte", "gt", "lt", "ne", "contains", "ilike", "isnull", "in")
+#: Reserved filter key for OR groups (``{"any_of": [{...}, {...}]}``) and its parsed operator.
+ANY_OF = "any_of"
+ALL_OF = "all_of"
+MAX_FILTER_DEPTH = 4
 
 
 @dataclass(frozen=True)
@@ -155,11 +162,24 @@ def clean_values(spec: EntitySpec, values: Mapping[str, Any], *, for_insert: boo
     return out
 
 
-def parse_filters(spec: EntitySpec, filters: Optional[Mapping[str, Any]]) -> List[Tuple[str, str, Any]]:
-    """``{"status": "open", "score__gte": 50}`` -> ``[("status","eq","open"), ("score","gte",50)]``."""
+def parse_filters(spec: EntitySpec, filters: Optional[Mapping[str, Any]], _depth: int = 0
+                  ) -> List[Tuple[str, str, Any]]:
+    """``{"status": "open", "score__gte": 50}`` -> ``[("status","eq","open"), ("score","gte",50)]``.
+
+    ``{"any_of": [{...}, {...}]}`` -> ``[("any_of", "or", [[...], [...]])]``."""
     out: List[Tuple[str, str, Any]] = []
     for key, value in (filters or {}).items():
         if key == "q":
+            continue
+        if key in (ANY_OF, ALL_OF):
+            if _depth >= MAX_FILTER_DEPTH:
+                raise ValidationError("filter groups are nested too deeply")
+            if not isinstance(value, (list, tuple)) or not value or not all(isinstance(g, Mapping) for g in value):
+                raise ValidationError(f"{key} must be a non-empty list of filter objects")
+            if len(value) > 50:
+                raise ValidationError(f"{key} accepts at most 50 groups")
+            out.append((key, "or" if key == ANY_OF else "and",
+                        [parse_filters(spec, group, _depth + 1) for group in value]))
             continue
         name, _, op = key.partition("__")
         op = op or ("in" if isinstance(value, (list, tuple, set)) else "eq")
@@ -323,6 +343,19 @@ class Store(ABC):
         return self._list(ctx, spec, parse_filters(spec, filters), str(q).strip() if q else None,
                           parse_order(spec, order), limit, offset)
 
+    def rows(self, ctx: Ctx, entity: str, filters: Optional[Mapping[str, Any]] = None, *,
+             order: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """One page of matching rows without a total count — for batch jobs that walk a large
+        table with keyset paging (``id__gt``), where counting every page would dominate."""
+        spec = get_spec(entity)
+        limit = max(1, min(int(limit), MAX_PAGE))
+        q = (filters or {}).get("q")
+        return self._rows(ctx, spec, parse_filters(spec, filters), str(q).strip() if q else None,
+                          parse_order(spec, order), limit)
+
+    def _rows(self, ctx: Ctx, spec: EntitySpec, filters, q, order, limit) -> List[Dict[str, Any]]:
+        return self._list(ctx, spec, filters, q, order, limit, 0).rows
+
     def all(self, ctx: Ctx, entity: str, filters: Optional[Mapping[str, Any]] = None, *,
             order: Optional[str] = None, cap: int = 100_000) -> List[Dict[str, Any]]:
         """Every matching row, paging internally. ``cap`` protects against runaway reads."""
@@ -351,6 +384,19 @@ class Store(ABC):
             raise ValidationError(f"{entity} has no field {column!r}")
         q = (filters or {}).get("q")
         return self._group_count(ctx, spec, column, parse_filters(spec, filters), str(q) if q else None)
+
+    def count_by_day(self, ctx: Ctx, entity: str, column: str, filters: Optional[Mapping[str, Any]] = None
+                     ) -> Dict[str, int]:
+        """Rows per UTC calendar day of the timestamp ``column`` ({"YYYY-MM-DD": n}) — counted by
+        the store (one GROUP BY in SQL), so a dashboard never loads the rows themselves."""
+        spec = get_spec(entity)
+        col = spec.columns.get(column) or COMMON_COLUMNS.get(column)
+        if col is None or col.kind != "ts":
+            raise ValidationError(f"{entity}.{column} is not a timestamp field")
+        return self._count_by_day(ctx, spec, column, parse_filters(spec, filters))
+
+    def _count_by_day(self, ctx: Ctx, spec: EntitySpec, column: str, filters) -> Dict[str, int]:
+        raise NotImplementedError
 
     # --- workspaces --------------------------------------------------------
 

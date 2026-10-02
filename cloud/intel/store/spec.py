@@ -55,6 +55,12 @@ class Col:
     #: creating migration keeps the original list (applied files never change);
     #: the named migration replaces the check constraint with ``choices``.
     widened: Optional[Tuple[str, Tuple[str, ...]]] = None
+    #: Later widenings of an already widened column: ``((migration, choices before it), ...)``,
+    #: in migration order. Each named migration replaces the check constraint again.
+    rewidened: Tuple[Tuple[str, Tuple[str, ...]], ...] = ()
+    #: The migration that dropped NOT NULL from a column an earlier migration created
+    #: as required. The creating migration keeps ``not null``; ``required`` is False.
+    relaxed: Optional[str] = None
     #: The migration that added this column to a table an earlier migration
     #: created (``alter table ... add column``). The creating migration leaves it out.
     added: Optional[str] = None
@@ -1042,16 +1048,33 @@ def _replace_spec(spec: EntitySpec, **changes: Any) -> EntitySpec:
     return replace(spec, **changes)
 
 
-def _widen(entity_name: str, column: str, *extra: str) -> None:
-    """Widen a column's choices in 0007; earlier migrations keep the original list."""
+def _widen(entity_name: str, column: str, *extra: str, version: str = "0007") -> None:
+    """Widen a column's choices in ``version``; earlier migrations keep the list they had."""
     from dataclasses import replace
 
     spec = ENTITIES[entity_name]
     col = spec.columns[column]
-    if col.widened:
-        raise ValueError(f"{entity_name}.{column} was already widened")
-    spec.columns[column] = replace(col, choices=tuple(col.choices) + tuple(extra),  # type: ignore[index]
-                                   widened=("0007", tuple(col.choices)))
+    choices = tuple(col.choices) + tuple(extra)  # type: ignore[arg-type]
+    if not col.widened:
+        spec.columns[column] = replace(col, choices=choices,  # type: ignore[index]
+                                       widened=(version, tuple(col.choices)))
+        return
+    latest = col.rewidened[-1][0] if col.rewidened else col.widened[0]
+    if version <= latest:
+        raise ValueError(f"{entity_name}.{column} was already widened in {latest}")
+    spec.columns[column] = replace(col, choices=choices,  # type: ignore[index]
+                                   rewidened=col.rewidened + ((version, tuple(col.choices)),))
+
+
+def _relax(entity_name: str, column: str, version: str) -> None:
+    """Drop NOT NULL from a required column in ``version`` (the creating migration keeps it)."""
+    from dataclasses import replace
+
+    spec = ENTITIES[entity_name]
+    col = spec.columns[column]
+    if not col.required or col.relaxed:
+        raise ValueError(f"{entity_name}.{column} is not a required column that can be relaxed")
+    spec.columns[column] = replace(col, required=False, relaxed=version)  # type: ignore[index]
 
 
 EMAIL_STATUSES = ("VALID", "INVALID", "RISKY", "UNKNOWN", "DISPOSABLE", "ROLE", "FREE_PROVIDER")
@@ -1364,6 +1387,258 @@ _add("workspace_invitations", {
 }, version="0009")
 ENTITIES["workspace_invitations"] = _replace_spec(ENTITIES["workspace_invitations"], admin_only="0009")
 
+
+# --- 0011: job source monitors -------------------------------------------------------
+# Continuous job intelligence: a saved source monitor re-reads a job site on a
+# schedule; every observed posting is upserted into job_postings (the master job
+# record) and classified NEW / CHANGED / UNCHANGED / REOPENED, and a posting is
+# CLOSED only after it is missing from enough *completed* full sweeps.
+# The 14 mandatory job fields map to job_postings as: Job URL -> job_url (key: url_key),
+# Job Title -> title, Company Name -> company_name, Location -> location, and the
+# columns added below. A field the source does not show stays NULL.
+JOB_MONITOR_STRATEGIES = ("wad_turbo", "site_profile", "ai_scraper", "jobspy")
+RELEVANCE_CLASSES = ("HIGH", "REVIEW", "REJECT")
+JOB_MONITOR_SCHEDULES = ("daily", "weekly", "manual")
+
+_widen("job_postings", "status", "unknown", version="0011")
+_relax("job_postings", "company_name", "0011")
+_widen("platform_tasks", "kind", "job_monitor", "job_import", version="0011")
+TASK_KINDS = ENTITIES["platform_tasks"].columns["kind"].choices
+_add("job_postings", {
+    "experience_level": _t(100),
+    "salary_budget": _t(200),
+    "keyword_1": _t(200),
+    "keyword_2": _t(200),
+    "keyword_3": _t(200),
+    "keyword_4": _t(200),
+    "keyword_5": _t(200),
+    "remote": _t(40),
+    "source": _t(200, index=True),
+    "scraped_date": Col("date", index=True),
+    "last_changed_at": Col("ts", index=True),
+    "content_hash": _t(64),
+    "source_monitor_id": _t(40, index=True),
+    "first_seen_run_id": _t(40, index=True),
+    "last_seen_run_id": _t(40),
+    "last_changed_run_id": _t(40, index=True),
+    "closed_run_id": _t(40, index=True),
+    "missed_full_sweeps": Col("int", required=True, default=0, minimum=0),
+    "missed_run_id": _t(40),
+    "observation_count": Col("int", required=True, default=0, minimum=0),
+    "company_match": Col("text", choices=("unmatched", "matched", "review"), required=True, default="unmatched"),
+    # Relevance (keyword universe from the workspace's active job_keyword_sets row)
+    "source_board": _t(100, index=True),
+    "search_term": _t(300),
+    "matched_keywords": _tags(),
+    "matched_categories": _tags(),
+    "relevance_score": Col("float", minimum=0, maximum=100, index=True),
+    "relevance_class": Col("text", choices=RELEVANCE_CLASSES, index=True),
+    "relevance_reason": _t(1000),
+    "relevance_version": _t(80),
+}, version="0011")
+
+entity("job_source_monitors", "jmon", {
+    "name": _t(200, required=True, search=True),
+    "source_url": _t(2048, required=True),
+    "source_name": _t(200, required=True, index=True),
+    "source_type": _choice("job_board", "company_careers", "ats_api", "feed"),
+    "strategy": _choice(*JOB_MONITOR_STRATEGIES),
+    "profile": _t(60),
+    "filters": _j(),
+    "extraction_schema": _j([]),
+    "schedule": _choice(*JOB_MONITOR_SCHEDULES),
+    "full_sweep_days": Col("int", required=True, default=7, minimum=1, maximum=90),
+    "close_after_missed": Col("int", required=True, default=2, minimum=1, maximum=10),
+    "incremental_stop_pages": Col("int", required=True, default=3, minimum=1, maximum=50),
+    "max_pages_incremental": Col("int", required=True, default=200, minimum=1, maximum=100000),
+    "max_pages_full": Col("int", required=True, default=20000, minimum=1, maximum=100000),
+    "outputs": Col("tags", required=True, default=["sana"]),
+    "enabled": Col("bool", required=True, default=True),
+    "next_run_at": Col("ts", index=True),
+    "next_full_sweep_at": Col("ts"),
+    "last_run_id": _t(40),
+    "last_run_at": Col("ts"),
+    "last_run_status": _t(40),
+    "last_full_sweep_at": Col("ts"),
+    "last_result": _j(),
+    "total_jobs": Col("int", required=True, default=0, minimum=0),
+}, unique=(("name",),), migration="0011",
+   description="A saved, scheduled job source: where to read, how (strategy + site profile), "
+               "which fields, and how often; runs feed job_postings.")
+
+entity("job_monitor_runs", "jmr", {
+    "monitor_id": _t(40, required=True, index=True),
+    "mode": _choice("incremental", "full"),
+    "trigger": _choice("schedule", "manual", "api"),
+    "status": _choice("queued", "running", "completed", "partial", "failed", "cancelled"),
+    "task_id": _t(40),
+    "started_at": Col("ts"),
+    "finished_at": Col("ts"),
+    "pages": Col("int", required=True, default=0, minimum=0),
+    "found": Col("int", required=True, default=0, minimum=0),
+    "new_count": Col("int", required=True, default=0, minimum=0),
+    "changed_count": Col("int", required=True, default=0, minimum=0),
+    "unchanged_count": Col("int", required=True, default=0, minimum=0),
+    "reopened_count": Col("int", required=True, default=0, minimum=0),
+    "closed_count": Col("int", required=True, default=0, minimum=0),
+    "rejected_count": Col("int", required=True, default=0, minimum=0),
+    "error_count": Col("int", required=True, default=0, minimum=0),
+    "warning_count": Col("int", required=True, default=0, minimum=0),
+    "request_count": Col("int", required=True, default=0, minimum=0),
+    "duration_seconds": Col("float", minimum=0),
+    "stop_reason": _t(500),
+    "error": _t(2000),
+    "checkpoint": _j(),
+    "notes": _j([]),
+}, migration="0011", default_order="created_at desc",
+   description="One execution of a job source monitor (incremental or full sweep) with its counts and "
+               "a resumable checkpoint.")
+
+entity("job_posting_changes", "jpc", {
+    "job_posting_id": _t(40, required=True, index=True),
+    "monitor_id": _t(40, index=True),
+    "run_id": _t(40, index=True),
+    "import_id": _t(40),
+    "change": _choice("new", "changed", "closed", "reopened"),
+    "changed_fields": _tags(),
+    "before": _j(),
+    "after": _j(),
+    "detected_at": Col("ts", required=True),
+}, append_only=True, migration="0011", default_order="detected_at desc",
+   description="Job history: when a posting appeared, which fields changed (previous values kept), "
+               "when it closed or reopened.")
+
+entity("job_imports", "jimp", {
+    "filename": _t(300, required=True),
+    "format": _choice("csv", "xlsx"),
+    "storage_key": _t(500, required=True),
+    "size_bytes": Col("bigint", required=True, default=0, minimum=0),
+    "sheet": _t(200),
+    "headers": _tags(),
+    "row_count": Col("int", required=True, default=0, minimum=0),
+    "mapping": _j(),
+    "default_source": _t(200),
+    "status": _choice("uploaded", "validated", "importing", "completed", "failed", "cancelled"),
+    "task_id": _t(40),
+    "validation": _j(),
+    "stats": _j(),
+    "checkpoint": _j(),
+    "error": _t(2000),
+}, migration="0011",
+   description="A historical CSV/XLSX job file: detected headers, the confirmed column mapping, "
+               "validation, and a resumable import into job_postings.")
+
+entity("job_keyword_sets", "jks", {
+    "name": _t(200, required=True),
+    "filename": _t(300),
+    "active": Col("bool", required=True, default=False, index=True),
+    "keywords": _j([]),
+    "categories": _j([]),
+    "groups": _j(),
+    "negative_terms": _j([]),
+    "thresholds": _j(),
+    "problems": _j([]),
+    "keyword_count": Col("int", required=True, default=0, minimum=0),
+}, unique=(("name",),), migration="0011",
+   description="A relevance keyword universe (e.g. IT_Crawler_Keywords.xlsx): keyword -> category, category "
+               "groups, noise terms and HIGH/REVIEW thresholds; one active set per workspace.")
+
+entity("job_company_reviews", "jcr", {
+    "company_name": _t(300, required=True, search=True),
+    "normalized_name": _t(300, required=True),
+    "status": _choice("pending", "linked", "ignored"),
+    "reason": _t(300),
+    "candidate_ids": _tags(),
+    "company_id": _t(40),
+    "job_count": Col("int", required=True, default=0, minimum=0),
+    "last_seen_at": Col("ts"),
+}, unique=(("normalized_name",),), migration="0011",
+   description="Job company names that did not match exactly one CRM company: reviewed by a person; "
+               "CRM companies are never created automatically from jobs.")
+
+# ---------------------------------------------------------------------------
+# 0013: job lifecycle, job-derived signals, contact snapshots, signal outcomes
+# ---------------------------------------------------------------------------
+# Lifecycle (status): open (ACTIVE) -> stale (STALE: still active beyond the monitor's
+# stale_after_days) ; expired (EXPIRED: aged out of the source's visible listing window
+# without closure evidence) ; closed (CLOSED: confirmed gone at the source, or missing
+# from close_after_missed consecutive completed full sweeps while still inside the
+# window) ; unknown (imported, never observed). Nothing is ever deleted.
+JOB_CLOSURE_REASONS = ("missed_full_sweeps", "source_gone", "manual")
+SIGNAL_OUTCOMES = ("contacted", "replied", "meeting", "opportunity", "no_response", "disqualified")
+
+_widen("job_postings", "status", "stale", "expired", version="0013")
+_widen("job_posting_changes", "change", "stale", "expired", version="0013")
+_widen("platform_tasks", "kind", "job_lifecycle", version="0013")
+TASK_KINDS = ENTITIES["platform_tasks"].columns["kind"].choices
+_add("job_postings", {
+    "listing_date": Col("date", index=True),          # the source's listing / refresh date, when it shows one
+    "stale_at": Col("ts", index=True),
+    "expired_at": Col("ts", index=True),
+    "reopened_at": Col("ts"),
+    "closure_reason": Col("text", choices=JOB_CLOSURE_REASONS),
+    "gone_checked_at": Col("ts"),                     # last direct check of the job URL
+    "gone_status": Col("int", minimum=0, maximum=999),  # its HTTP status (410 = gone)
+}, version="0013")
+_add("job_source_monitors", {
+    "stale_after_days": Col("int", required=True, default=30, minimum=1, maximum=365),
+    "visible_window_days": Col("int", minimum=1, maximum=3650),   # NULL = the source shows its whole history
+    "gone_checks_per_run": Col("int", required=True, default=500, minimum=0, maximum=20000),
+    "next_lifecycle_at": Col("ts", index=True),
+    "last_lifecycle_at": Col("ts"),
+    "last_lifecycle_result": _j(),
+}, version="0013")
+_add("job_monitor_runs", {
+    "expired_count": Col("int", required=True, default=0, minimum=0),
+    "gone_checked_count": Col("int", required=True, default=0, minimum=0),
+    "gone_closed_count": Col("int", required=True, default=0, minimum=0),
+}, version="0013")
+
+# Job-derived signals may name a company that is not (yet) a CRM company.
+_relax("hiring_signals", "company_id", "0013")
+_widen("hiring_signals", "signal_type", "HIRING_CLUSTER", "STACK_MIGRATION", "DEPARTURE", version="0013")
+_add("hiring_signals", {
+    "company_name": _t(300, index=True),
+    "domain": _t(255),
+    "technologies": _tags(),
+    "contact_id": _t(40),
+    "outcome": Col("text", choices=SIGNAL_OUTCOMES),   # latest outcome written back from a campaign
+    "outcome_at": Col("ts"),
+    "outcome_counts": _j(),
+}, version="0013")
+# Which signal put this prospect into this campaign.
+_add("sequence_enrollments", {"signal_id": _t(40, index=True)}, version="0013")
+
+entity("contact_snapshots", "csn", {
+    "contact_id": _t(40, required=True, index=True),
+    "provider": _choice("zoominfo", "seamless", "manual"),
+    "provider_contact_id": _t(200, index=True),
+    "company_id": _t(40),
+    "company_name": _t(300),
+    "title": _t(300),
+    "employment_status": _choice("current", "left_company", "unknown", default="unknown"),
+    "observed_at": Col("ts", required=True),
+    "evidence": _j(),
+}, append_only=True, migration="0013", default_order="observed_at desc",
+   description="What an authorized contact provider reported about a person on each refresh (company, title, "
+               "employment status as the provider states it): the evidence behind DEPARTURE signals.")
+
+entity("signal_outcomes", "so", {
+    "signal_id": _t(40, required=True, index=True),
+    "company_id": _t(40, index=True),
+    "contact_id": _t(40, index=True),
+    "campaign_id": _t(40, index=True),
+    "enrollment_id": _t(40, index=True),
+    "opportunity_id": _t(40),
+    "outcome": _choice(*SIGNAL_OUTCOMES),
+    "occurred_at": Col("ts", required=True),
+    "source": _choice("message_event", "enrollment", "opportunity", "manual"),
+    "note": _t(2000),
+    "data": _j(),
+}, append_only=True, migration="0013", default_order="occurred_at desc",
+   description="Closed loop: what happened after a signal produced a prospect/campaign (contacted, replied, "
+               "meeting, opportunity, no response, disqualified), linked to the signal, company, prospect and "
+               "campaign.")
 
 def entities() -> Iterable[EntitySpec]:
     return ENTITIES.values()

@@ -121,6 +121,8 @@ export interface Message {
   content: string;
   run_id?: string | null;
   created_at?: string;
+  /** Structured content, e.g. {kind: "job_monitor_update", jobs, counts, links}. */
+  data?: Record<string, unknown> | null;
 }
 
 export interface Session {

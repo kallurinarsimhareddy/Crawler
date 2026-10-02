@@ -33,6 +33,8 @@ ROUTER_MODULES = (
     "cloud.intel.api.routes_integrations",
     "cloud.intel.api.routes_internal",
     "cloud.intel.api.routes_workflows",
+    # Job source monitors (migration 0011)
+    "cloud.intel.api.routes_job_monitor",
 )
 
 

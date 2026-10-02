@@ -181,9 +181,17 @@ class ContactIntelService:
         functions = contact_functions(person.get("title"))
         if functions:
             values["function"] = functions[0]
-        return self.platform.service("crm").upsert_contact(
+        contact = self.platform.service("crm").upsert_contact(
             ctx, values, source_kind=source_kind, source_name=source_name, source_ref=source_ref,
             original=dict(person), confidence=person.get("confidence"))
+        if source_kind in ("zoominfo", "seamless"):
+            try:   # what the provider reported this time: evidence for a later DEPARTURE signal
+                self.platform.service("signals").record_contact_snapshot(
+                    ctx, contact.get("contact") if isinstance(contact.get("contact"), dict) else contact,
+                    provider=source_kind, person=person, company=company)
+            except Exception:  # noqa: BLE001 - a snapshot never blocks a contact upsert
+                log.exception("could not record the %s contact snapshot", source_kind)
+        return contact
 
     def find_contacts(self, ctx: Ctx, company_ids: Sequence[str], *, functions: Sequence[str] = ("hr", "it", "executive"),
                       allow_paid: bool = False, providers: Optional[Sequence[str]] = None,

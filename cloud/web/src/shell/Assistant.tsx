@@ -8,6 +8,7 @@ import { useNavigate } from "react-router-dom";
 import { ErrorBanner } from "../components/Feedback";
 import { EXAMPLES, remember, remembered } from "../platform/controlroom/ControlRoom";
 import type { AskResponse, Session } from "../platform/controlroom/types";
+import { JobMonitorUpdate, isJobMonitorUpdate } from "../platform/pages/jobsShared";
 import { useAction, useLoad } from "../platform/ui";
 import { useWorkspace } from "../platform/workspace";
 import { Icon } from "./Icon";
@@ -139,6 +140,7 @@ function AssistantPanel({ request, onClose }: { request: { text: string; send: b
               <div key={m.id} className={`assist__msg assist__msg--${m.role}`}>
                 <div className="assist__who">{m.role === "user" ? "You" : "SANA GTM AI"}</div>
                 <div className="assist__text">{m.content}</div>
+                {isJobMonitorUpdate(m.data) && <JobMonitorUpdate data={m.data} onNavigate={onClose} />}
                 {m.run_id && (
                   <button type="button" className="link link-button small" onClick={openWorkspace}>
                     Review the plan in the AI workspace →

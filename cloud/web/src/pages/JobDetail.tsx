@@ -92,7 +92,7 @@ export function JobDetail() {
   if (!job) {
     return (
       <div className="page">
-        <Link to="/jobs" className="link back">← Jobs</Link>
+        <Link to="/settings/crawls" className="link back">← Crawls</Link>
         {error && <ErrorBanner error={error} onRetry={refresh} />}
       </div>
     );
@@ -111,7 +111,7 @@ export function JobDetail() {
 
   return (
     <div className="page">
-      <Link to="/jobs" className="link back">← Jobs</Link>
+      <Link to="/settings/crawls" className="link back">← Crawls</Link>
 
       <div className="page__header">
         <div className="min-w-0">

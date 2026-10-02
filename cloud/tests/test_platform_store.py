@@ -123,6 +123,26 @@ class StoreContract:
         with self.assertRaises(ValidationError):
             self.store.list(self.ctx, "companies", order="name; drop table x")
 
+    def test_any_of_all_of_and_rows(self) -> None:
+        for name, score in (("Alpha", 10), ("Beta", 50), ("Gamma", 90), ("Delta", None)):
+            self.store.insert(self.ctx, "companies", {"name": name, "account_score": score})
+        self.store.insert(self.other_ctx, "companies", {"name": "Alpha"})
+        either = {"any_of": [{"name": "Alpha"}, {"account_score__gte": 80}]}
+        self.assertEqual(sorted(r["name"] for r in self.store.all(self.ctx, "companies", either)), ["Alpha", "Gamma"])
+        both = {"all_of": [{"name__ilike": "a"}, {"name__ilike": "t"}]}       # two conditions on one column
+        self.assertEqual(sorted(r["name"] for r in self.store.all(self.ctx, "companies", both)), ["Beta", "Delta"])
+        nested = {"account_score__isnull": False, "any_of": [{"all_of": [{"name": "Beta"}]}, {"name": "Gamma"}]}
+        self.assertEqual(self.store.count(self.ctx, "companies", nested), 2)
+        with self.assertRaises(ValidationError):
+            self.store.list(self.ctx, "companies", {"any_of": [{"password": "x"}]})
+        with self.assertRaises(ValidationError):
+            self.store.list(self.ctx, "companies", {"any_of": []})
+        # rows(): one page, no count, keyset paging, workspace-scoped
+        first = self.store.rows(self.ctx, "companies", {}, order="id", limit=2)
+        rest = self.store.rows(self.ctx, "companies", {"id__gt": first[-1]["id"]}, order="id", limit=10)
+        self.assertEqual(len(first) + len(rest), 4)
+        self.assertEqual(len({r["id"] for r in first + rest}), 4)
+
     def test_workspace_isolation(self) -> None:
         row = self.store.insert(self.ctx, "companies", {"name": "Secret Co"})
         self.assertIsNone(self.store.find(self.other_ctx, "companies", row["id"]))

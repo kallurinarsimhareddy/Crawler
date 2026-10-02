@@ -7,6 +7,8 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { EmptyState, ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
 import { DataTable, PageHeader, Pill, ResourceList, Stat, Tabs, fmt, fmtDate, useAction, useLoad } from "../ui";
+import { safeJobUrl } from "../logic/jobFields";
+import { newMonitorLink } from "../logic/jobFilters";
 import { useWs } from "../workspace";
 import { GtmActions } from "./GtmBridge";
 
@@ -337,7 +339,11 @@ export function Scraper() {
         <label className="field field--wide">
           <span className="field__label">From these URLs</span>
           <textarea className="input textarea mono" rows={4} value={urls} onChange={(e) => { setUrls(e.target.value); invalidate(); }} placeholder={"https://example1.com\nhttps://example2.com\nhttps://example3.com"} />
-          <span className="field__hint">{urlCount ? `${urlCount} line${urlCount === 1 ? "" : "s"}` : "One per line"}</span>
+          <span className="field__hint">
+            {urlCount ? `${urlCount} line${urlCount === 1 ? "" : "s"}` : "One per line"}
+            {" "}
+            <SaveAsMonitor urls={urls.split(/\n/).map((line) => line.trim()).filter(Boolean)} />
+          </span>
         </label>
         <div className="scraper-upload">
           <label className="field">
@@ -754,6 +760,27 @@ function CrmPanel({ run }: { run: Row }) {
   );
 }
 
+/** "Save as Monitor": check this source for new, changed and closed jobs on a schedule. */
+function SaveAsMonitor({ urls }: { urls: string[] }) {
+  const navigate = useNavigate();
+  const usable = urls.filter((u) => safeJobUrl(u));
+  const [pick, setPick] = useState(0);
+  if (usable.length === 0) return null;
+  const chosen = usable[Math.min(pick, usable.length - 1)];
+  return (
+    <span className="actions jm-inline">
+      {usable.length > 1 && (
+        <select className="input input--small" aria-label="Source URL for the monitor" value={Math.min(pick, usable.length - 1)} onChange={(e) => setPick(Number(e.target.value))}>
+          {usable.slice(0, 50).map((u, i) => <option key={u + i} value={i}>{u.length > 60 ? `${u.slice(0, 58)}…` : u}</option>)}
+        </select>
+      )}
+      <button type="button" className="button button--ghost button--small" title={`Monitor ${chosen} for new, changed and closed jobs`} onClick={() => navigate(newMonitorLink(chosen))}>
+        Save as Monitor
+      </button>
+    </span>
+  );
+}
+
 export function ScrapeRun() {
   const { runId = "" } = useParams();
   const client = useWs();
@@ -818,6 +845,7 @@ export function ScrapeRun() {
             {(isActive || status === "paused") && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void act("cancel")}>Cancel</button>}
             {["failed", "cancelled", "completed"].includes(status) && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void act("retry")}>Retry</button>}
             {["failed", "cancelled", "completed"].includes(status) && <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void act("restart")}>Restart</button>}
+            <SaveAsMonitor urls={Array.isArray(data.urls) ? (data.urls as unknown[]).map(String) : []} />
           </>
         }
       />

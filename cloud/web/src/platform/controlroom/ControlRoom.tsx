@@ -6,6 +6,7 @@ import { ErrorBanner } from "../../components/Feedback";
 import type { Row } from "../api";
 import { Pill, fmtDate, useAction, useLoad } from "../ui";
 import { useWorkspace, useWs } from "../workspace";
+import { JobMonitorUpdate, isJobMonitorUpdate } from "../pages/jobsShared";
 import { ResearchCanvas } from "./Canvas";
 import { ASK_EVENT, type AgentRun, type AskResponse, type ModeInfo, type Session } from "./types";
 
@@ -52,6 +53,7 @@ function Conversation({ session, onPickRun, activeRun }: { session: Session | nu
         <div key={m.id} className={`cr-msg cr-msg--${m.role}`}>
           <div className="cr-msg__who">{m.role === "user" ? "You" : "SANA GTM AI"}</div>
           <div className="cr-msg__body">{m.content}</div>
+          {isJobMonitorUpdate(m.data) && <JobMonitorUpdate data={m.data} />}
           {m.run_id && (
             <button type="button" className={`button button--ghost button--small${m.run_id === activeRun ? " cr-active" : ""}`} onClick={() => onPickRun(m.run_id!)}>
               {m.run_id === activeRun ? "Shown below" : "Open in canvas"}
@@ -64,8 +66,12 @@ function Conversation({ session, onPickRun, activeRun }: { session: Session | nu
   );
 }
 
-function SidePanel({ onFill, onOpenRun, reload }: { onFill: (text: string) => void; onOpenRun: (id: string) => void; reload: number }) {
+const MONITOR_SESSION_TITLE = "SANA job monitor updates";
+
+function SidePanel({ onFill, onOpenRun, onOpenSession, reload }: { onFill: (text: string) => void; onOpenRun: (id: string) => void; onOpenSession: (id: string) => void; reload: number }) {
   const client = useWs();
+  const sessions = useLoad((s) => client.list("/agent/sessions", { limit: 50 }, s).catch(() => null), client.base + "sessions" + reload);
+  const monitorSession = sessions.data?.items.find((s) => s.title === MONITOR_SESSION_TITLE && s.mode === "monitoring");
   const saved = useLoad((s) => client.list("/agent/saved", undefined, s), client.base + "saved" + reload);
   const runs = useLoad((s) => client.list("/agent/runs", { limit: 8 }, s), client.base + "runs" + reload);
   const insights = useLoad((s) => client.list("/agent/insights", undefined, s), client.base + "insights" + reload);
@@ -105,6 +111,13 @@ function SidePanel({ onFill, onOpenRun, reload }: { onFill: (text: string) => vo
           </ul>
         )}
       </div>
+      {monitorSession && (
+        <div className="card pad">
+          <h3>Job monitor updates</h3>
+          <p className="muted small">New, changed and closed jobs from your monitors, posted after each run.</p>
+          <button type="button" className="button button--ghost button--small" onClick={() => onOpenSession(monitorSession.id)}>Open updates</button>
+        </div>
+      )}
       <div className="card pad">
         <h3>Saved requests</h3>
         {(saved.data?.items ?? []).length === 0 ? <p className="muted small">Save a request to reuse it.</p> : (
@@ -297,7 +310,16 @@ export function ControlRoom() {
             <div className="card pad muted small">Ask a question to see its plan, sources, live progress, results, evidence and proposed actions here.</div>
           )}
         </div>
-        <SidePanel onFill={(t) => focus(t)} onOpenRun={setRunId} reload={reload} />
+        <SidePanel
+          onFill={(t) => focus(t)}
+          onOpenRun={setRunId}
+          onOpenSession={(id) => {
+            setSessionId(id);
+            remember(wsId, id);
+            setRunId(null);
+          }}
+          reload={reload}
+        />
       </div>
     </div>
   );

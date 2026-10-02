@@ -1,0 +1,66 @@
+/* Job source monitors: the Jobs table, monitors, historical import, company job activity, chat updates. */
+.jm-chips { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 8px 0; }
+.jm-chip--on { border-color: var(--accent); background: var(--accent-soft); }
+/* EXPIRED: aged out of the source's listing window — kept, not closed (outlined gray, distinct from UNKNOWN). */
+.badge--expired { color: var(--queued); background: transparent; box-shadow: inset 0 0 0 1px var(--queued); }
+.jm-columns { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 8px 0; border-top: 1px solid var(--border); }
+.jm-columns label { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; }
+.jm-reason-cell { max-width: 280px; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+.jm-history__detail { margin: 4px 0 0; padding-left: 16px; }
+.jm-lifecycle { display: flex; flex-direction: column; gap: 10px; }
+.jm-outcomes { display: flex; flex-direction: column; gap: 10px; }
+.jm-outcomes__form { display: flex; flex-wrap: wrap; gap: 8px; align-items: flex-end; }
+.jm-inline { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.jm-advanced { display: flex; flex-direction: column; gap: 8px; padding: 12px 0; border-top: 1px solid var(--border); }
+.jm-problem { color: var(--failed); }
+.jm-row { cursor: pointer; }
+.jm-url { max-width: 260px; overflow-wrap: anywhere; }
+.jm-table td { vertical-align: top; }
+.jm-history { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.jm-history__item { border-left: 2px solid var(--border); padding-left: 10px; }
+.jm-history__head { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.jm-history__fields { margin: 4px 0 0; padding-left: 16px; }
+.jm-before { text-decoration: line-through; color: var(--text-muted); }
+.jm-new { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+.jm-plan { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid var(--border); padding-top: 12px; }
+.jm-steps { margin: 0; padding-left: 20px; }
+.jm-filled { margin: 4px 0 8px; }
+.jm-sample { margin: 0; overflow-x: auto; }
+.jm-sample .table { font-size: 12px; }
+.jm-mapping { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+.jm-examples { margin: 6px 0 0; padding-left: 18px; }
+.jm-progress { display: block; height: 8px; margin: 8px 0 12px; }
+.jm-activity { display: flex; flex-direction: column; gap: 12px; margin-bottom: 16px; }
+.jm-weeks { list-style: none; margin: 0; padding: 0; }
+.jm-week { display: grid; grid-template-columns: 110px 1fr auto; gap: 8px; align-items: center; padding: 3px 0; }
+.jm-week__bars { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.jm-fill--new { background: var(--completed, var(--accent)); }
+.jm-fill--closed { background: var(--failed); }
+.jm-update { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
+.jm-update__jobs { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.jm-update__job { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; padding: 6px 8px; border: 1px solid var(--border); border-radius: var(--radius-small); background: var(--surface); }
+@media (max-width: 640px) {
+  .jm-week { grid-template-columns: 80px 1fr; }
+  .jm-week .bars__value { grid-column: 1 / -1; }
+  .jm-update__job { flex-direction: column; }
+}
+/* JobSpy sources and relevance */
+.jm-relevance { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
+.jm-relevance__score { font-weight: 600; min-width: 2ch; text-align: right; }
+.jm-source-pick { display: flex; flex-wrap: wrap; gap: 16px; border: 0; margin: 0; padding: 0; }
+.jm-source-pick label, .jm-boards label { display: inline-flex; align-items: center; gap: 6px; font-size: 14px; }
+.jm-boards { display: flex; flex-direction: column; gap: 6px; border: 0; margin: 0; padding: 0; }
+.jm-boards .field__label { margin-bottom: 2px; }
+.jm-board-note { color: var(--cancelled); font-size: 12px; }
+.jm-terms { display: flex; flex-direction: column; gap: 6px; }
+.jm-terms .chips { display: flex; flex-wrap: wrap; gap: 4px; }
+.jm-chip-x { margin-left: 4px; border: 0; background: none; padding: 0; cursor: pointer; color: var(--text-muted); font: inherit; }
+.jm-chip-x:hover { color: var(--failed); }
+.jm-desc { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.5; margin: 8px 0 0; max-height: 480px; overflow: auto; }
+.jm-reason { white-space: pre-wrap; overflow-wrap: anywhere; }
+.jm-sets { display: flex; flex-direction: column; gap: 12px; }
+.jm-set { border: 1px solid var(--border); border-radius: var(--radius-small); padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+.jm-set--active { border-color: var(--completed); }
+.jm-set__head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.jm-try { display: flex; flex-direction: column; gap: 8px; }
+.jm-block { display: block; }

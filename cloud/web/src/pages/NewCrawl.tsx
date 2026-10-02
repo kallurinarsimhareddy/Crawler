@@ -45,7 +45,7 @@ export function NewCrawl() {
     setError(null);
     try {
       const created = await api.createJob(buildRequest());
-      navigate(`/jobs/${created.job_id}`);
+      navigate(`/settings/crawls/${created.job_id}`);
     } catch (err) {
       setError(err as Error);
       setSubmitting(false);

@@ -35,7 +35,7 @@ export function Jobs() {
     <div className="page">
       <div className="page__header">
         <div>
-          <h1>Jobs</h1>
+          <h1>Crawls</h1>
           <p className="muted">Every crawl, newest first.</p>
         </div>
         <Link to="/new" className="button button--primary">

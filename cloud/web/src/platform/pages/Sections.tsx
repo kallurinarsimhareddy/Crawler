@@ -510,7 +510,7 @@ function Crawls() {
       action={
         <span className="actions">
           <Link className="button button--primary" to="/new">New crawl</Link>
-          <Link className="button button--ghost" to="/jobs">All crawls</Link>
+          <Link className="button button--ghost" to="/settings/crawls">All crawls</Link>
         </span>
       }
     />

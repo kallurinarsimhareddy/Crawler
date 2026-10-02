@@ -71,6 +71,11 @@ SERVICES: Dict[str, str] = {
     "internal_data": "cloud.intel.imports.internal:InternalDataService",
     "gtm_bridge": "cloud.intel.gtm.bridge:GtmBridgeService",
     "enrichment": "cloud.intel.providers.enrichment:EnrichmentService",
+    # Job source monitors (migration 0011)
+    "job_monitors": "cloud.intel.job_monitor.service:JobMonitorService",
+    "job_imports": "cloud.intel.job_monitor.importer:JobImportService",
+    # Signal outcomes / contact snapshots (migration 0013)
+    "signal_outcomes": "cloud.intel.signals.outcomes:SignalOutcomeService",
 }
 
 

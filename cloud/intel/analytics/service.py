@@ -77,12 +77,16 @@ class AnalyticsService:
     def jobs(self, ctx: Ctx) -> Dict[str, Any]:
         return {
             "discovered": self._count(ctx, "job_postings"),
-            "open": self._count(ctx, "job_postings", {"status": "open"}),
-            "relevant": self._count(ctx, "job_postings", {"is_relevant": True}),
+            # ACTIVE + STALE: a stale job is still listed by its source (only old)
+            "open": self._count(ctx, "job_postings", {"status": ["open", "stale"]}),
+            "stale": self._count(ctx, "job_postings", {"status": "stale"}),
+            # the relevance engine's HIGH / REVIEW jobs, or the older is_relevant flag
+            "relevant": self._count(ctx, "job_postings", {"any_of": [
+                {"relevance_class": ["HIGH", "REVIEW"]}, {"is_relevant": True}]}),
             "by_source": self._group(ctx, "job_postings", "source_name"),
             "by_workplace_type": self._group(ctx, "job_postings", "workplace_type"),
             "top_technologies": dict(list(self._group(ctx, "job_postings", "technologies",
-                                                      {"status": "open"}).items())[:20]),
+                                                      {"status": ["open", "stale"]}).items())[:20]),
         }
 
     def signals(self, ctx: Ctx) -> Dict[str, Any]:
@@ -189,16 +193,13 @@ class AnalyticsService:
         start_day = (now - timedelta(days=days - 1)).date()
         start = datetime.combine(start_day, datetime.min.time(), tzinfo=timezone.utc)
         buckets: Dict[str, int] = OrderedDict((str(start_day + timedelta(days=i)), 0) for i in range(days))
-        rows = self.store.all(ctx, entity, {f"{column}__gte": start}, cap=_SCAN_CAP)
-        for row in rows:
-            value = row.get(column)
-            if isinstance(value, datetime):
-                key = str(value.astimezone(timezone.utc).date())
-                if key in buckets:
-                    buckets[key] += 1
+        # Counted per day by the store (one GROUP BY), never by loading the rows.
+        for key, count in self.store.count_by_day(ctx, entity, column, {f"{column}__gte": start}).items():
+            if key in buckets:
+                buckets[key] += count
         return {"entity": entity, "days": days, "column": column,
                 "points": [{"date": d, "count": c} for d, c in buckets.items()],
-                "truncated": len(rows) >= _SCAN_CAP}
+                "truncated": False}
 
     # --- everything ---------------------------------------------------------------------------
 
