@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import unittest
 
-from cloud.intel.email.providers import EmailListVerifyProvider, LocalValidator, ValidationResult
+from cloud.intel.email.engine import final_status
+from cloud.intel.email.providers import (ELV_DOCUMENTED_CODES, EmailListVerifyProvider, EmailProviderError,
+                                         LocalValidator, ValidationResult)
 from cloud.intel.email.service import EmailValidationService
 from cloud.intel.providers.base import ProviderError
 from cloud.tests.test_platform_sources_support import FakeResponse, FakeSession, make_platform
@@ -128,16 +130,85 @@ class EmailListVerifyTests(unittest.TestCase):
         return EmailListVerifyProvider("elv-secret-key", session=session), session
 
     def test_result_code_mapping(self) -> None:
-        for code, status in (("ok", "VALID"), ("ok_for_all", "RISKY"), ("email_disabled", "INVALID"),
-                             ("disposable", "DISPOSABLE"), ("unknown", "UNKNOWN"), ("something_new", "UNKNOWN")):
+        # Every code in the published GET /api/verifyEmail enum, and what it resolves to.
+        documented = {"ok": ("VALID", "VALID"), "ok_for_all": ("RISKY", "NOT_VERIFIED"),
+                      "email_disabled": ("INVALID", "INVALID"), "dead_server": ("INVALID", "INVALID"),
+                      "invalid_mx": ("INVALID", "INVALID"), "invalid_syntax": ("INVALID", "INVALID"),
+                      "spamtrap": ("INVALID", "INVALID"), "disposable": ("DISPOSABLE", "NOT_VERIFIED"),
+                      "unknown": ("UNKNOWN", "NOT_VERIFIED"), "antispam_system": ("RISKY", "NOT_VERIFIED"),
+                      "smtp_protocol": ("RISKY", "NOT_VERIFIED")}
+        self.assertEqual(set(documented), set(ELV_DOCUMENTED_CODES))
+        for code, (status, final) in documented.items():
             provider, session = self.provider(code)
             result = provider.check("jane@acme.com")
-            self.assertEqual(result.status, status, code)
-            self.assertFalse(result.checks["mapping_verified"])
+            self.assertEqual((result.status, final_status(result.status, result.provider)), (status, final), code)
+            self.assertTrue(result.checks["mapping_verified"])
             method, url, kwargs = session.calls[0]
             self.assertTrue(url.startswith("https://api.emaillistverify.com/api/verifyEmail?"))
             self.assertNotIn("elv-secret-key", url)   # the key travels in a header, never the URL
             self.assertEqual(kwargs["headers"]["x-api-key"], "elv-secret-key")
+
+    def test_unrecognized_replies_are_errors_not_results(self) -> None:
+        # Previously an undocumented reply was stored as an EmailListVerify UNKNOWN, which then
+        # blocked the address from ever being verified again. It is now an error (the address
+        # stays re-checkable) flagged as possibly charged.
+        for body in ("something_new", "", "<!DOCTYPE html><html></html>", '{"status": "ok"}'):
+            provider, _ = self.provider(body)
+            with self.assertRaises(EmailProviderError) as caught:
+                provider.check("jane@acme.com")
+            self.assertEqual(caught.exception.code, "malformed_response", body)
+            self.assertTrue(caught.exception.charge_uncertain)
+
+    def test_http_auth_failures_are_fatal_account_errors(self) -> None:
+        for status_code in (401, 403):
+            session = FakeSession({"verifyEmail": FakeResponse(status_code, {"statusCode": status_code,
+                                                                              "message": "Invalid api key"})})
+            provider = EmailListVerifyProvider("k", session=session, sleep=lambda s: None)
+            with self.assertRaises(EmailProviderError) as caught:
+                provider.check("jane@acme.com")
+            self.assertEqual(caught.exception.code, "auth")
+            self.assertEqual(len(session.calls), 1)  # not retried
+
+    def test_possibly_processed_failures_are_not_retried(self) -> None:
+        # A read timeout / HTTP 500 / 504 may already have been charged upstream: one call only.
+        for answer in (FakeResponse(500, text=""), FakeResponse(504, text="")):
+            session = FakeSession({"verifyEmail": answer})
+            provider = EmailListVerifyProvider("k", session=session, sleep=lambda s: None)
+            with self.assertRaises(EmailProviderError) as caught:
+                provider.check("jane@acme.com")
+            self.assertEqual((len(session.calls), caught.exception.charge_uncertain), (1, True))
+
+        class ReadTimeout(Exception):
+            pass
+
+        class Slow:
+            calls = 0
+
+            def get(self, url, **kw):
+                Slow.calls += 1
+                raise ReadTimeout("read timed out")
+
+        provider = EmailListVerifyProvider("k", session=Slow(), sleep=lambda s: None)
+        with self.assertRaises(EmailProviderError) as caught:
+            provider.check("jane@acme.com")
+        self.assertEqual((Slow.calls, caught.exception.code, caught.exception.charge_uncertain), (1, "timeout", True))
+
+        class ConnectionError_(Exception):
+            pass
+
+        ConnectionError_.__name__ = "ConnectionError"
+        attempts = []
+
+        class Refused:
+            def get(self, url, **kw):
+                attempts.append(url)
+                if len(attempts) < 3:
+                    raise ConnectionError_("refused")
+                return FakeResponse(200, text="ok")
+
+        provider = EmailListVerifyProvider("k", session=Refused(), sleep=lambda s: None)
+        self.assertEqual(provider.check("jane@acme.com").status, "VALID")  # never sent: safe to retry
+        self.assertEqual(len(attempts), 3)
 
     def test_errors_raise_and_health(self) -> None:
         provider, _ = self.provider("key_not_valid")

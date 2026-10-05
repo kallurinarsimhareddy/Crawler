@@ -41,6 +41,7 @@ from cloud.intel.core.context import ConflictError, Ctx, ValidationError, utcnow
 from cloud.intel.core.normalize import normalize_email
 from cloud.intel.email import engine
 from cloud.intel.email.providers import elv_enabled
+from cloud.intel.email.service import max_age
 
 __all__ = ["EmailValidationJobService", "detect_email_columns", "extract_email", "reason_for", "result_source",
            "run_validation_job_task", "STATUSES", "MAX_ROWS", "MAX_BYTES", "SOURCES"]
@@ -68,6 +69,18 @@ INGEST_CHUNK = 1000
 WRITE_CHUNK = 100
 #: Concurrent DNS lookups when a chunk brings new domains (same resolvers and timeouts).
 DNS_WORKERS = 16
+#: Pasted / API row sets larger than this are stored and read in by a background task (like
+#: large uploads), so the request that creates the job stays short.
+INLINE_ROWS = 5000
+#: Task attempts for a job. Progress is saved every WRITE_CHUNK rows, so a retry continues
+#: where the last attempt stopped; long jobs get more attempts than the platform default (3)
+#: so a few worker restarts or transient database errors cannot fail a million-row run.
+JOB_ATTEMPTS = 8
+#: In-run retries of one chunk after a transient error (database blip, ...), with backoff.
+CHUNK_RETRIES = 3
+CHUNK_BACKOFF = 2.0
+#: Seconds a transient DNS failure is reused within a run before the domain is asked again.
+DNS_TRANSIENT_SECONDS = 120.0
 PREVIEW_ROWS = 8
 #: Evidence cache lifetimes (days), per check type.
 EVIDENCE_TTL_DAYS = {"dns": 1, "smtp": 7, "public": 14, "catch_all": 30, "mailbox": 30}
@@ -145,8 +158,10 @@ def reason_for(status: str, checks: Mapping[str, Any]) -> str:
     if status == "INVALID":
         if checks.get("syntax") is False:
             return "Not a valid email address"
-        if checks.get("placeholder"):
-            return "Placeholder address"
+        if checks.get("reserved_domain"):
+            return "Reserved example/test domain (never receives mail)"
+        if checks.get("domain_invalid"):
+            return f"The domain does not accept email ({checks['domain_invalid']})"
         if checks.get("mx") is False:
             return "The domain does not accept email"
         code = checks.get("result_code")
@@ -166,13 +181,19 @@ def reason_for(status: str, checks: Mapping[str, Any]) -> str:
             return f"EmailListVerify could not confirm the mailbox ({checks['result_code']})"
         if checks.get("strict_demoted"):
             return "Not externally verified (strict validation)"
+        if checks.get("error"):
+            return f"Could not be checked ({checks['error']})"
+        if checks.get("no_reply"):
+            return "No-reply address; mailbox not verified"
+        if checks.get("placeholder"):
+            return "Looks like a placeholder address; mailbox not verified"
         return "Mail server exists; mailbox not verified"
     return ""
 
 
 #: Evidence columns appended to exports (see engine.evidence_summary).
 _EXPORT_SIGNALS = ("technical", "domain", "mx", "spf", "dmarc", "smtp", "catch_all", "role", "disposable",
-                   "free_provider", "person_match", "public_evidence", "mailbox_verification")
+                   "free_provider", "no_reply", "person_match", "public_evidence", "mailbox_verification")
 
 
 def _contact_mode(columns: Mapping[str, str]) -> bool:
@@ -205,6 +226,11 @@ def _name_from(row: Mapping[str, Any], email: str) -> str:
     return (email.split("@", 1)[0] or email)[:200]
 
 
+def _safe_cell(value: str) -> str:
+    """CSV formula-injection guard (OWASP): a cell a spreadsheet would evaluate gets a leading quote."""
+    return ("'" + value) if value[:1] in ("=", "+", "-", "@", chr(9), chr(13)) else value
+
+
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "campaign"
 
@@ -224,6 +250,8 @@ class _EvidenceRun:
         self.finder = (engine.PublicEvidenceFinder(service.public_fetcher) if settings.get("public_evidence")
                        else None)
         self.memory: Dict[Tuple[str, str], Any] = {}
+        #: domain -> when its last lookup failed transiently (see _needs_dns).
+        self.transient: Dict[str, float] = {}
         #: Cache writes buffered until the end of the batch: (subject hash, check type) -> row.
         self.pending: Dict[Tuple[str, str], Dict[str, Any]] = {}
 
@@ -301,7 +329,7 @@ class _EvidenceRun:
         the per-row :meth:`domain` calls hit memory instead of waiting on DNS one by one."""
         from concurrent.futures import ThreadPoolExecutor
 
-        todo = sorted({d for d in domains if d and self.memory.get(("dns", d)) is None})
+        todo = sorted({d for d in domains if d and self._needs_dns(d)})
         if not todo:
             return
 
@@ -316,17 +344,39 @@ class _EvidenceRun:
             for domain, info in zip(todo, pool.map(inspect, todo)):
                 self._store_domain(domain, info)
 
+    def _needs_dns(self, domain: str) -> bool:
+        """Unknown this run, or a transient failure older than DNS_TRANSIENT_SECONDS (a long
+        job asks again instead of reporting one early blip for the rest of the run)."""
+        if self.memory.get(("dns", domain)) is None:
+            return True
+        failed_at = self.transient.get(domain)
+        return failed_at is not None and time.monotonic() - failed_at >= DNS_TRANSIENT_SECONDS
+
     def _store_domain(self, domain: str, info: Dict[str, Any]) -> Dict[str, Any]:
         if info.get("dns_error") in ("servfail", "timeout", "error"):
-            self.memory[("dns", domain)] = info  # transient: reuse within this run only
+            self.memory[("dns", domain)] = info  # transient: reuse within this run only, briefly
+            self.transient[domain] = time.monotonic()
             return info
+        self.transient.pop(domain, None)
         return self.remember("dns", domain, "domain", info)
 
     def domain(self, domain: str) -> Dict[str, Any]:
-        cached = self._cached("dns", domain)
+        if not self._needs_dns(domain):
+            return self.memory[("dns", domain)]
+        cached = self._cached("dns", domain) if domain not in self.transient else None
         if cached is not None:
             return cached
-        return self._store_domain(domain, engine.inspect_domain(domain, self.dns))
+        try:
+            info = engine.inspect_domain(domain, self.dns)
+        except Exception:  # noqa: BLE001 - treated as a transient DNS failure
+            info = {"domain": domain, "exists": None, "dns_error": "error", "mail": None, "mx": [],
+                    "spf": "unknown", "dmarc": "unknown", "verdict": "unknown"}
+        return self._store_domain(domain, info)
+
+    def mail_of(self, domain: str) -> Optional[bool]:
+        """The domain's mail verdict this run knows (True / False / None), without a lookup."""
+        info = self.memory.get(("dns", domain))
+        return None if info is None else info.get("mail")
 
     def smtp_check(self, host: str) -> Optional[Dict[str, Any]]:
         if self.smtp is None:
@@ -450,8 +500,10 @@ class EmailValidationJobService:
     def _ingest_key(self, ctx: Ctx, job_id: str, fmt: str) -> str:
         return f"email-validation/{ctx.workspace_id}/{job_id}/upload.{fmt}"
 
-    def _queue_ingest(self, ctx: Ctx, job: Mapping[str, Any], filename: str, fmt: str, data: bytes
-                      ) -> Dict[str, Any]:
+    def _queue_ingest(self, ctx: Ctx, job: Mapping[str, Any], filename: str, fmt: str, data: bytes,
+                      *, start_settings: Optional[Mapping[str, Any]] = None) -> Dict[str, Any]:
+        """Store the file and queue the background read. ``start_settings``: start the
+        validation (with these settings) as soon as the read finishes — used by large pastes."""
         import tempfile
         from pathlib import Path
 
@@ -460,18 +512,28 @@ class EmailValidationJobService:
             path = Path(scratch) / "upload"
             path.write_bytes(data)
             self.platform.storage.put_file(key, path, content_type="application/octet-stream")
-        task = self.platform.tasks.submit(ctx, "email_validation_job", {"job_id": job["id"], "phase": "ingest"},
-                                          entity_type="email_validation_jobs", entity_id=job["id"])
-        return self.store.update(ctx, "email_validation_jobs", job["id"], {"settings": {
-            **(job.get("settings") or {}),
-            "ingest": {"state": "pending", "task_id": task["id"], "storage_key": key, "format": fmt, "rows": 0}}})
+        task = self._submit(ctx, job["id"], phase="ingest")
+        settings = {**(job.get("settings") or {}),
+                    "ingest": {"state": "pending", "task_id": task["id"], "storage_key": key, "format": fmt,
+                               "rows": 0}}
+        if start_settings is not None:
+            settings["start_after_ingest"] = dict(start_settings)
+        return self.store.update(ctx, "email_validation_jobs", job["id"], {"settings": settings})
+
+    def _ingest_failed(self, ctx: Ctx, job_id: str, error: str) -> None:
+        job = self.store.get(ctx, "email_validation_jobs", job_id)
+        settings = dict(job.get("settings") or {})
+        settings["ingest"] = {**(settings.get("ingest") or {}), "state": "failed", "error": error[:500]}
+        settings.pop("start_after_ingest", None)
+        self.store.update(ctx, "email_validation_jobs", job_id, {"status": "failed", "error": error[:2000],
+                                                                  "settings": settings, "finished_at": utcnow()})
 
     def _ingest(self, ctx: Ctx, task: Mapping[str, Any], reporter: Any) -> Dict[str, Any]:
         """Read a stored upload into the job in bulk chunks. Resumable: rows already in the
         job (a paused or interrupted run) are skipped by row number. Memory stays bounded:
         rows are streamed and inserted INGEST_CHUNK at a time."""
-        from cloud.intel.imports.parse import ParseError, iter_rows
-        from cloud.intel.tasks.worker import TaskPaused
+        from cloud.intel.imports.parse import ParseError, iter_rows_stream
+        from cloud.intel.tasks.worker import PermanentTaskError, TaskPaused
 
         job_id = task["params"]["job_id"]
         job = self.store.get(ctx, "email_validation_jobs", job_id)
@@ -481,9 +543,8 @@ class EmailValidationJobService:
             return {"job_id": job_id, "ingest": ingest.get("state") or "none"}
         key = ingest["storage_key"]
         if not self.platform.storage.exists(key):
-            raise ValidationError("the uploaded file is no longer stored; upload it again")
-        with self.platform.storage.open(key) as handle:
-            data = handle.read()
+            self._ingest_failed(ctx, job_id, "the uploaded file is no longer stored; upload it again")
+            raise PermanentTaskError("the uploaded file is no longer stored; upload it again")
         last = self.store.list(ctx, "email_validation_items", {"job_id": job_id}, order="-row_number", limit=1).rows
         done_through = last[0]["row_number"] if last else 0
         total = done_through
@@ -497,43 +558,56 @@ class EmailValidationJobService:
                 chunk = []
 
         truncated = False
-        try:
-            for number, row in iter_rows(ingest.get("format") or job.get("format") or "csv", data,
-                                         max_rows=MAX_ROWS + 1):
-                if number > MAX_ROWS:
-                    truncated = True
-                    break
-                if number <= done_through:
-                    continue
-                chunk.append({"job_id": job_id, "row_number": number, "row": row, "status": "PENDING"})
-                total = number
-                if len(chunk) >= INGEST_CHUNK:
-                    flush()
-                    if reporter.is_cancelled():
+        unreadable: Optional[str] = None
+        # Streamed from storage: memory is bounded by INGEST_CHUNK rows, not by the file size.
+        with self.platform.storage.open(key) as handle:
+            try:
+                for number, row in iter_rows_stream(ingest.get("format") or job.get("format") or "csv", handle,
+                                                    max_rows=MAX_ROWS + 1):
+                    if number > MAX_ROWS:
+                        truncated = True
                         break
-                    if reporter.should_pause():
-                        raise TaskPaused({"rows": total})
-                    if time.monotonic() - last_progress >= PROGRESS_SECONDS:
-                        last_progress = time.monotonic()
-                        self.store.update(ctx, "email_validation_jobs", job_id, {
-                            "row_count": total, "settings": {**settings, "ingest": {**ingest, "rows": total}}})
-                        reporter.progress(f"read {total} rows", done=total)
-            flush()
-        except ParseError as error:
-            flush()
-            raise ValidationError(f"the file could not be read: {error}") from None
-        del data
+                    if number <= done_through:
+                        continue
+                    chunk.append({"job_id": job_id, "row_number": number, "row": row, "status": "PENDING"})
+                    total = number
+                    if len(chunk) >= INGEST_CHUNK:
+                        flush()
+                        if reporter.is_cancelled():
+                            break
+                        if reporter.should_pause():
+                            raise TaskPaused({"rows": total})
+                        if time.monotonic() - last_progress >= PROGRESS_SECONDS:
+                            last_progress = time.monotonic()
+                            self.store.update(ctx, "email_validation_jobs", job_id, {
+                                "row_count": total, "settings": {**settings, "ingest": {**ingest, "rows": total}}})
+                            reporter.progress(f"read {total} rows", done=total)
+                flush()
+            except ParseError as error:
+                flush()
+                unreadable = str(error)[:500]
         problems = list(settings.get("problems") or [])
-        if truncated:
+        if unreadable is not None:
+            if not total:  # nothing usable: a permanent failure, shown on the job
+                self._ingest_failed(ctx, job_id, f"the file could not be read: {unreadable}")
+                raise PermanentTaskError(f"the file could not be read: {unreadable}")
+            # Keep every row read before the damage, and say exactly where reading stopped.
+            problems.append(f"the file stopped being readable after row {total:,} ({unreadable}); "
+                            f"the {total:,} rows before it are validated")
+            truncated = True
+        elif truncated:
             problems.append(f"more than {MAX_ROWS:,} rows; only the first {MAX_ROWS:,} are validated")
         settings.update(problems=problems, truncated=truncated or bool(settings.get("truncated")),
                         ingest={**ingest, "state": "done", "rows": total})
+        start_settings = settings.pop("start_after_ingest", None)
         self.store.update(ctx, "email_validation_jobs", job_id, {
             "row_count": total, "counts": {"total": total, "processed": 0}, "settings": settings})
         try:
             self.platform.storage.delete(key)  # the rows now live in the job
         except Exception:  # noqa: BLE001 - cleanup is best-effort
             log.debug("could not remove the ingested upload")
+        if start_settings is not None and total and job.get("email_column"):
+            self.start(ctx, job_id, settings=start_settings)
         return {"job_id": job_id, "ingest": "done", "rows": total}
 
     def create_from_rows(self, ctx: Ctx, *, name: str, rows: Sequence[Mapping[str, Any]], email_field: str,
@@ -553,11 +627,31 @@ class EmailValidationJobService:
         if email_field not in columns:
             raise ValidationError(f"the rows have no {email_field!r} field")
         contact_columns = engine.detect_contact_columns(c for c in columns if c != email_field)
+        if start and (settings or {}).get("allow_paid"):
+            raise ValidationError("paid verification is not started with the job: run the built-in checks, then "
+                                  "use Verify Unknowns, which shows the exact credits first")
+        background = len(records) > INLINE_ROWS
         job = self.store.insert(ctx, "email_validation_jobs", {
             "name": name[:200], "source_type": source_type, "source_id": source_id, "columns": columns,
-            "email_column": email_field, "preview": records[:PREVIEW_ROWS], "row_count": len(records),
-            "status": "ready", "counts": {"total": len(records), "processed": 0},
+            "email_column": email_field, "preview": records[:PREVIEW_ROWS],
+            "row_count": 0 if background else len(records), "status": "ready",
+            "format": "csv" if background else "none",
+            "counts": {"total": 0 if background else len(records), "processed": 0},
             "settings": {"contact_columns": contact_columns, "contact_mode": _contact_mode(contact_columns)}})
+        if background:
+            # A big paste is written to storage as CSV and read in by the worker, exactly like a
+            # large upload, so this request returns in about a second whatever the row count.
+            buffer = io.StringIO()
+            writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+            writer.writeheader()
+            for record in records:
+                writer.writerow({k: "" if v is None else v for k, v in record.items()})
+            job = self._queue_ingest(ctx, job, name, "csv", buffer.getvalue().encode("utf-8"),
+                                     start_settings=(settings or {}) if start else None)
+            audit(self.store, ctx, "email_validation.create", entity_type="email_validation_jobs",
+                  entity_id=job["id"], summary=f"{name}: {len(records)} row(s) from {source_type}, reading in the "
+                                               "background")
+            return job
         self._insert_items(ctx, job["id"], enumerate(records, start=1))
         audit(self.store, ctx, "email_validation.create", entity_type="email_validation_jobs", entity_id=job["id"],
               summary=f"{name}: {len(records)} row(s) from {source_type}")
@@ -603,6 +697,14 @@ class EmailValidationJobService:
     def get(self, ctx: Ctx, job_id: str) -> Dict[str, Any]:
         """The job, with its status reconciled against its background task."""
         job = self.store.get(ctx, "email_validation_jobs", job_id)
+        ingest = (job.get("settings") or {}).get("ingest") or {}
+        if ingest.get("state") == "pending" and ingest.get("task_id") and ctx.can_write:
+            # A background file read that died (attempts exhausted, cancelled) must not leave the
+            # job "reading" forever: surface it as a failed job with the reason (Retry re-reads).
+            reader = self.store.find(ctx, "platform_tasks", ingest["task_id"])
+            if reader is not None and reader["status"] in ("failed", "cancelled"):
+                self._ingest_failed(ctx, job_id, reader.get("error") or f"reading the file was {reader['status']}")
+                job = self.store.get(ctx, "email_validation_jobs", job_id)
         task = self.store.find(ctx, "platform_tasks", job["task_id"]) if job.get("task_id") else None
         if task is not None and job["status"] in ("queued", "running", "paused"):
             wanted = {"paused": "paused", "cancelled": "cancelled", "failed": "failed"}.get(task["status"])
@@ -634,22 +736,64 @@ class EmailValidationJobService:
             if job["status"] == "uploaded":
                 raise ValidationError("choose the email column first")
             raise ConflictError(f"the job is already {job['status']}")
+        if (settings or {}).get("allow_paid"):
+            # Paid checks need an exact, confirmed credit figure, which only exists once the free
+            # checks have run: start built-in, then "Verify Unknowns" (estimate -> confirm -> run).
+            raise ValidationError("paid verification is not started with the job: run the built-in checks, then "
+                                  "use Verify Unknowns, which shows the exact credits first")
         strict = (settings or {}).get("strict_validation", (job.get("settings") or {}).get("strict_validation", True))
-        clean = {"allow_paid": bool((settings or {}).get("allow_paid")),
-                 "max_age_days": max(0, min(365, int((settings or {}).get("max_age_days") or 30))),
+        clean = {"allow_paid": False, "paid_budget": None, "paid_used": 0,
+                 "max_age_days": max_age((settings or {}).get("max_age_days")),
                  "strict_validation": bool(strict),
                  # Opt-in evidence layers: slower, so never on by default.
                  "public_evidence": bool((settings or {}).get("public_evidence")),
                  "smtp_preflight": bool((settings or {}).get("smtp_preflight"))}
-        if clean["allow_paid"] and not elv_enabled(self.platform.service("providers"), ctx):
-            raise ValidationError("EmailListVerify is not configured and verified; run with built-in checks only")
         merged = {**(job.get("settings") or {}), **clean}
-        task = self.platform.tasks.submit(ctx, "email_validation_job", {"job_id": job_id},
-                                          entity_type="email_validation_jobs", entity_id=job_id)
+        task = self._submit(ctx, job_id)
         job = self.store.update(ctx, "email_validation_jobs", job_id, {"status": "queued", "task_id": task["id"],
                                                                         "settings": merged})
         audit(self.store, ctx, "email_validation.start", entity_type="email_validation_jobs", entity_id=job_id,
               changes={"allow_paid": clean["allow_paid"], "rows": job["row_count"]})
+        return job
+
+    def _submit(self, ctx: Ctx, job_id: str, **params: Any) -> Dict[str, Any]:
+        return self.platform.tasks.submit(ctx, "email_validation_job", {"job_id": job_id, **params},
+                                          entity_type="email_validation_jobs", entity_id=job_id,
+                                          max_attempts=JOB_ATTEMPTS)
+
+    def retry(self, ctx: Ctx, job_id: str) -> Dict[str, Any]:
+        """Continue a failed (or cancelled) job: rows already checked keep their results and
+        only PENDING rows are validated. A failed file read is read again from where it stopped
+        when the stored upload still exists. A confirmed paid recheck continues within the
+        credits that were confirmed (never more); everything else runs built-in only."""
+        ctx.require_write()
+        job = self.get(ctx, job_id)
+        if job["status"] not in ("failed", "cancelled"):
+            raise ConflictError(f"only a failed or cancelled job can be retried (this one is {job['status']})")
+        settings = dict(job.get("settings") or {})
+        ingest = dict(settings.get("ingest") or {})
+        if ingest.get("state") in ("pending", "failed"):
+            if not ingest.get("storage_key") or not self.platform.storage.exists(ingest["storage_key"]):
+                raise ValidationError("the uploaded file is no longer stored; upload it again")
+            task = self._submit(ctx, job_id, phase="ingest")
+            settings["ingest"] = {**ingest, "state": "pending", "task_id": task["id"], "error": None}
+            job = self.store.update(ctx, "email_validation_jobs", job_id, {
+                "status": "uploaded" if not job.get("email_column") else "ready", "error": None,
+                "settings": settings, "finished_at": None})
+            audit(self.store, ctx, "email_validation.retry", entity_type="email_validation_jobs", entity_id=job_id,
+                  changes={"phase": "ingest"})
+            return job
+        if not self.store.count(ctx, "email_validation_items", {"job_id": job_id, "status": "PENDING"}):
+            raise ConflictError("every row of this job has been checked already; nothing to retry")
+        if not settings.get("recheck_unknowns"):
+            settings.update(allow_paid=False, paid_budget=None)
+        task = self._submit(ctx, job_id)
+        job = self.store.update(ctx, "email_validation_jobs", job_id, {
+            "status": "queued", "task_id": task["id"], "error": None, "finished_at": None, "settings": settings})
+        audit(self.store, ctx, "email_validation.retry", entity_type="email_validation_jobs", entity_id=job_id,
+              changes={"paid": bool(settings.get("allow_paid")), "budget_left":
+                       None if settings.get("paid_budget") is None
+                       else int(settings["paid_budget"]) - int(settings.get("paid_used") or 0)})
         return job
 
     def _task(self, ctx: Ctx, job: Mapping[str, Any]) -> str:
@@ -697,7 +841,7 @@ class EmailValidationJobService:
         if job["status"] in ("queued", "running"):
             raise ConflictError("cancel the job before deleting it")
         ingest = (job.get("settings") or {}).get("ingest") or {}
-        if ingest.get("state") == "pending":  # stop reading the file and drop the stored upload
+        if ingest.get("state") in ("pending", "failed"):  # stop reading the file and drop the stored upload
             try:
                 task = self.platform.tasks.get(ctx, ingest["task_id"])
                 if task["status"] not in ("completed", "failed", "cancelled"):
@@ -732,10 +876,11 @@ class EmailValidationJobService:
         out["provider_local"] = int(by_provider.get("local", 0))
         out["unknown_builtin"] = self.store.count(ctx, "email_validation_items",
                                                   {"job_id": job_id, "status": "UNKNOWN", "provider": "local"})
-        # The three user-facing statuses (see engine.final_status).
-        out["final_valid"] = self.store.count(ctx, "email_validation_items", {
-            "job_id": job_id, "status": "VALID", "provider__in": list(engine.VERIFIERS)})
-        out["final_invalid"] = out["INVALID"]
+        # The three user-facing statuses, through the one resolver's own filters (engine.final_filters).
+        out["final_valid"] = self.store.count(ctx, "email_validation_items",
+                                              {"job_id": job_id, **engine.final_filters("VALID")})
+        out["final_invalid"] = self.store.count(ctx, "email_validation_items",
+                                                {"job_id": job_id, **engine.final_filters("INVALID")})
         out["final_not_verified"] = out["processed"] - out["final_valid"] - out["final_invalid"]
         return out
 
@@ -766,16 +911,9 @@ class EmailValidationJobService:
         """Distinct NOT VERIFIED addresses only the built-in checks answered (unknown, role,
         free provider), in row order, and how many sit on a known catch-all domain (skipped)."""
         seen: Dict[str, str] = {}
-        offset = 0
-        while True:
-            rows = self.store.list(ctx, "email_validation_items", {"job_id": job_id, **self._CANDIDATES},
-                                   order="row_number", limit=500, offset=offset).rows
-            if not rows:
-                break
-            for row in rows:
-                if row.get("email"):
-                    seen.setdefault(row["email"], row.get("domain") or row["email"].rpartition("@")[2])
-            offset += len(rows)
+        for row in self._scan(ctx, {"job_id": job_id, **self._CANDIDATES}):
+            if row.get("email"):
+                seen.setdefault(row["email"], row.get("domain") or row["email"].rpartition("@")[2])
         catch_all = self._catch_all_domains(ctx, set(seen.values()))
         emails = [e for e, d in seen.items() if d not in catch_all]
         return emails, len(seen) - len(emails)
@@ -838,23 +976,23 @@ class EmailValidationJobService:
                                 f"{estimate['to_check']} address(es) (estimate changed or not confirmed)")
         job = self.store.get(ctx, "email_validation_jobs", job_id)
         send = set(self._unresolved_emails(ctx, job_id)[0])
-        offset = 0
-        while True:  # candidates that are sent become PENDING; the rest (catch-all) keep their result
-            rows = self.store.list(ctx, "email_validation_items", {"job_id": job_id, **self._CANDIDATES},
-                                   order="row_number", limit=500, offset=offset).rows
-            if not rows:
-                break
-            kept = 0
-            for row in rows:
-                if row.get("email") in send:
-                    self.store.update(ctx, "email_validation_items", row["id"], {"status": "PENDING"})
-                else:
-                    kept += 1
-            offset += kept  # reset rows left the filter; skip only the ones that stayed
+        # Candidates that are sent become PENDING (one bulk update per page); the rest (known
+        # catch-all domains) keep their result. The keyset scan is not disturbed by the reset.
+        page: List[Tuple[str, Dict[str, Any]]] = []
+        for row in self._scan(ctx, {"job_id": job_id, **self._CANDIDATES}):
+            if row.get("email") in send:
+                page.append((row["id"], {"status": "PENDING"}))
+                if len(page) >= 500:
+                    self.store.update_many(ctx, "email_validation_items", page)
+                    page = []
+        if page:
+            self.store.update_many(ctx, "email_validation_items", page)
+        # The confirmed figure is a hard cap: the run never makes more paid checks than this.
+        budget = int(round(estimate["credits"] / (estimate["cost_per_check"] or 1.0)))
         settings = {**(job.get("settings") or {}), "allow_paid": True, "recheck_unknowns": True,
-                    "paid_statuses": list(engine.PAID_CANDIDATE_STATUSES)}
-        task = self.platform.tasks.submit(ctx, "email_validation_job", {"job_id": job_id},
-                                          entity_type="email_validation_jobs", entity_id=job_id)
+                    "paid_statuses": list(engine.PAID_CANDIDATE_STATUSES), "paid_budget": budget, "paid_used": 0,
+                    "confirmed_credits": estimate["credits"]}
+        task = self._submit(ctx, job_id)
         job = self.store.update(ctx, "email_validation_jobs", job_id, {
             "status": "queued", "task_id": task["id"], "settings": settings, "finished_at": None})
         audit(self.store, ctx, "email_validation.verify_unknowns", entity_type="email_validation_jobs",
@@ -872,34 +1010,53 @@ class EmailValidationJobService:
     def items(self, ctx: Ctx, job_id: str, filters: Optional[Mapping[str, Any]] = None, *, limit: int = 50,
               offset: int = 0, order: Optional[str] = None):
         self.store.get(ctx, "email_validation_jobs", job_id)
-        clean = {k: v for k, v in (filters or {}).items() if k != "job_id"}
+        clean = {k: v for k, v in (filters or {}).items() if k not in ("job_id", "workspace_id", "final_status")}
+        final = (filters or {}).get("final_status")
+        if final:  # VALID / INVALID / NOT_VERIFIED, resolved server-side by the one resolver
+            try:
+                clean.update(engine.final_filters(str(final).upper().replace(" ", "_")))
+            except ValueError as error:
+                raise ValidationError(str(error)) from None
         page = self.store.list(ctx, "email_validation_items", {**clean, "job_id": job_id}, order=order,
                                limit=min(max(1, limit), 500), offset=max(0, offset))
         for row in page.rows:
             if row.get("status") != "PENDING":
                 row["final_status"] = engine.final_status(row.get("status"), row.get("provider"))
                 row["summary"] = engine.evidence_summary(row.get("status"), row.get("provider"), row.get("checks"))
+                row["stages"] = engine.evidence_stages(row.get("status"), row.get("provider"), row.get("checks"),
+                                                       validated_at=row.get("validated_at"))
+                row["reason"] = reason_for(row["status"], row.get("checks") or {})
         return page
 
+    def _scan(self, ctx: Ctx, filters: Mapping[str, Any], *, page: int = 500) -> Iterable[Dict[str, Any]]:
+        """Every matching item in row order, by keyset (``row_number > last``) rather than
+        OFFSET, so reading a million-row job stays linear and rows changed while it is read
+        are neither skipped nor repeated."""
+        last = 0
+        while True:
+            rows = self.store.list(ctx, "email_validation_items", {**filters, "row_number__gt": last},
+                                   order="row_number", limit=page).rows
+            if not rows:
+                return
+            yield from rows
+            last = rows[-1]["row_number"]
+
     def _iter_items(self, ctx: Ctx, job_id: str, statuses: Optional[Sequence[str]] = None, *,
-                    provider: Optional[str] = None) -> Iterable[Dict[str, Any]]:
+                    provider: Optional[str] = None, final: Optional[str] = None) -> Iterable[Dict[str, Any]]:
         filters: Dict[str, Any] = {"job_id": job_id}
+        if final:
+            filters.update(engine.final_filters(final))
         if statuses:
             filters["status__in"] = list(statuses)
         if provider:
             filters["provider"] = provider
-        offset = 0
-        while True:
-            rows = self.store.list(ctx, "email_validation_items", filters, order="row_number", limit=500,
-                                   offset=offset).rows
-            if not rows:
-                return
-            yield from rows
-            offset += len(rows)
+        yield from self._scan(ctx, filters)
 
     def export(self, ctx: Ctx, job_id: str, fmt: str = "csv", status: Optional[Sequence[str]] = None,
-               provider: Optional[str] = None) -> Tuple[str, bytes, str]:
-        """``(filename, content, media type)``: the original columns plus the result."""
+               provider: Optional[str] = None, *, final: Optional[str] = None, stream: bool = False):
+        """``(filename, content, media type)``: the original columns plus the result. With
+        ``stream=True`` a CSV's content is an iterator of encoded chunks (constant memory for
+        any job size); XLSX is always built whole (openpyxl write-only mode)."""
         job = self.store.get(ctx, "email_validation_jobs", job_id)
         if fmt not in ("csv", "xlsx"):
             raise ValidationError("format must be csv or xlsx")
@@ -909,6 +1066,10 @@ class EmailValidationJobService:
                 raise ValidationError(f"unknown status {s!r}")
         if provider not in (None, "", "local", "emaillistverify"):
             raise ValidationError(f"unknown provider {provider!r}")
+        if final:
+            final = str(final).upper().replace(" ", "_")
+            if final not in engine.FINAL_STATUSES:
+                raise ValidationError(f"unknown final status {final!r}")
         columns = list(job.get("columns") or [])
         extra = ["validation_email", "validation_status", "validation_detail", "validation_score",
                  "validation_reason", "validation_provider", "validation_source", "validated_at"] + [
@@ -916,7 +1077,7 @@ class EmailValidationJobService:
         header = columns + [c for c in extra if c not in columns]
 
         def records():
-            for item in self._iter_items(ctx, job_id, statuses, provider=provider or None):
+            for item in self._iter_items(ctx, job_id, statuses, provider=provider or None, final=final):
                 row = item.get("row") or {}
                 values = [row.get(c, "") for c in columns]
                 pending = item["status"] == "PENDING"
@@ -932,29 +1093,43 @@ class EmailValidationJobService:
                 yield [str(v) if v is not None else "" for v in values]
 
         base = re.sub(r"[^A-Za-z0-9._-]+", "-", job["name"]).strip("-")[:60] or "validation"
-        suffix = f"-{'-'.join(s.lower() for s in statuses)}" if statuses else ""
+        suffix = (f"-{final.lower().replace('_', '-')}" if final else "") + (
+            f"-{'-'.join(s.lower() for s in statuses)}" if statuses else "")
+        audit(self.store, ctx, "email_validation.export", entity_type="email_validation_jobs", entity_id=job_id,
+              changes={"format": fmt, "statuses": statuses, "final": final})
         if fmt == "csv":
-            buffer = io.StringIO()
-            writer = csv.writer(buffer)
-            writer.writerow(header)
-            for values in records():
-                writer.writerow([("'" + v) if v[:1] in ("=", "+", "-", "@") else v for v in values])
-            content = buffer.getvalue().encode("utf-8-sig")
+            def chunks():
+                buffer = io.StringIO()
+                writer = csv.writer(buffer)
+                writer.writerow(header)
+                yield chr(0xFEFF) + buffer.getvalue()  # UTF-8 BOM so Excel reads the encoding
+                for values in records():
+                    buffer.seek(0)
+                    buffer.truncate()
+                    writer.writerow([_safe_cell(v) for v in values])
+                    yield buffer.getvalue()
+
+            encoded = (part.encode("utf-8") for part in chunks())
+            content = encoded if stream else b"".join(encoded)
             media = "text/csv"
         else:
             from openpyxl import Workbook
+            from openpyxl.cell import WriteOnlyCell
 
             workbook = Workbook(write_only=True)
             sheet = workbook.create_sheet("Validation")
             sheet.append(header)
             for values in records():
-                sheet.append(values)
+                cells = []
+                for value in values:
+                    cell = WriteOnlyCell(sheet, value=value)
+                    cell.data_type = "s"  # always text: a cell like "=HYPERLINK(...)" is never a formula
+                    cells.append(cell)
+                sheet.append(cells)
             out = io.BytesIO()
             workbook.save(out)
             content = out.getvalue()
             media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        audit(self.store, ctx, "email_validation.export", entity_type="email_validation_jobs", entity_id=job_id,
-              changes={"format": fmt, "statuses": statuses})
         return f"{base}{suffix}.{fmt}", content, media
 
     # --- running (worker) -----------------------------------------------------------------
@@ -975,6 +1150,10 @@ class EmailValidationJobService:
         self.store.update(ctx, "email_validation_jobs", job_id, {
             "status": "running", "started_at": job.get("started_at") or utcnow()})
         last_progress = 0.0
+        # A confirmed paid recheck carries its budget: the exact credits the user confirmed. It is
+        # never exceeded, across chunks, pauses, retries and restarts (paid_used is persisted).
+        budget = settings.get("paid_budget") if settings.get("allow_paid") else None
+        paid_used = int(settings.get("paid_used") or 0)
         while True:
             if reporter.is_cancelled():
                 self._finish(ctx, job_id, "cancelled")
@@ -989,8 +1168,14 @@ class EmailValidationJobService:
             if not batch:
                 break
             for start in range(0, len(batch), WRITE_CHUNK):  # saved every WRITE_CHUNK rows
-                self._process(ctx, email_service, batch[start:start + WRITE_CHUNK], column, settings,
-                              task_id=task.get("id"), evidence=evidence)
+                remaining = None if budget is None else max(0, int(budget) - paid_used)
+                used = self._process_with_retry(ctx, email_service, batch[start:start + WRITE_CHUNK], column,
+                                                settings, task_id=task.get("id"), evidence=evidence,
+                                                paid_budget=remaining)
+                if used:
+                    paid_used += used
+                    settings = {**settings, "paid_used": paid_used}
+                    self.store.update(ctx, "email_validation_jobs", job_id, {"settings": settings})
             if time.monotonic() - last_progress >= PROGRESS_SECONDS:  # counting a huge job every batch is waste
                 last_progress = time.monotonic()
                 counts = self.counts(ctx, job_id)
@@ -1002,7 +1187,8 @@ class EmailValidationJobService:
         if settings.get("recheck_unknowns"):  # a confirmed recheck authorises one paid run, not future ones
             final = self.store.update(ctx, "email_validation_jobs", job_id, {
                 "settings": {**settings, "allow_paid": False, "recheck_unknowns": False, "paid_statuses": None,
-                             "last_recheck_at": utcnow().isoformat()}})
+                             "paid_budget": None, "last_recheck_at": utcnow().isoformat(),
+                             "last_recheck_paid_checks": paid_used}})
         audit(self.store, ctx, "email_validation.complete", entity_type="email_validation_jobs", entity_id=job_id,
               summary=f"{final['counts'].get('processed', 0)} row(s) validated", changes={"counts": final["counts"]})
         self._notify(ctx, final)
@@ -1015,9 +1201,35 @@ class EmailValidationJobService:
             log.debug("validation_job_completed emit skipped", exc_info=True)
         return {"job_id": job_id, "status": "completed", "counts": final["counts"]}
 
+    def _process_with_retry(self, ctx: Ctx, email_service: Any, batch: List[Dict[str, Any]], column: str,
+                            settings: Mapping[str, Any], **kw: Any) -> int:
+        """:meth:`_process`, retried in-run after a transient failure (a database blip, a
+        dropped connection) with backoff, before the task attempt itself fails. Retrying is
+        safe: nothing in the chunk is marked done until its single bulk write succeeds, and
+        results already cached (including paid answers) are reused, never paid again."""
+        from cloud.intel.core.context import PlatformError
+
+        delay = CHUNK_BACKOFF
+        for attempt in range(CHUNK_RETRIES + 1):
+            try:
+                return self._process(ctx, email_service, batch, column, settings, **kw)
+            except PlatformError:  # validation / permission / not-found: retrying cannot help
+                raise
+            except Exception as error:  # noqa: BLE001
+                if attempt >= CHUNK_RETRIES:
+                    raise
+                # The error type only: a database error's text can quote row values (addresses).
+                log.warning("email validation chunk failed (attempt %d, %s); retrying in %.0fs", attempt + 1,
+                            type(error).__name__, delay)
+                time.sleep(delay)
+                delay *= 2
+        return 0  # pragma: no cover - the loop returns or raises
+
     def _process(self, ctx: Ctx, email_service: Any, batch: List[Dict[str, Any]], column: str,
-                 settings: Mapping[str, Any], *, task_id: Optional[str], evidence: Optional[_EvidenceRun] = None
-                 ) -> None:
+                 settings: Mapping[str, Any], *, task_id: Optional[str], evidence: Optional[_EvidenceRun] = None,
+                 paid_budget: Optional[int] = None) -> int:
+        """Validate one chunk and write it back in one bulk update. Returns the number of
+        paid checks it spent (answers, plus failures the provider may have charged for)."""
         evidence = evidence or _EvidenceRun(self, ctx, settings)
         emails: Dict[str, str] = {}
         originals: Dict[str, str] = {}
@@ -1027,20 +1239,28 @@ class EmailValidationJobService:
             emails[item["id"]] = engine.to_ascii_email(original)[0] if original else ""  # IDN -> punycode
         wanted = [e for e in emails.values() if e]
         # All DNS for this chunk up front and concurrently: the evidence engine's domain records
-        # (one cache read, then parallel lookups for new domains) and the built-in MX check.
+        # (one cache read, then parallel lookups for new domains). The built-in MX check reuses
+        # those answers, so each domain is resolved once and both layers agree on it.
         domains = sorted({_key(e).rpartition("@")[2] for e in wanted if "@" in _key(e)})
         evidence.prime(domains)
         evidence.resolve_domains(domains)
         local = getattr(email_service, "local", None)
-        if hasattr(local, "prime_domains"):
+        if hasattr(local, "seed"):
+            for domain in domains:
+                if evidence.memory.get(("dns", domain)) is not None:
+                    local.seed(domain, evidence.mail_of(domain))
+        if hasattr(local, "prime_domains"):  # anything the evidence layer did not answer
             local.prime_domains(domains, max_workers=DNS_WORKERS)
         results = {}
         if wanted:
             paid_statuses = tuple(settings.get("paid_statuses") or ("UNKNOWN",))
             for result in email_service.validate(ctx, wanted, allow_paid=bool(settings.get("allow_paid")),
-                                                 max_age_days=int(settings.get("max_age_days") or 30),
-                                                 task_id=task_id, paid_statuses=paid_statuses):
+                                                 max_age_days=max_age(settings.get("max_age_days")),
+                                                 task_id=task_id, paid_statuses=paid_statuses,
+                                                 paid_budget=paid_budget, on_credit_error="record"):
                 results[result["email"]] = result
+        paid_spent = sum(1 for r in results.values() if not r.get("cached") and (
+            r.get("provider") in engine.VERIFIERS or (r.get("checks") or {}).get("paid_charge_uncertain")))
         known_contacts = {}
         lookup = sorted({_key(e) for e in wanted if normalize_email(_key(e))})
         if lookup:  # one query per batch rather than one per row
@@ -1069,8 +1289,13 @@ class EmailValidationJobService:
                         # Strict validation: VALID means "a mailbox verifier confirmed it", nothing less.
                         changes.update(status="UNKNOWN", score=None,
                                        checks={**changes["checks"], "strict_demoted": True})
-                    self._add_evidence(changes, originals[item["id"]], key, item.get("row") or {}, settings,
-                                       evidence, fresh=not result.get("cached"))
+                    try:
+                        self._add_evidence(changes, originals[item["id"]], key, item.get("row") or {}, settings,
+                                           evidence, fresh=not result.get("cached"))
+                    except Exception as error:  # noqa: BLE001 - one odd row never fails the chunk
+                        log.warning("evidence layers failed for one row (%s)", type(error).__name__)
+                        changes["checks"] = {**(changes.get("checks") or {}),
+                                             "evidence_error": f"evidence layers failed ({type(error).__name__})"}
                 domain = key.rpartition("@")[2] if "@" in key else None
                 changes["domain"] = (domain or None) and domain[:253]
                 if not item.get("contact_id") and key in known_contacts:
@@ -1080,6 +1305,7 @@ class EmailValidationJobService:
         # resumed run simply validates them again (results are cached, nothing is paid twice).
         self.store.update_many(ctx, "email_validation_items", writes)
         evidence.flush()
+        return paid_spent
 
     def _add_evidence(self, changes: Dict[str, Any], original: str, email: str, row: Mapping[str, Any],
                       settings: Mapping[str, Any], evidence: _EvidenceRun, *, fresh: bool) -> None:
@@ -1088,7 +1314,8 @@ class EmailValidationJobService:
         changes the result, to INVALID; everything else is evidence."""
         checks = dict(changes.get("checks") or {})
         fmt = engine.check_format(original)
-        ev: Dict[str, Any] = {"format": {k: fmt[k] for k in ("ok", "idn", "issues", "placeholder", "did_you_mean")}}
+        ev: Dict[str, Any] = {"format": {k: fmt[k] for k in ("ok", "idn", "issues", "placeholder", "reserved_domain",
+                                                             "did_you_mean")}}
         provider = changes.get("provider")
         if not fmt["ok"]:
             if changes["status"] != "INVALID" and provider not in engine.VERIFIERS:
@@ -1098,12 +1325,18 @@ class EmailValidationJobService:
             domain = email.rpartition("@")[2]
             dom = evidence.domain(domain)
             ev["domain"] = {k: dom.get(k) for k in ("exists", "dns_error", "mail", "null_mx", "a_fallback", "spf",
-                                                     "spf_all", "dmarc", "dmarc_policy", "verdict", "invalid_reason")}
+                                                     "spf_all", "dmarc", "dmarc_policy", "verdict", "invalid_reason",
+                                                     "checked_at", "latency_ms")}
             ev["domain"]["mx_hosts"] = len(dom.get("mx") or [])
-            if dom.get("verdict") == "invalid" and changes["status"] != "INVALID" and provider not in engine.VERIFIERS:
-                changes.update(status="INVALID", score=0.0)
+            if dom.get("verdict") == "invalid" and provider not in engine.VERIFIERS:
+                # The domain provably takes no mail: INVALID, with the exact reason recorded even
+                # when the built-in check already said so.
+                if changes["status"] != "INVALID":
+                    changes.update(status="INVALID", score=0.0)
                 checks["mx"] = False
                 checks["domain_invalid"] = dom.get("invalid_reason")
+                if dom.get("dns_error") == "reserved":
+                    checks["reserved_domain"] = True
             contact_columns = settings.get("contact_columns") or {}
             contact = {name: row.get(col) for name, col in contact_columns.items()}
             first, last = engine._names(contact)  # noqa: SLF001 - same module family
@@ -1137,8 +1370,8 @@ class EmailValidationJobService:
             self.store.insert(ctx, "notifications", {
                 "user_id": job.get("created_by"), "kind": "email_validation.completed", "severity": "success",
                 "title": f"Email validation finished: {job['name']}"[:300],
-                "body": f"{counts.get('processed', 0)} checked · {counts.get('VALID', 0)} valid · "
-                        f"{counts.get('INVALID', 0)} invalid · {counts.get('UNKNOWN', 0)} unknown",
+                "body": f"{counts.get('processed', 0)} checked · {counts.get('final_valid', 0)} valid · "
+                        f"{counts.get('final_invalid', 0)} invalid · {counts.get('final_not_verified', 0)} not verified",
                 "link": f"/email-validation/{job['id']}", "entity_type": "email_validation_jobs",
                 "entity_id": job["id"]})
         except Exception:  # noqa: BLE001 - a notification must never fail the job

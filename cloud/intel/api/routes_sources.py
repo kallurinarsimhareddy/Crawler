@@ -195,22 +195,65 @@ def credit_limit(provider: str, body: Dict[str, Any] = Body(...), ctx: Ctx = Dep
 @router.post("/email/validate")
 def validate_emails(request: Request, body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
                     platform: Platform = Depends(get_platform)):
-    """Up to 25 addresses are validated synchronously; larger requests become a task."""
+    """Up to 25 addresses are validated synchronously; larger requests become a task.
+
+    Paid (EmailListVerify) checks are explicit and credit-exact: ``allow_paid`` needs
+    ``confirm: true`` and ``expected_credits`` equal to what ``POST /email/validate/estimate``
+    returns for the same addresses (the request is refused with the exact figure otherwise),
+    and the call never spends more than that. Paid checks are only offered for the
+    synchronous path; larger sets use an email validation job and its Verify Unknowns step."""
+    from cloud.intel.email.service import max_age
+
     emails = [str(e) for e in (body.get("emails") or []) if e]
     allow_paid = bool(body.get("allow_paid"))
     targets = body.get("contact_ids") or body.get("list_id")
+    max_age_days = max_age(body.get("max_age_days"))
     try:
         if emails and len(emails) <= 25 and not targets:
-            results = platform.service("email").validate(ctx, emails, allow_paid=allow_paid,
-                                                         max_age_days=int(body.get("max_age_days") or 30))
+            service = platform.service("email")
+            budget = None
+            if allow_paid:
+                estimate = service.estimate_paid(ctx, emails, max_age_days=max_age_days)
+                try:
+                    expected = float(body.get("expected_credits"))
+                except (TypeError, ValueError):
+                    expected = None
+                if body.get("confirm") is not True or expected is None or abs(expected - estimate["credits"]) > 1e-9:
+                    raise HTTPException(status.HTTP_409_CONFLICT, {
+                        "detail": f"confirm spending exactly {estimate['credits']:g} EmailListVerify credits on "
+                                  f"{estimate['to_check']} address(es)", "estimate": estimate})
+                budget = estimate["to_check"]
+            results = service.validate(ctx, emails, allow_paid=allow_paid, max_age_days=max_age_days,
+                                       paid_budget=budget)
             return {"items": jsonable_encoder(results)}
         if not emails and not targets:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "give emails, contact_ids or list_id")
+        if allow_paid:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                                "paid checks for more than 25 addresses run through an email validation job: "
+                                "built-in checks first, then Verify Unknowns with the exact credit estimate")
         params = {"emails": emails, "contact_ids": body.get("contact_ids") or [], "list_id": body.get("list_id"),
-                  "allow_paid": allow_paid, "max_age_days": body.get("max_age_days") or 30}
+                  "allow_paid": False, "max_age_days": max_age_days}
         task = idempotent(platform, ctx, request, params, lambda: jsonable_encoder(
             platform.tasks.submit(ctx, "validation", params)))
         return {"task_id": task["id"], "status": task["status"]}
+    except _HANDLED as error:
+        raise _fail(error) from error
+
+
+@router.post("/email/validate/estimate")
+def estimate_validation(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
+                        platform: Platform = Depends(get_platform)):
+    """Free: exactly how many EmailListVerify credits ``POST /email/validate`` with
+    ``allow_paid`` would spend on these addresses now (cache + built-in checks only)."""
+    from cloud.intel.email.service import max_age
+
+    emails = [str(e) for e in (body.get("emails") or []) if e]
+    if not emails or len(emails) > 25:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "give 1 to 25 emails")
+    try:
+        return jsonable_encoder(platform.service("email").estimate_paid(
+            ctx, emails, max_age_days=max_age(body.get("max_age_days"))))
     except _HANDLED as error:
         raise _fail(error) from error
 

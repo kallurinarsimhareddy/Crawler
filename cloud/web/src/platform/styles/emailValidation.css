@@ -76,6 +76,15 @@ th.ev-col--chosen, td.ev-col--chosen { background: var(--accent-soft); font-weig
 .ev-signal--bad { color: var(--danger, #b91c1c); }
 .ev-signal--neutral { color: var(--muted, #64748b); }
 .ev-details { padding-left: 18px; margin: 4px 0 12px; display: grid; gap: 4px; overflow-wrap: anywhere; }
+.ev-stages { list-style: none; padding: 0; margin: 4px 0 12px; display: grid; gap: 2px; }
+.ev-stage { display: grid; grid-template-columns: minmax(110px, 38%) 1fr; gap: 2px 10px; padding: 5px 0 5px 8px; border-left: 3px solid var(--border); border-bottom: 1px solid var(--border); min-width: 0; }
+.ev-stage__label { font-weight: 600; }
+.ev-stage__result { overflow-wrap: anywhere; }
+.ev-stage__meta { grid-column: 1 / -1; font-size: 12px; overflow-wrap: anywhere; }
+.ev-stage--good { border-left-color: var(--success, #15803d); }
+.ev-stage--bad { border-left-color: var(--danger, #b91c1c); }
+.ev-stage--warn { border-left-color: var(--warning, #b45309); }
+.ev-stage--neutral { border-left-color: var(--border); }
 @media (max-width: 640px) {
   .ev-results__head { padding: 8px; }
   .ev-date { flex: 1 1 100%; }

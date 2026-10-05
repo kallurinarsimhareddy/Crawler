@@ -144,9 +144,22 @@ class SmtpTests(unittest.TestCase):
                 raise AssertionError(f"SMTP preflight called {name}()")
 
         with mock.patch("smtplib.SMTP", FakeSMTP):
-            result = SmtpPreflight().check("mx1.acme.com")
+            result = SmtpPreflight(resolve_public=lambda host: ["203.0.113.9"]).check("mx1.acme.com")
         self.assertEqual((result["smtp"], result["starttls"]), ("pass", True))
-        self.assertEqual(commands, ["connect mx1.acme.com:25", "ehlo", "quit"])
+        # It connects to the vetted public address, never re-resolving the (attacker-chosen) MX name.
+        self.assertEqual(commands, ["connect 203.0.113.9:25", "ehlo", "quit"])
+
+    def test_an_mx_pointing_at_a_private_address_is_never_contacted(self) -> None:
+        from cloud.shared.urls import UnsafeTargetError
+
+        def private(host):
+            raise UnsafeTargetError("non-public address")
+
+        with mock.patch("smtplib.SMTP", side_effect=AssertionError("must not connect")):
+            result = SmtpPreflight(resolve_public=private).check("mx.evil.example")
+            self.assertEqual((result["smtp"], result["error_code"]), ("unknown", "unsafe_target"))
+            loopback = SmtpPreflight().check("127.0.0.1")  # the real check refuses loopback too
+        self.assertEqual(loopback["error_code"], "unsafe_target")
 
     def test_timeout_is_unknown_not_invalid(self) -> None:
         class Slow:
@@ -577,8 +590,11 @@ class ConcurrencyTests(unittest.TestCase):
         validator.prime_domains([f"d{i}.example" for i in range(32)] + ["nomail.example", "flaky.example"])
         self.assertLess(_time.monotonic() - started, 0.6)  # 34 lookups x 50 ms sequentially would be 1.7 s
         self.assertGreater(peak[0], 4)
-        self.assertEqual(validator._mx_cache["nomail.example"], False)  # noqa: SLF001
-        self.assertNotIn("flaky.example", validator._mx_cache)  # transient failures are not cached  # noqa: SLF001
+        self.assertIs(validator._get("nomail.example"), False)  # noqa: SLF001
+        # A transient failure is remembered only briefly (TRANSIENT_TTL), so the per-row checks of
+        # a slow domain do not each wait for another DNS timeout; it is asked again later.
+        self.assertEqual(validator._get("flaky.example"), "transient")  # noqa: SLF001
+        self.assertIsNone(validator.check("a@flaky.example").checks["mx"])
 
     def test_a_chunk_resolves_its_domains_before_validating(self) -> None:
         platform, ctx, _ = make_platform()
