@@ -155,8 +155,8 @@ export function jobsForCompany(name: string): string {
 }
 
 /**
- * States that can be filtered and counted across every company. MATCHED (a fuzzy CRM match) is
- * only checked for the companies on the page being shown, so it is a badge, not a filter.
+ * States that can be filtered and counted across every company. MATCHED is kept for API
+ * compatibility but no longer produced by the page (name-only evidence is never a safe match).
  */
 export const FILTER_STATES = ["NEW ACCOUNT", "ALREADY IN CRM", "REVIEW", "LINKED"] as const;
 

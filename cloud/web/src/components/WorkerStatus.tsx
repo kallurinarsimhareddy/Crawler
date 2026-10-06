@@ -12,7 +12,8 @@ import { formatSeconds, formatDateTime } from "../lib/format";
  * offline and what to do about it.
  */
 export function useWorkerStatus() {
-  return usePolling<Status>((signal) => api.status(signal), 10000, "status");
+  // Every minute (and not while the tab is hidden): each read costs queue commands.
+  return usePolling<Status>((signal) => api.status(signal), 60000, "status");
 }
 
 function Dot({ online }: { online: boolean }) {

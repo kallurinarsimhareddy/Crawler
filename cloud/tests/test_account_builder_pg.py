@@ -51,6 +51,9 @@ class AccountBuilderPostgresTests(PostgresTestCase):
         self.assertEqual(self.store.group_tags(self.ctx, "job_postings", "company_name", "matched_keywords",
                                                {"company_name": ["Contoso Ltd"]}), {"Contoso Ltd": {"SAP": 1, "ERP": 1}})
         self.assertEqual(len(self.store.walk(self.ctx, "job_postings", {"status": "open"})), 5)
+        slim = self.store.rows(self.ctx, "job_postings", {"company_name": ["Contoso Ltd"]}, columns=("company_name",))
+        self.assertEqual([sorted(r) for r in slim], [["company_name", "id"]])
+        self.assertEqual(len(self.store.walk(self.ctx, "job_postings", {"status": "open"}, columns=("status",))), 5)
         item = {k: north[k] for k in ("key", "names", "display_name", "signal_ids", "job_ids")}
         out = self.builder.build(self.ctx, [item], new_list="ERP migration targets")
         self.assertEqual((out["stats"]["created"], out["stats"]["jobs_linked"], out["stats"]["signals_linked"],

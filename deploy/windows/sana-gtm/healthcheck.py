@@ -14,7 +14,7 @@ import sys
 import time
 from pathlib import Path
 
-HEARTBEAT_FRESH_S = 120  # the worker heartbeats every 30 s
+HEARTBEAT_FRESH_S = 240  # the worker beats every 60 s (queue presence and its state file)
 
 
 def read_env(path: Path) -> dict:
@@ -27,10 +27,26 @@ def read_env(path: Path) -> dict:
     return values
 
 
+def _state_age(state, now: float):
+    """Seconds since the worker last wrote its state file, or None."""
+    try:
+        from datetime import datetime
+
+        return now - datetime.fromisoformat(state["updated_at"]).timestamp()
+    except (TypeError, KeyError, ValueError):
+        return None
+
+
 def main() -> int:
     env = read_env(Path(sys.argv[1]))
-    out = {"database": False, "queue": False, "worker_heartbeat": False, "workers_online": 0,
-           "last_heartbeat_age_s": None, "errors": {}}
+    out = {"database": False, "queue": False, "queue_quota_exhausted": False, "worker_heartbeat": False,
+           "workers_online": 0, "last_heartbeat_age_s": None, "worker_state": None, "errors": {}}
+    # what the worker itself reports (written by cloud.intel.tasks.worker --state-file)
+    state_file = Path(__file__).resolve().parents[3] / "logs" / "sana-gtm" / "worker-state.json"
+    try:
+        out["worker_state"] = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        pass
     try:
         import psycopg
 
@@ -43,16 +59,24 @@ def main() -> int:
 
         client = redis.Redis.from_url(env["CAREERCLOUD_REDIS_URL"], socket_timeout=10, socket_connect_timeout=10,
                                       decode_responses=True)
-        out["queue"] = bool(client.ping())
-        key = f"{env.get('CAREERCLOUD_QUEUE_PREFIX', 'careercloud')}:platform:workers"
+        client.ping()                           # PING is not a billed command
         now = time.time()
-        out["workers_online"] = int(client.zcount(key, now - HEARTBEAT_FRESH_S, "+inf"))
-        newest = client.zrange(key, -1, -1, withscores=True)
-        if newest:
-            out["last_heartbeat_age_s"] = round(now - float(newest[0][1]), 1)
+        fresh = _state_age(out["worker_state"], now)
+        if fresh is not None and fresh < HEARTBEAT_FRESH_S:
+            # the worker's own state file says it is alive: no queue commands needed
+            out["workers_online"], out["last_heartbeat_age_s"] = 1, round(fresh, 1)
+        else:
+            key = f"{env.get('CAREERCLOUD_QUEUE_PREFIX', 'careercloud')}:platform:workers"
+            out["workers_online"] = int(client.zcount(key, now - HEARTBEAT_FRESH_S, "+inf"))
+            newest = client.zrange(key, -1, -1, withscores=True)
+            if newest:
+                out["last_heartbeat_age_s"] = round(now - float(newest[0][1]), 1)
         out["worker_heartbeat"] = out["workers_online"] > 0
+        out["queue"] = True                     # only when every queue command was served
     except Exception as error:  # noqa: BLE001
         out["errors"]["queue"] = type(error).__name__
+        if "request limit" in str(error).lower() or "requests limit" in str(error).lower():
+            out["queue_quota_exhausted"] = True
     print(json.dumps(out))
     return 0
 

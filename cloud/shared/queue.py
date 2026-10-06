@@ -57,7 +57,10 @@ __all__ = [
 
 #: A worker whose last heartbeat is older than this is treated as gone. Three
 #: times the worker's default 30 s heartbeat, so one missed beat is not an outage.
-DEFAULT_WORKER_STALE_AFTER = 90.0
+#: The longest single blocking wait for new work, in seconds.
+MAX_WAIT_SECONDS = 25.0
+#: A worker beats every 60 s; three missed beats mean it is gone.
+DEFAULT_WORKER_STALE_AFTER = 180.0
 
 
 @dataclass(frozen=True)
@@ -101,6 +104,41 @@ class WorkerPresence:
         return max(0.0, self.checked_at - self.last_heartbeat)
 
 
+class QueueUnavailable(RuntimeError):
+    """The queue backend cannot serve requests: unreachable, or its provider refuses them
+    (e.g. a monthly request quota). Infrastructure, not a task failure — nothing was
+    reserved or acknowledged, and every task's state stays in the database."""
+
+    def __init__(self, reason: str, *, quota: bool = False) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.quota = quota
+
+
+#: Provider replies that mean "this database refuses commands until the quota resets".
+_QUOTA_MARKERS = ("max requests limit", "max daily request limit", "max monthly request limit",
+                  "request limit exceeded", "max commands limit")
+
+
+def queue_unavailable(error: BaseException) -> Optional[QueueUnavailable]:
+    """``QueueUnavailable`` when ``error`` means the queue itself is down or refusing
+    commands; None for anything else (a real bug must still surface)."""
+    if isinstance(error, QueueUnavailable):
+        return error
+    try:
+        import redis
+    except ImportError:  # pragma: no cover - redis is installed wherever it is used
+        return None
+    if isinstance(error, (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError)):
+        return QueueUnavailable(f"the task queue is unreachable ({type(error).__name__})")
+    if isinstance(error, redis.exceptions.ResponseError):
+        text = str(error)
+        if any(marker in text.lower() for marker in _QUOTA_MARKERS):
+            return QueueUnavailable("the task queue provider refuses commands: its request quota is exhausted ("
+                                    + text.split(" See ")[0][:160] + ")", quota=True)
+    return None
+
+
 class JobQueue(ABC):
     """Hands job ids to workers. See the module docstring for the contract."""
 
@@ -125,6 +163,12 @@ class JobQueue(ABC):
     @abstractmethod
     def stats(self) -> QueueStats:
         """Counts, for health checks and tests."""
+
+    def wait_for_work(self, timeout: float) -> bool:
+        """Block up to ``timeout`` seconds until new work may be ready; True means "reserve
+        now". A backend without a doorbell sleeps briefly and says yes (plain polling)."""
+        time.sleep(min(max(timeout, 0.0), 2.0))
+        return True
 
     @abstractmethod
     def heartbeat_worker(self, worker_id: str) -> None:
@@ -159,6 +203,8 @@ class InMemoryJobQueue(JobQueue):
         self._in_flight: Dict[str, Tuple[float, str]] = {}
         self._deliveries: Dict[str, int] = {}
         self._workers: Dict[str, float] = {}
+        self._bell = threading.Condition()
+        self._rang = False
 
     def enqueue(self, job_id: str, *, delay_seconds: float = 0.0) -> bool:
         with self._lock:
@@ -169,7 +215,18 @@ class InMemoryJobQueue(JobQueue):
                 self._delayed[job_id] = self._clock() + delay_seconds
             else:
                 self._ready.append(job_id)
-            return True
+        if delay_seconds <= 0:
+            with self._bell:
+                self._rang = True
+                self._bell.notify_all()
+        return True
+
+    def wait_for_work(self, timeout: float) -> bool:
+        with self._bell:
+            if not self._rang:
+                self._bell.wait(max(0.0, timeout))
+            rang, self._rang = self._rang, False
+            return rang
 
     def _promote(self, now: float) -> None:
         for job_id, due in sorted(self._delayed.items(), key=lambda item: item[1]):
@@ -254,6 +311,10 @@ if tonumber(ARGV[2]) > 0 then
   redis.call('ZADD', KEYS[2], tonumber(ARGV[3]) + tonumber(ARGV[2]), ARGV[1])
 else
   redis.call('LPUSH', KEYS[1], ARGV[1])
+  if KEYS[4] then
+    redis.call('LPUSH', KEYS[4], '1')
+    redis.call('LTRIM', KEYS[4], 0, 63)
+  end
 end
 return 1
 """
@@ -313,14 +374,17 @@ class RedisJobQueue(JobQueue):
         *,
         prefix: str = "careercloud",
         clock: Callable[[], float] = time.time,
+        blocking_client: Optional[object] = None,
     ) -> None:
         if not prefix or any(ch.isspace() for ch in prefix):
             raise ValueError("queue prefix must be a non-empty string without spaces")
         self._redis = client
+        #: a connection whose read timeout outlasts a blocking wait (see from_url)
+        self._blocking = blocking_client or client
         self._clock = clock
         self._keys = {
             name: f"{prefix}:{name}"
-            for name in ("ready", "delayed", "waiting", "inflight", "deliveries", "workers")
+            for name in ("ready", "delayed", "waiting", "inflight", "deliveries", "workers", "bell")
         }
         register = client.register_script  # type: ignore[attr-defined]
         self._enqueue = register(_ENQUEUE)
@@ -335,15 +399,26 @@ class RedisJobQueue(JobQueue):
         client = redis.Redis.from_url(
             url, decode_responses=True, socket_timeout=10, socket_connect_timeout=5, health_check_interval=30
         )
-        return cls(client, prefix=prefix)
+        # Blocking waits need a read timeout longer than the wait itself.
+        blocking = redis.Redis.from_url(
+            url, decode_responses=True, socket_timeout=MAX_WAIT_SECONDS + 15, socket_connect_timeout=5,
+            health_check_interval=30,
+        )
+        return cls(client, prefix=prefix, blocking_client=blocking)
 
     def enqueue(self, job_id: str, *, delay_seconds: float = 0.0) -> bool:
         k = self._keys
         added = self._enqueue(
-            keys=[k["ready"], k["delayed"], k["waiting"]],
+            keys=[k["ready"], k["delayed"], k["waiting"], k["bell"]],
             args=[job_id, max(0.0, float(delay_seconds)), self._clock()],
         )
         return bool(int(added))
+
+    def wait_for_work(self, timeout: float) -> bool:
+        """One BLPOP on the doorbell (a single command however long it waits) instead of
+        polling. Each enqueue of immediate work rings it; the list is capped at 64."""
+        seconds = max(1, min(int(timeout), int(MAX_WAIT_SECONDS)))
+        return self._blocking.blpop([self._keys["bell"]], timeout=seconds) is not None  # type: ignore[attr-defined]
 
     def reserve(self, worker_id: str, *, visibility_timeout: float) -> Optional[Delivery]:
         k = self._keys

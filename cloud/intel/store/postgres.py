@@ -343,6 +343,19 @@ class PostgresStore(Store):
             row = conn.execute(query, [row_id, ctx.workspace_id]).fetchone()
         return _plain(row) if row else None
 
+    def _rows_columns(self, ctx: Ctx, spec: EntitySpec, filters, q, order, limit,
+                      columns: List[str]) -> List[Dict[str, Any]]:
+        from psycopg import sql
+
+        where, params = self._where(spec, ctx, filters, q)
+        order_sql = sql.SQL(", ").join(
+            sql.SQL("{} {} nulls last").format(sql.Identifier(n), sql.SQL("desc" if d else "asc")) for n, d in order)
+        with self._tx(self._scope(ctx)) as conn:
+            rows = conn.execute(sql.SQL("select {} from {} where {} order by {} limit %s").format(
+                sql.SQL(", ").join(sql.Identifier(c) for c in columns), self._table(spec), where, order_sql),
+                params + [limit]).fetchall()
+        return [_plain(r) for r in rows]
+
     def _rows(self, ctx: Ctx, spec: EntitySpec, filters, q, order, limit) -> List[Dict[str, Any]]:
         from psycopg import sql
 

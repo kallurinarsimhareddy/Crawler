@@ -331,15 +331,16 @@ class Store(ABC):
         return out
 
     def walk(self, ctx: Ctx, entity: str, filters: Optional[Mapping[str, Any]] = None, *,
-             cap: int = 100_000) -> List[Dict[str, Any]]:
-        """Every matching row in id order, paged by id (cheap at any depth, unlike offsets)."""
+             cap: int = 100_000, columns: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
+        """Every matching row in id order, paged by id (cheap at any depth, unlike offsets).
+        ``columns`` limits each row to those fields (plus ``id``)."""
         rows: List[Dict[str, Any]] = []
         last = ""
         while len(rows) < cap:
             page = dict(filters or {})
             if last:
                 page = {"all_of": [page, {"id__gt": last}]} if page else {"id__gt": last}
-            batch = self.rows(ctx, entity, page, order="id", limit=MAX_PAGE)
+            batch = self.rows(ctx, entity, page, order="id", limit=MAX_PAGE, columns=columns)
             rows.extend(batch)
             if len(batch) < MAX_PAGE:
                 break
@@ -441,14 +442,27 @@ class Store(ABC):
                           parse_order(spec, order), limit, offset)
 
     def rows(self, ctx: Ctx, entity: str, filters: Optional[Mapping[str, Any]] = None, *,
-             order: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+             order: Optional[str] = None, limit: int = 50,
+             columns: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
         """One page of matching rows without a total count — for batch jobs that walk a large
-        table with keyset paging (``id__gt``), where counting every page would dominate."""
+        table with keyset paging (``id__gt``), where counting every page would dominate.
+        ``columns`` returns only those fields (plus ``id``): much less to read and transfer
+        when rows carry large JSON or arrays."""
         spec = get_spec(entity)
         limit = max(1, min(int(limit), MAX_PAGE))
         q = (filters or {}).get("q")
-        return self._rows(ctx, spec, parse_filters(spec, filters), str(q).strip() if q else None,
-                          parse_order(spec, order), limit)
+        parsed, text, ordering = parse_filters(spec, filters), str(q).strip() if q else None, parse_order(spec, order)
+        if columns:
+            cols = ["id"] + [c for c in dict.fromkeys(columns) if c != "id"]
+            for col in cols:
+                if col not in spec.columns and col not in COMMON_COLUMNS:
+                    raise ValidationError(f"{entity} has no field {col!r}")
+            return self._rows_columns(ctx, spec, parsed, text, ordering, limit, cols)
+        return self._rows(ctx, spec, parsed, text, ordering, limit)
+
+    def _rows_columns(self, ctx: Ctx, spec: EntitySpec, filters, q, order, limit,
+                      columns: List[str]) -> List[Dict[str, Any]]:
+        return [{c: r.get(c) for c in columns} for r in self._rows(ctx, spec, filters, q, order, limit)]
 
     def _rows(self, ctx: Ctx, spec: EntitySpec, filters, q, order, limit) -> List[Dict[str, Any]]:
         return self._list(ctx, spec, filters, q, order, limit, 0).rows

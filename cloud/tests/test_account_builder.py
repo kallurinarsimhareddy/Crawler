@@ -141,6 +141,19 @@ class AccountBuilderTests(_Base):
         out = self.builder.build(self.ctx, [self.item(booz, override=True)])
         self.assertEqual(out["stats"]["created"], 1)
 
+    def test_alias_match_is_review_and_the_page_makes_no_per_row_resolver_calls(self) -> None:
+        company = self.platform.service("crm").create_company(self.ctx, {"name": "Beta Holdings"})["company"]
+        self.store.update(self.ctx, "companies", company["id"], {"aliases": ["Beta LLC"]})
+        with mock.patch.object(type(self.platform.service("dedupe")), "resolve",
+                               side_effect=AssertionError("no per-row resolver on the page")):
+            beta = self.builder.candidates(self.ctx, {}, limit=50, fresh=True)["rows"]
+        beta = next(r for r in beta if r["display_name"] == "Beta LLC")
+        self.assertEqual((beta["state"], [c["name"] for c in beta["crm"]]), ("REVIEW", ["Beta Holdings"]))
+        self.assertEqual(beta["match_reason"], ab.ALIAS_REASON)
+        # and building it goes to review too — never a silent duplicate
+        out = self.builder.build(self.ctx, [self.item(beta)])
+        self.assertEqual((out["stats"]["created"], out["stats"]["review"]), (0, 1))
+
     def test_crm_index_signals_and_technologies_are_not_truncated_at_one_page(self) -> None:
         crm = self.platform.service("crm")
         for i in range(8):
@@ -157,6 +170,10 @@ class AccountBuilderTests(_Base):
         self.assertEqual(acme["technologies"], ["SAP"])
         self.assertEqual(self.store.group_tags(self.ctx, "job_postings", "company_name", "matched_keywords",
                                                {"status": "open"})["Beta LLC"], {"NetSuite": 2})
+        slim = self.store.rows(self.ctx, "hiring_signals", {}, columns=("signal_type", "strength"))
+        self.assertTrue(slim and all(sorted(r) == ["id", "signal_type", "strength"] for r in slim))
+        with self.assertRaises(ValidationError):
+            self.store.rows(self.ctx, "hiring_signals", {}, columns=("no_such_field",))
 
     # near match -> review; explicit override; link to an existing company
     def test_ambiguous_goes_to_review_and_override_or_link_resolves_it(self) -> None:

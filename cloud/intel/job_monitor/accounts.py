@@ -8,9 +8,11 @@ signals and its CRM state:
 ==============  =====================================================================
 LINKED          its jobs already point at a CRM company
 ALREADY IN CRM  exactly one CRM company has this normalised name — "Create" links to it
-MATCHED         the CRM dedupe resolver finds a safe (exact / strong) match by other
-                evidence (alias, domain) — "Create" links to it
-REVIEW          ambiguous: several candidates, a near match, or a pending review row —
+MATCHED         kept for API compatibility; the page no longer runs the dedupe resolver per
+                row (name-only evidence never gives a safe match). "Create" still does, and
+                links when the resolver finds an exact / strong match
+REVIEW          ambiguous: several CRM companies with the name, the same name apart from
+                legal form / punctuation, a recorded alias, or a pending review row —
                 nothing happens without an explicit Link / Create-new decision
 NEW ACCOUNT     no CRM company resembles it
 ==============  =====================================================================
@@ -67,6 +69,7 @@ _REVIEW_REASONS = ("several CRM companies share this name", "possible duplicate"
 #: The job monitor's reason for a name with no CRM company at all (nothing to choose between).
 UNMATCHED_REASON = "no CRM company has this name"
 NEAR_REASON = "same name as a CRM company apart from legal form or punctuation (Inc, Ltd, LLC…)"
+ALIAS_REASON = "same name as a recorded alias of a CRM company"
 
 
 def _key(name: Any) -> Optional[str]:
@@ -124,6 +127,12 @@ class AccountBuilderService:
             slug = company_name_key(row.get("name") or "")
             if slug and len(slug) >= 3:
                 loose.setdefault(slug, []).append(ref)
+            # a recorded alias equal to a job's company name is the same possible duplicate
+            # the dedupe resolver reports (name-only evidence: review, never auto-link)
+            for alias in row.get("aliases") or []:
+                alias_slug = company_name_key(alias or "")
+                if alias_slug and len(alias_slug) >= 3 and alias_slug != slug:
+                    loose.setdefault(alias_slug, []).append({**ref, "alias": alias})
         return exact, loose
 
     def _near(self, ctx: Ctx, item: Mapping[str, Any], names: Sequence[str]) -> List[Dict[str, Any]]:
@@ -212,7 +221,8 @@ class AccountBuilderService:
             g["linked_jobs"] += s["linked"]
         crm, loose = self._crm_indexes(ctx)
         ambiguous = {r["normalized_name"] for r in self.store.walk(ctx, "job_company_reviews", {
-            "status": "pending", "any_of": [{"reason__ilike": reason} for reason in _REVIEW_REASONS]}, cap=50_000)}
+            "status": "pending", "any_of": [{"reason__ilike": reason} for reason in _REVIEW_REASONS]}, cap=50_000,
+            columns=("normalized_name",))}
         rows = []
         for key, g in groups.items():
             matches = crm.get(key, [])
@@ -233,7 +243,8 @@ class AccountBuilderService:
             else:
                 state = "NEW ACCOUNT"
             reason = ("several CRM companies share this exact name" if len(matches) > 1 else
-                      NEAR_REASON if state == "REVIEW" and near else
+                      (ALIAS_REASON if all(r.get("alias") for r in near) else NEAR_REASON)
+                      if state == "REVIEW" and near else
                       "waiting in the company review queue" if state == "REVIEW" else None)
             if near and state == "REVIEW":
                 matches = near
@@ -259,7 +270,8 @@ class AccountBuilderService:
                 if key in keywords:
                     keywords[key].update(tags)
             # a few recent jobs per company, recorded as the originating jobs
-            for job in self.store.rows(ctx, "job_postings", chunk, order="-first_seen_at", limit=500):
+            for job in self.store.rows(ctx, "job_postings", chunk, order="-first_seen_at", limit=500,
+                                       columns=("company_name",)):
                 key = _key(job.get("company_name"))
                 if key in job_ids and len(job_ids[key]) < 5:
                     job_ids[key].append(job["id"])
@@ -271,10 +283,13 @@ class AccountBuilderService:
             linked_names = sorted({n for r in linked_rows.values() for n in r["names"]})
             for start in range(0, len(linked_names), 200):
                 for job in self.store.rows(ctx, "job_postings", {"company_name": linked_names[start:start + 200],
-                                                                 "company_id__isnull": False}, order="id", limit=500):
+                                                                 "company_id__isnull": False}, order="id", limit=500,
+                                           columns=("company_name", "company_id")):
                     owner.setdefault(_key(job.get("company_name")) or "", job["company_id"])
+            companies = {c["id"]: c for c in self.store.rows(
+                ctx, "companies", {"id": sorted(set(owner.values()))}, limit=len(owner))} if owner else {}
             for key, row in linked_rows.items():
-                company = self.store.find(ctx, "companies", owner[key]) if key in owner else None
+                company = companies.get(owner.get(key, ""))
                 if company is not None:
                     row["crm"] = [{"id": company["id"], "name": company["name"], "domain": company.get("domain"),
                                    "hiring_score": company.get("hiring_score"),
@@ -285,9 +300,11 @@ class AccountBuilderService:
         same_company = ("ALREADY IN CRM", "LINKED")
         company_ids = [c["id"] for r in page if r["state"] in same_company for c in r["crm"]]
         for start in range(0, len(names), 200):
+            # only what the page shows: signal evidence and job id lists are large
             for sig in self.store.walk(ctx, "hiring_signals", {"status": "active", "any_of": [
                     {"company_name": names[start:start + 200]},
-                    *([{"company_id": company_ids}] if company_ids else [])]}, cap=20_000):
+                    *([{"company_id": company_ids}] if company_ids else [])]}, cap=20_000,
+                    columns=("company_name", "company_id", "signal_type", "strength", "confidence")):
                 key = _key(sig.get("company_name"))
                 if key not in signals:
                     owner = next((r["key"] for r in page if r["state"] in same_company
@@ -295,9 +312,13 @@ class AccountBuilderService:
                     key = owner
                 if key in signals:
                     signals[key].append(sig)
-        resolver = self.platform.service("dedupe")
-        from cloud.intel.imports.dedupe import MERGEABLE
         from cloud.intel.signals.service import SIGNAL_WEIGHTS
+
+        # review candidates of pending reviews, read in one query (not one per row)
+        wanted = sorted({cid for r in page if r["state"] == "REVIEW" and not r["crm"]
+                         for cid in ((reviews.get(r["key"]) or {}).get("candidate_ids") or [])})
+        candidates = {c["id"]: c for c in self.store.rows(ctx, "companies", {"id": wanted},
+                                                          limit=len(wanted))} if wanted else {}
 
         for row in page:
             row["display_name"] = row["names"].most_common(1)[0][0]
@@ -318,18 +339,11 @@ class AccountBuilderService:
                 row["hiring_score"], row["score_source"] = round(min(100.0, value), 1), "signals"
             pending = reviews.get(row["key"])
             row["review_id"] = pending["id"] if pending else None
-            if row["state"] == "NEW ACCOUNT":
-                match = resolver.resolve(ctx, {"name": row["display_name"]})
-                if match.get("candidates"):
-                    if match["outcome"] in MERGEABLE and match.get("company_id"):
-                        row["state"], row["match_reason"] = "MATCHED", "; ".join(match.get("reasons") or [])[:200]
-                        found = self.store.find(ctx, "companies", match["company_id"])
-                        row["crm"] = [{"id": found["id"], "name": found["name"]}] if found else row["crm"]
-                    else:
-                        row["state"], row["match_reason"] = "REVIEW", "; ".join(match.get("reasons") or [])[:200]
-                        row["crm"] = self._names(ctx, match["candidates"][:5])
-            elif row["state"] == "REVIEW" and not row["crm"] and pending:
-                row["crm"] = self._names(ctx, pending.get("candidate_ids") or [])
+            # Exact, legal-form and alias matches were found once for the whole grouping
+            # (_group); creating an account still runs the full dedupe resolver.
+            if row["state"] == "REVIEW" and not row["crm"] and pending:
+                row["crm"] = [{"id": c["id"], "name": c["name"], "domain": c.get("domain")}
+                              for c in (candidates.get(i) for i in pending.get("candidate_ids") or []) if c]
                 row["match_reason"] = pending.get("reason")
             elif row["state"] == "ALREADY IN CRM":
                 row["match_reason"] = "exact normalised company name"

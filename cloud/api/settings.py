@@ -105,7 +105,7 @@ class Settings:
     log_level: str = "INFO"
     #: A worker whose last heartbeat is older than this counts as offline on
     #: ``/status``. Three missed 30 s beats, so a slow tick is not an outage.
-    worker_stale_after_seconds: float = 90.0
+    worker_stale_after_seconds: float = 180.0
 
     @property
     def deployed(self) -> bool:
@@ -212,7 +212,7 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         log_format=env_choice(env, "CAREERCLOUD_LOG_FORMAT", "text", ("text", "json")),
         log_level=env_choice(env, "CAREERCLOUD_LOG_LEVEL", "info", ("debug", "info", "warning", "error")).upper(),
         worker_stale_after_seconds=env_float(
-            env, "CAREERCLOUD_WORKER_STALE_AFTER_SECONDS", 90.0, minimum=5.0, maximum=3600.0
+            env, "CAREERCLOUD_WORKER_STALE_AFTER_SECONDS", 180.0, minimum=5.0, maximum=3600.0
         ),
     )
     validate_settings(settings)

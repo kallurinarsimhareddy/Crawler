@@ -167,7 +167,8 @@ function Start-Api {
 function Start-Worker {
     Rotate (Join-Path $LogDir "worker.out.log"); Rotate (Join-Path $LogDir "worker.err.log")
     # The same command run-sanagtm-worker.bat runs, without the .bat / cmd.exe in between.
-    $procId = Start-Hidden $Python @("-m", "cloud.intel.tasks.worker", "--env-file", $WorkerEnv) `
+    $procId = Start-Hidden $Python @("-m", "cloud.intel.tasks.worker", "--env-file", $WorkerEnv,
+                                     "--state-file", (Join-Path $LogDir "worker-state.json")) `
         (Join-Path $LogDir "worker.out.log") (Join-Path $LogDir "worker.err.log")
     Write-Log "Worker started (pid $procId, no window)"
 }
@@ -248,7 +249,7 @@ function Invoke-Supervisor {
 
         $state = @{
             api    = @{ fails = 0; restarts = 0; next = [datetime]::MinValue; started = [datetime]::MinValue }
-            worker = @{ fails = 0; restarts = 0; next = [datetime]::MinValue; started = [datetime]::MinValue }
+            worker = @{ fails = 0; restarts = 0; next = [datetime]::MinValue; started = [datetime]::MinValue; queueDown = $false }
             tunnel = @{ fails = 0; restarts = 0; next = [datetime]::MinValue; started = [datetime]::MinValue }
         }
         $lastDeep = [datetime]::MinValue
@@ -330,7 +331,17 @@ function Invoke-Supervisor {
                 $h = Get-Health
                 if (-not $h -or -not $h.database) { Write-Log "PostgreSQL (Supabase) not reachable" "WARN" }
                 $ws = $state.worker
-                if ($h -and $h.queue -and -not $h.worker_heartbeat -and $worker.Count -gt 0 -and ($now - $ws.started).TotalSeconds -gt 180) {
+                # A worker waiting for an unavailable / quota-exhausted queue is healthy: it idles
+                # and re-checks on its own, so restarting it would only repeat the failure.
+                $queueDown = ($h -and ($h.queue_quota_exhausted -or ($h.worker_state -and $h.worker_state.state -eq "queue_unavailable")))
+                if ($queueDown -and -not $ws.queueDown) {
+                    $why = if ($h.worker_state -and $h.worker_state.reason) { $h.worker_state.reason } elseif ($h.queue_quota_exhausted) { "queue request quota exhausted" } else { "queue unavailable" }
+                    Write-Log "Task queue unavailable ($why); worker left idle, not restarted" "WARN"
+                } elseif (-not $queueDown -and $ws.queueDown) {
+                    Write-Log "Task queue available again"
+                }
+                $ws.queueDown = [bool]$queueDown
+                if (-not $queueDown -and $h -and $h.queue -and -not $h.worker_heartbeat -and $worker.Count -gt 0 -and ($now - $ws.started).TotalSeconds -gt 180) {
                     $ws.fails++
                     if ($ws.fails -ge 3) {
                         Write-Log "Worker process alive but no heartbeat for minutes; restarting" "WARN"

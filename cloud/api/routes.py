@@ -8,6 +8,7 @@ one that does not exist: both are 404, so ids cannot be probed.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Iterator, Optional
@@ -181,6 +182,29 @@ def _redis_status(request: Request) -> ComponentStatus:
     return _timed(check)
 
 
+#: Worker presence and queue depth are read from Redis at most this often per API process
+#: (every open dashboard asks every minute; each read is several queue commands).
+QUEUE_VIEW_CACHE_SECONDS = 60.0
+_queue_view_lock = threading.Lock()
+
+
+def _cached_queue_view(queue, stale_after: float):
+    """Presence and depth, cached on the queue object (one queue per API process)."""
+    now = time.monotonic()
+    with _queue_view_lock:
+        hit = getattr(queue, "_status_view", None)
+        if hit and hit[0] == stale_after and now - hit[1] < QUEUE_VIEW_CACHE_SECONDS:
+            return hit[2], hit[3]
+    presence = queue.worker_presence(stale_after=stale_after)
+    stats = queue.stats()
+    with _queue_view_lock:
+        try:
+            queue._status_view = (stale_after, now, presence, stats)
+        except AttributeError:          # a queue that cannot hold attributes is simply not cached
+            pass
+    return presence, stats
+
+
 def _worker_status(request: Request, settings: Settings, redis_ok: bool) -> tuple[WorkerStatus, QueueDepth]:
     """Worker presence and queue depth, both read from the queue.
 
@@ -209,8 +233,7 @@ def _worker_status(request: Request, settings: Settings, redis_ok: bool) -> tupl
             QueueDepth(),
         )
     try:
-        presence = queue.worker_presence(stale_after=stale_after)
-        stats = queue.stats()
+        presence, stats = _cached_queue_view(queue, stale_after)
     except Exception as error:  # noqa: BLE001
         log.warning("worker presence unavailable: %s", error)
         return (

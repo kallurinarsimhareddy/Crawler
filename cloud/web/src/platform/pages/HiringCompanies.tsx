@@ -164,7 +164,7 @@ export function HiringCompanies() {
             </button>
           ))}
         </div>
-        <p className="muted small">Counts compare exact company names with the CRM. Similar (not identical) CRM names are checked for the companies shown and marked <em>Matched</em> or <em>Review</em>.</p>
+        <p className="muted small">Every company is compared with the CRM: an exact name, the same name apart from legal form or punctuation (Inc, Ltd…), or a recorded alias. Anything that is not an exact single match goes to <em>Review</em>.</p>
         {!writable && <p className="alert alert--info small" role="note">You can view hiring companies. Members, managers and admins can create or link accounts and build lists.</p>}
         {writable && <div className="ab-bulk" role="toolbar" aria-label="Bulk actions">
           <label className="ab-check"><input type="checkbox" checked={allVisible} onChange={toggleAll} /> Select all visible</label>
