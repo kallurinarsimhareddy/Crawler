@@ -230,6 +230,10 @@ def parse_order(spec: EntitySpec, order: Optional[str]) -> List[Tuple[str, bool]
     return result
 
 
+def _holds(value: Any, op: str, expected: Any) -> bool:
+    return (op == "in" and value in expected) or (op == "eq" and value == expected) or (op == "notnull" and value is not None)
+
+
 class Store(ABC):
     """Workspace-scoped CRUD over the platform's entities."""
 
@@ -276,6 +280,99 @@ class Store(ABC):
         cleaned = [(row_id, clean_values(spec, values, for_insert=False)) for row_id, values in changes]
         cleaned = [(row_id, values) for row_id, values in cleaned if values]
         return self._update_many(ctx, spec, cleaned) if cleaned else []
+
+    def group_stats(self, ctx: Ctx, entity: str, column: str, filters: Optional[Mapping[str, Any]],
+                    metrics: Mapping[str, Any]) -> Dict[Any, Dict[str, int]]:
+        """Per value of ``column``: ``count`` plus one conditional count per metric, in ONE scan.
+        A metric is a condition ``(column, op, value)`` — op ``in`` (list), ``eq`` or ``notnull`` —
+        or a list of conditions that must all hold."""
+        spec = get_spec(entity)
+        norm: Dict[str, List[Tuple[str, str, Any]]] = {}
+        for name, raw in metrics.items():
+            conds = [raw] if isinstance(raw, tuple) else list(raw)
+            for col, op, _value in conds + [(column, "eq", None)]:
+                if col not in spec.columns and col not in COMMON_COLUMNS:
+                    raise ValidationError(f"{entity} has no field {col!r}")
+                if op not in ("in", "eq", "notnull"):
+                    raise ValidationError(f"unsupported metric operator {op!r}")
+            norm[name] = [tuple(c) for c in conds]
+        q = (filters or {}).get("q")
+        return self._group_stats(ctx, spec, column, parse_filters(spec, filters), str(q) if q else None, norm)
+
+    def _group_stats(self, ctx: Ctx, spec: EntitySpec, column: str, filters, q, metrics) -> Dict[Any, Dict[str, int]]:
+        out: Dict[Any, Dict[str, int]] = {}
+        for row in self._filtered_rows(ctx, spec, filters, q):
+            slot = out.setdefault(row.get(column), {"count": 0, **{m: 0 for m in metrics}})
+            slot["count"] += 1
+            for name, conds in metrics.items():
+                if all(_holds(row.get(col), op, value) for col, op, value in conds):
+                    slot[name] += 1
+        return out
+
+    def group_tags(self, ctx: Ctx, entity: str, column: str, tags_column: str,
+                   filters: Optional[Mapping[str, Any]] = None) -> Dict[Any, Dict[str, int]]:
+        """Per value of ``column``: how many matching rows carry each tag of ``tags_column``."""
+        spec = get_spec(entity)
+        for col in (column, tags_column):
+            if col not in spec.columns and col not in COMMON_COLUMNS:
+                raise ValidationError(f"{entity} has no field {col!r}")
+        if spec.columns[tags_column].kind != "tags":
+            raise ValidationError(f"{tags_column} is not a tags field")
+        q = (filters or {}).get("q")
+        return self._group_tags(ctx, spec, column, tags_column, parse_filters(spec, filters), str(q) if q else None)
+
+    def _group_tags(self, ctx: Ctx, spec: EntitySpec, column: str, tags_column: str, filters, q
+                    ) -> Dict[Any, Dict[str, int]]:
+        out: Dict[Any, Dict[str, int]] = {}
+        for row in self._filtered_rows(ctx, spec, filters, q):
+            slot = out.setdefault(row.get(column), {})
+            for tag in set(row.get(tags_column) or []):
+                slot[tag] = slot.get(tag, 0) + 1
+        return out
+
+    def walk(self, ctx: Ctx, entity: str, filters: Optional[Mapping[str, Any]] = None, *,
+             cap: int = 100_000) -> List[Dict[str, Any]]:
+        """Every matching row in id order, paged by id (cheap at any depth, unlike offsets)."""
+        rows: List[Dict[str, Any]] = []
+        last = ""
+        while len(rows) < cap:
+            page = dict(filters or {})
+            if last:
+                page = {"all_of": [page, {"id__gt": last}]} if page else {"id__gt": last}
+            batch = self.rows(ctx, entity, page, order="id", limit=MAX_PAGE)
+            rows.extend(batch)
+            if len(batch) < MAX_PAGE:
+                break
+            last = batch[-1]["id"]
+        return rows[:cap]
+
+    def _filtered_rows(self, ctx: Ctx, spec: EntitySpec, filters, q):
+        raise NotImplementedError
+
+    def update_where(self, ctx: Ctx, entity: str, filters: Mapping[str, Any], changes: Mapping[str, Any]) -> int:
+        """Apply ``changes`` to every row matching ``filters`` (same write checks, workspace scope
+        and RLS as :meth:`update_many`); returns how many rows changed. Backends do it in one
+        statement; the default pages through the rows. ``filters`` must not be empty."""
+        spec = get_spec(entity)
+        self._check_write(ctx, spec, "update")
+        if not filters:
+            raise ValidationError("update_where needs filters")
+        clean = clean_values(spec, changes, for_insert=False)
+        if not clean:
+            return 0
+        return self._update_where(ctx, spec, filters, clean)
+
+    def _update_where(self, ctx: Ctx, spec: EntitySpec, filters: Mapping[str, Any], clean: Dict[str, Any]) -> int:
+        total, last_id = 0, ""
+        while True:
+            page = dict(filters)
+            if last_id:
+                page["id__gt"] = last_id
+            rows = self.rows(ctx, spec.name, page, order="id", limit=1000)
+            if not rows:
+                return total
+            last_id = rows[-1]["id"]
+            total += len(self._update_many(ctx, spec, [(r["id"], dict(clean)) for r in rows]))
 
     def delete_many(self, ctx: Ctx, entity: str, row_ids: Sequence[str]) -> int:
         """Delete rows by id with the same checks as :meth:`delete`; ids outside this workspace

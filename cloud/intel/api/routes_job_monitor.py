@@ -152,12 +152,43 @@ def company_job_activity(company_id: str, ctx: Ctx = Depends(workspace_ctx),
 
 
 @router.get(W + "/job-company-reviews")
-def list_reviews(status_filter: str = "pending", limit: int = 100, offset: int = 0,
-                 ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
-    filters = {"status": status_filter} if status_filter != "all" else {}
+def list_reviews(status_filter: str = "pending", kind: str = "ambiguous", q: str = "", limit: int = 100,
+                 offset: int = 0, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    """Review rows with names, not ids: candidate CRM companies, the linked company, and how many
+    jobs and active signals the name has. ``kind``: ``ambiguous`` (CRM candidates to choose from),
+    ``unmatched`` (no CRM company has the name) or ``all``; ``q`` searches the company name."""
+    from cloud.intel.job_monitor.accounts import UNMATCHED_REASON
+
+    filters: Dict[str, Any] = {"status": status_filter} if status_filter != "all" else {}
+    if kind == "ambiguous":
+        filters["reason__ne"] = UNMATCHED_REASON
+    elif kind == "unmatched":
+        filters["reason"] = UNMATCHED_REASON
+    if q.strip():
+        filters["company_name__ilike"] = q.strip()[:200]
+    limit = max(1, min(int(limit), 200))
     try:
-        return page_response(platform.store.list(ctx, "job_company_reviews", filters, order="-job_count",
-                                                 limit=limit, offset=offset))
+        counts = {k: platform.store.count(ctx, "job_company_reviews", {
+            **({"status": status_filter} if status_filter != "all" else {}),
+            **({"reason__ne": UNMATCHED_REASON} if k == "ambiguous" else {"reason": UNMATCHED_REASON})})
+            for k in ("ambiguous", "unmatched")}
+        page = platform.store.list(ctx, "job_company_reviews", filters, order="-job_count", limit=limit,
+                                   offset=offset)
+        store = platform.store
+        rows = []
+        for row in page.rows:
+            ids = list(row.get("candidate_ids") or [])
+            if row.get("company_id"):
+                ids.append(row["company_id"])
+            names = {c["id"]: {"id": c["id"], "name": c["name"], "domain": c.get("domain"),
+                               "hiring_count": c.get("hiring_count")}
+                     for c in store.all(ctx, "companies", {"id": ids}, cap=len(ids) + 1)} if ids else {}
+            rows.append({**row, "candidates": [names[i] for i in row.get("candidate_ids") or [] if i in names],
+                         "company": names.get(row.get("company_id")),
+                         "signal_count": store.count(ctx, "hiring_signals", {"company_name": row["company_name"],
+                                                                             "status": "active"})})
+        return jsonable_encoder({"items": rows, "total": page.total, "limit": limit, "offset": offset,
+                                 "counts": counts})
     except PlatformError as error:
         raise http_error(error) from error
 
@@ -167,6 +198,73 @@ def resolve_review(review_id: str, body: Dict[str, Any] = Body(...), ctx: Ctx = 
                    platform: Platform = Depends(get_platform)):
     return _call(lambda: _svc(platform).resolve_review(ctx, review_id, action=str(body.get("action") or ""),
                                                        company_id=body.get("company_id")))
+
+
+# --- Account Builder: hiring companies -> CRM accounts -> lists --------------------------------
+
+def _builder(platform: Platform):
+    return platform.service("account_builder")
+
+
+@router.get(W + "/hiring-companies")
+def hiring_companies(request: Request, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    """Companies among the jobs the Jobs filters select (same query parameters), grouped by
+    normalised name, with their CRM state; ``state``, ``order``, ``limit``, ``offset``."""
+    q = dict(request.query_params)
+    fresh = q.pop("refresh", "") in ("1", "true")
+    return _call(lambda: _builder(platform).candidates(
+        ctx, q, limit=int(q.get("limit") or 50), offset=int(q.get("offset") or 0),
+        order=str(q.get("sort") or "open"), state=q.get("state"), fresh=fresh))
+
+
+@router.get(W + "/hiring-companies/capacity")
+def hiring_capacity(ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    from cloud.intel.job_monitor.accounts import CONFIRM_ABOVE, MAX_PER_ACTION, SYNC_LIMIT
+
+    return _call(lambda: {**_builder(platform).capacity(), "max_per_action": MAX_PER_ACTION,
+                          "confirm_above": CONFIRM_ABOVE, "sync_limit": SYNC_LIMIT})
+
+
+@router.post(W + "/hiring-companies/build")
+def hiring_build(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
+                 platform: Platform = Depends(get_platform)):
+    """{items: [{key, names, display_name, signal_ids, job_ids, create_new}], confirm, list_id | new_list}"""
+    items = body.get("items")
+    if not isinstance(items, list):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "items must be a list of hiring companies")
+    return _call(lambda: _builder(platform).build(ctx, items, confirm=bool(body.get("confirm")),
+                                                  list_id=body.get("list_id"), new_list=body.get("new_list")))
+
+
+@router.post(W + "/hiring-companies/link")
+def hiring_link(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
+                platform: Platform = Depends(get_platform)):
+    """Link one hiring company (item) to an existing CRM company chosen by a person."""
+    item, company_id = body.get("item"), body.get("company_id")
+    if not isinstance(item, dict) or not company_id:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "item and company_id are required")
+    return _call(lambda: _builder(platform).link(ctx, item, str(company_id), reason="linked by user"))
+
+
+@router.post(W + "/hiring-companies/add-to-list")
+def hiring_add_to_list(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
+                       platform: Platform = Depends(get_platform)):
+    """{companies: [{company_id, signal_ids, job_ids}], list_id | new_list}"""
+    companies = body.get("companies")
+    if not isinstance(companies, list):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "companies must be a list")
+    return _call(lambda: _builder(platform).add_to_list(ctx, companies, list_id=body.get("list_id"),
+                                                        new_list=body.get("new_list")))
+
+
+@router.get(W + "/account-lists/{list_id}/summary")
+def account_list_summary(list_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
+    return _call(lambda: _builder(platform).list_summary(ctx, list_id))
+
+
+@router.post(W + "/account-lists/{list_id}/validate-emails", status_code=status.HTTP_201_CREATED)
+def account_list_validate(list_id: str, ctx: Ctx = Depends(write_ctx), platform: Platform = Depends(get_platform)):
+    return _call(lambda: _builder(platform).validate_list_contacts(ctx, list_id))
 
 
 # --- historical imports ------------------------------------------------------------------------

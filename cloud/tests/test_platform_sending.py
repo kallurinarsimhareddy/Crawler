@@ -286,7 +286,10 @@ class SendingTests(Base):
         self.platform.service("campaigns").configure(self.ctx, self.campaign["id"], {
             "schedule": {"timezone": "UTC", "days": [1, 2, 3, 4, 5], "start_hour": 9, "end_hour": 17}})
         enrollment = self.enroll_and_approve()
-        saturday_night = datetime(2026, 10, 3, 22, 0, tzinfo=timezone.utc)
+        # the NEXT Saturday 22:00 UTC (a fixed date became a time bomb once it was in the past)
+        now = utcnow()
+        saturday_night = (now + timedelta(days=(5 - now.weekday()) % 7 or 7)).replace(hour=22, minute=0, second=0,
+                                                                                    microsecond=0)
         stats = self.seq.process_due(self.ctx, saturday_night)
         self.assertEqual(stats.get("deferred"), 1)
         nxt = self.store.get(self.ctx, "sequence_enrollments", enrollment["id"])["next_step_at"]

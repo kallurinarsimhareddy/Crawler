@@ -243,6 +243,10 @@ class CrmService:
               summary=f"{company['name']} from {source_kind}:{source_name}")
         _emit(self.platform, ctx, "new_company", f"company:{company['id']}",
               {"company_id": company["id"], "name": company["name"], "source": source_kind})
+        try:   # pending job/company reviews this new company resolves exactly (never fuzzy)
+            self.platform.service("account_builder").rematch(ctx, company)
+        except Exception:  # noqa: BLE001 - derived linking; the company is created
+            log.exception("job/company re-match failed for %s", company["id"])
         return {"company": company, "created": True, "match": match, "needs_review": False}
 
     @staticmethod

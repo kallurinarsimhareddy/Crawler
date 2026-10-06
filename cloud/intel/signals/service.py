@@ -94,7 +94,8 @@ class SignalService:
         for sig in detected:
             fp = sig.fingerprint(company_id, "all")
             fingerprints.add(fp)
-            values = {"company_id": company_id, "signal_type": sig.signal_type, "detected_at": now,
+            values = {"company_id": company_id, "company_name": (company.get("name") or "")[:300] or None,
+                      "signal_type": sig.signal_type, "detected_at": now,
                       "window_start": sig.window_start, "window_end": sig.window_end,
                       "confidence": round(sig.confidence, 3), "strength": round(sig.strength, 1),
                       "reason_codes": sig.reason_codes[:30], "summary": sig.summary[:1000],
@@ -122,9 +123,12 @@ class SignalService:
                 except Exception:  # noqa: BLE001
                     log.debug("change event skipped", exc_info=True)
         for old in self.store.all(ctx, "hiring_signals", {"company_id": company_id, "status": "active"}):
-            if old["fingerprint"] not in fingerprints:
+            # Only this engine's own signals expire here; job-derived ones (source "job_signals":
+            # clusters, stack migration, departures) belong to the daily job detection.
+            if old["fingerprint"] not in fingerprints and old.get("source") != "job_signals":
                 self.store.update(ctx, "hiring_signals", old["id"], {"status": "expired"})
-        active_types = sorted({s["signal_type"] for s in kept if s and s["status"] == "active"})
+        active_types = sorted({s["signal_type"] for s in self.store.all(
+            ctx, "hiring_signals", {"company_id": company_id, "status": "active"}, cap=5000)})
         agg = aggregate(jobs, now=now, has_campaigns=self._has_campaigns(ctx))
         self.store.update(ctx, "companies", company_id, {"hiring_signals": active_types,
                                                          "hiring_velocity": float(agg["velocity_30d"])})
@@ -365,9 +369,15 @@ class SignalService:
 
 
 def run_signals_task(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: Any) -> Dict[str, Any]:
-    """Detect signals and rescore: ``params.company_ids`` or every active company."""
-    service: SignalService = platform.service("signals")
+    """Detect signals and rescore: ``params.company_ids`` or every active company.
+    ``params.operation == "account_build"``: the Account Builder's background build (signals
+    -> CRM accounts), routed here so no new task kind (migration) is needed."""
     params = task.get("params") or {}
+    if params.get("operation") == "account_build":
+        from cloud.intel.job_monitor.accounts import run_account_build_task
+
+        return run_account_build_task(platform, ctx, task, reporter)
+    service: SignalService = platform.service("signals")
     ids: Sequence[str] = params.get("company_ids") or [
         c["id"] for c in platform.store.all(ctx, "companies", {"status": "active"}, cap=100_000)]
     start = int(reporter.checkpoint.get("index", 0)) if reporter is not None else 0

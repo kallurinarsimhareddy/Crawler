@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -18,8 +18,19 @@ router = APIRouter()
 
 router.include_router(crud_router("job_postings", path="/jobs", tag="jobs", allow_create=False,
                                   allow_update=False, allow_delete=False))
+def _signal_company_names(platform: Platform, ctx: Ctx, rows: List[Dict[str, Any]]) -> None:
+    """Signals scored on a CRM company may carry only its id: show the company's name."""
+    ids = sorted({r["company_id"] for r in rows if r.get("company_id") and not r.get("company_name")})
+    if ids:
+        names = {c["id"]: c["name"] for c in platform.store.rows(ctx, "companies", {"id": ids}, limit=len(ids))}
+        for row in rows:
+            if row.get("company_id") in names and not row.get("company_name"):
+                row["company_name"] = names[row["company_id"]]
+
+
 router.include_router(crud_router("hiring_signals", path="/hiring-signals", tag="hiring-intelligence",
-                                  allow_create=False, allow_update=False, allow_delete=False))
+                                  allow_create=False, allow_update=False, allow_delete=False,
+                                  decorate=_signal_company_names))
 router.include_router(crud_router("change_events", path="/change-events", tag="monitoring", allow_create=False))
 router.include_router(crud_router("discovery_candidates", path="/discovery/candidates", tag="discovery",
                                   allow_create=False, allow_update=False, allow_delete=False))

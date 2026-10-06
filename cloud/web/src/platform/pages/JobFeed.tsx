@@ -3,7 +3,6 @@
 // advanced AND/OR conditions, the job page with its change history, and the
 // company-name review queue.
 
-import { DownloadCsvPanel } from "./JobCsv";
 import { useMemo, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { EmptyState, ErrorBanner, Loading } from "../../components/Feedback";
@@ -14,13 +13,18 @@ import {
 } from "../logic/jobFields";
 import { RELEVANCE_CLASSES, parseRelevanceParam, relevanceTone, toggleRelevance } from "../logic/jobspy";
 import {
-  CONDITION_FIELDS, CONDITION_OPS, ORDER_OPTIONS, buildConditions, children, clearScope, conditionValueText, deepLink,
+  CONDITION_FIELDS, CONDITION_OPS, FILTER_KEYS, ORDER_OPTIONS, buildConditions, children, clearScope, conditionValueText, deepLink,
   emptyGroup, groupMode, hasScope, isGroup, parseConditionValue, parseConditionsParam, parseFilters, parsePage, scopeBanner,
   searchBody, toQueryString, validateConditions, type FilterKey, type Group, type JobFilters, type Node,
 } from "../logic/jobFilters";
 import { FilterBar, KeyValues, PageHeader, Tabs, fmt, fmtDate, useAction, useLoad, type FilterDef } from "../ui";
-import { useWs } from "../workspace";
+import { useWorkspace, useWs } from "../workspace";
+import { canWrite } from "../logic/admin";
 import { Badge, Cell, ChangeBadge, Chips, JobStatus, JobUrl, Relevance, type Job, type JobPage, type Monitor } from "./jobsShared";
+import { DownloadCsvPanel } from "./JobCsv";
+import { HiringCompanies } from "./HiringCompanies";
+import { CompanyPicker } from "./accountsShared";
+import { carryFilters, type CrmRef } from "../logic/accounts";
 
 const FILTERS: FilterDef[] = [
   { key: "source", label: "Source", placeholder: "source contains…" },
@@ -82,7 +86,8 @@ const ORDER_LABELS: Record<string, string> = {
 
 export function JobsPage() {
   const [params] = useSearchParams();
-  const tab = params.get("tab") === "reviews" ? "reviews" : "jobs";
+  const rawTab = params.get("tab");
+  const tab = rawTab === "reviews" ? "reviews" : rawTab === "hiring" ? "hiring" : "jobs";
   const navigate = useNavigate();
   const [downloading, setDownloading] = useState(false);
   return (
@@ -98,10 +103,10 @@ export function JobsPage() {
             <button type="button" className="button button--primary" aria-expanded={downloading} onClick={() => setDownloading((d) => !d)}>Download CSV</button>
           </>
         }
-        tabs={<Tabs active={tab} onChange={(k) => navigate(k === "reviews" ? "/jobs?tab=reviews" : "/jobs")} tabs={[{ key: "jobs", label: "Jobs" }, { key: "reviews", label: "Company review" }]} />}
+        tabs={<Tabs active={tab} onChange={(k) => navigate(carryFilters(params, FILTER_KEYS, k))} tabs={[{ key: "jobs", label: "Jobs" }, { key: "hiring", label: "Hiring companies" }, { key: "reviews", label: "Company review" }]} />}
       />
       {downloading && tab === "jobs" && <DownloadCsvPanel onClose={() => setDownloading(false)} />}
-      {tab === "reviews" ? <CompanyReviews /> : <JobsTable />}
+      {tab === "reviews" ? <CompanyReviews /> : tab === "hiring" ? <HiringCompanies /> : <JobsTable />}
     </div>
   );
 }
@@ -536,50 +541,115 @@ function RelevancePanel({ job }: { job: Job }) {
 
 function CompanyReviews() {
   const client = useWs();
+  const writable = canWrite(useWorkspace().current?.role);
   const [reload, setReload] = useState(0);
-  const [targets, setTargets] = useState<Record<string, string>>({});
-  const list = useLoad((signal) => client.list<Row>("/job-company-reviews", { status_filter: "pending", limit: 100 }, signal), client.base + "reviews" + reload);
+  const [targets, setTargets] = useState<Record<string, CrmRef | null>>({});
+  const [confirmCreate, setConfirmCreate] = useState<string | null>(null);
+  const [params, setParams] = useSearchParams();
+  const kind = params.get("rkind") === "unmatched" ? "unmatched" : "ambiguous";
+  const search = params.get("rq") ?? "";
+  const offset = Math.max(0, Number(params.get("roffset") ?? 0) || 0);
+  const setView = (changes: Record<string, string>) => {
+    const next = new URLSearchParams(params);
+    for (const [k, v] of Object.entries(changes)) { if (v) next.set(k, v); else next.delete(k); }
+    if (!("roffset" in changes)) next.delete("roffset");
+    next.set("tab", "reviews");
+    setParams(next);
+  };
+  const query = { status_filter: "pending", kind, q: search || undefined, limit: 50, offset };
+  const list = useLoad((signal) => client.get<PageOf & { counts?: Record<string, number> }>("/job-company-reviews", query as never, signal),
+    client.base + "reviews" + JSON.stringify(query) + reload);
+  const [done, setDone] = useState<string | null>(null);
   const action = useAction();
   const resolve = (id: string, body: Record<string, unknown>) =>
     action.run(async () => {
-      await client.post(`/job-company-reviews/${id}/resolve`, body);
+      const name = String(items.find((r) => r.id === id)?.company_name ?? "");
+      const res = await client.post<Row>(`/job-company-reviews/${id}/resolve`, body);
+      setConfirmCreate(null);
+      const verb = body.action === "link" ? `linked to ${String((res.company as Row | undefined)?.name ?? "the chosen company")} (${fmt(res.jobs_attached)} jobs, ${fmt(res.signals_attached)} signals attached)` :
+        body.action === "create" ? "created as a new CRM account" : body.action === "keep" ? "kept for review" : "ignored";
+      setDone(`“${name}” ${verb}.`);
       setReload((n) => n + 1);
     });
   const items = (list.data as PageOf | null)?.items ?? [];
+  const counts = list.data?.counts ?? {};
+  const total = (list.data as PageOf | null)?.total ?? 0;
   return (
     <div className="card">
-      <p className="muted small pad">Company names from jobs that did not match exactly one CRM company. Link each to a company (by its id) or ignore it — companies are never created from jobs automatically.</p>
+      <div className="pad">
+        <p className="muted small">Company names from jobs that did not match exactly one CRM company. Link each to the right company, create a new account when you are sure it is not a duplicate, or keep it for later — companies are never created from jobs automatically.</p>
+        <div className="ab-toolbar">
+          <div className="chips" role="group" aria-label="Review type">
+            <button type="button" className={`chip${kind === "ambiguous" ? " chip--on" : ""}`} aria-pressed={kind === "ambiguous"} onClick={() => setView({ rkind: "" })}>
+              Ambiguous — choose a CRM company {counts.ambiguous !== undefined ? `(${fmt(counts.ambiguous)})` : ""}
+            </button>
+            <button type="button" className={`chip${kind === "unmatched" ? " chip--on" : ""}`} aria-pressed={kind === "unmatched"} onClick={() => setView({ rkind: "unmatched" })}>
+              No CRM company yet {counts.unmatched !== undefined ? `(${fmt(counts.unmatched)})` : ""}
+            </button>
+          </div>
+          <input key={search} className="input input--small" placeholder="Company name contains… (Enter)" defaultValue={search} aria-label="Search reviews"
+                 onKeyDown={(e) => { if (e.key === "Enter") setView({ rq: (e.target as HTMLInputElement).value.trim() }); }} />
+        </div>
+        {kind === "unmatched" && <p className="small muted">These names have no CRM company at all. Creating accounts for them in bulk is quicker from <Link className="link" to="/jobs?tab=hiring&hstate=NEW+ACCOUNT">Hiring companies</Link>.</p>}
+      </div>
+      {done && <div className="alert alert--success ab-summary" role="status"><p>{done}</p><button type="button" className="link-button small" onClick={() => setDone(null)}>Dismiss</button></div>}
       {(list.error || action.error) && <ErrorBanner error={(list.error ?? action.error)!} onRetry={list.refresh} />}
       {list.loading && !list.data ? <Loading /> : items.length === 0 ? (
-        <EmptyState icon="check" title="Nothing to review" description="Every job company name matched a CRM company or was already resolved." />
+        <EmptyState icon="check" title="Nothing to review" description={search ? "No review matches this company name." : kind === "ambiguous" ? "No company name is waiting for a choice between CRM companies." : "Every job company name has a CRM company or was resolved."} />
       ) : (
         <div className="table-wrap">
-          <table className="table">
-            <thead><tr><th>Company name</th><th>Jobs</th><th>Candidates</th><th>Link to company id</th><th /></tr></thead>
+          <table className="table ab-table">
+            <thead><tr><th>Job company name</th><th>Jobs</th><th>Signals</th><th>Candidate CRM companies</th><th>Link to</th><th /></tr></thead>
             <tbody>
               {items.map((r) => {
-                const candidates = Array.isArray(r.candidate_ids) ? (r.candidate_ids as string[]) : [];
+                const candidates = (Array.isArray(r.candidates) ? r.candidates : []) as CrmRef[];
+                const target = targets[r.id] ?? null;
                 return (
                   <tr key={r.id} className="table__row">
-                    <td data-label="Company name"><strong>{display(r.company_name)}</strong>{r.reason ? <div className="muted small">{String(r.reason)}</div> : null}</td>
+                    <td data-label="Job company name">
+                      <strong>{display(r.company_name)}</strong>
+                      {r.reason ? <div className="muted small">Why: {String(r.reason)}</div> : null}
+                      <div><Link className="link small" to={`/jobs?company=${encodeURIComponent(String(r.company_name ?? ""))}`}>View jobs</Link></div>
+                    </td>
                     <td data-label="Jobs" className="tabular">{fmt(r.job_count)}</td>
+                    <td data-label="Signals" className="tabular">{fmt(r.signal_count)}</td>
                     <td data-label="Candidates" className="small">
-                      {candidates.length === 0 ? <span className="muted">—</span> : candidates.map((c) => (
-                        <button key={c} type="button" className="link-button mono" onClick={() => setTargets((t) => ({ ...t, [r.id]: c }))}>{c}</button>
+                      {candidates.length === 0 ? <span className="muted">none — no CRM company has this name</span> : candidates.map((c) => (
+                        <div key={c.id}>
+                          <button type="button" className="link-button" onClick={() => setTargets((t) => ({ ...t, [r.id]: c }))}>{c.name}</button>
+                          {c.domain ? <span className="muted"> · {c.domain}</span> : null}
+                        </div>
                       ))}
                     </td>
-                    <td data-label="Link to company id">
-                      <input className="input input--small" placeholder="co_…" value={targets[r.id] ?? ""} onChange={(e) => setTargets((t) => ({ ...t, [r.id]: e.target.value }))} />
+                    <td data-label="Link to">
+                      <CompanyPicker value={target} onChange={(c) => setTargets((t) => ({ ...t, [r.id]: c }))} suggestions={candidates} />
                     </td>
-                    <td className="actions">
-                      <button type="button" className="button button--primary button--small" disabled={action.busy || !(targets[r.id] ?? "").trim()} onClick={() => void resolve(r.id, { action: "link", company_id: targets[r.id].trim() })}>Link</button>
+                    {!writable ? <td className="muted small">View only</td> : <td className="actions ab-wrap">
+                      <button type="button" className="button button--primary button--small" disabled={action.busy || !target} onClick={() => target && void resolve(r.id, { action: "link", company_id: target.id })}>Link</button>
+                      {confirmCreate === r.id ? (
+                        <span className="ab-confirm small">
+                          {candidates.length > 0 ? <>Not a duplicate of {candidates.map((c) => c.name).join(", ")}? </> : null}
+                          <button type="button" className="button button--primary button--small" disabled={action.busy} onClick={() => void resolve(r.id, { action: "create" })}>Yes, create new</button>
+                          <button type="button" className="link-button small" onClick={() => setConfirmCreate(null)}>Cancel</button>
+                        </span>
+                      ) : (
+                        <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => setConfirmCreate(r.id)}>Create new</button>
+                      )}
+                      <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void resolve(r.id, { action: "keep" })}>Keep reviewing</button>
                       <button type="button" className="button button--ghost button--small" disabled={action.busy} onClick={() => void resolve(r.id, { action: "ignore" })}>Ignore</button>
-                    </td>
+                    </td>}
                   </tr>
                 );
               })}
             </tbody>
           </table>
+        </div>
+      )}
+      {total > 50 && (
+        <div className="pager pad">
+          <button type="button" className="button button--ghost button--small" disabled={offset === 0} onClick={() => setView({ roffset: String(Math.max(0, offset - 50)) })}>Previous</button>
+          <span className="muted small">{fmt(offset + 1)}–{fmt(Math.min(offset + 50, total))} of {fmt(total)}</span>
+          <button type="button" className="button button--ghost button--small" disabled={offset + 50 >= total} onClick={() => setView({ roffset: String(offset + 50) })}>Next</button>
         </div>
       )}
     </div>

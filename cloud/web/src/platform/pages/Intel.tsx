@@ -7,8 +7,11 @@ import { ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
 import { CreateForm } from "../ResourcePage";
 import { KeyValues, PageHeader, Pill, ResourceList, Score, Stat, Tabs, Tags, fmt, fmtDate, useAction, useLoad } from "../ui";
-import { useWs } from "../workspace";
+import { useWorkspace, useWs } from "../workspace";
+import { canWrite } from "../logic/admin";
 import { ScorePanel } from "./Scoring";
+import { jobsForCompany, signalAsCompany, type HiringCompany } from "../logic/accounts";
+import { BuildSummary, CreateDialog, LinkDialog, type BuildResult } from "./HiringCompanies";
 
 export function Contacts() {
   const client = useWs();
@@ -257,6 +260,9 @@ export function HiringIntel({ title = "Hiring intelligence" }: { title?: string 
   const client = useWs();
   const action = useAction();
   const [selected, setSelected] = useState<Row | null>(null);
+  const [dialog, setDialog] = useState<null | { kind: "create" | "list" | "link"; row: HiringCompany }>(null);
+  const writable = canWrite(useWorkspace().current?.role);
+  const [built, setBuilt] = useState<BuildResult | null>(null);
   const [reload, setReload] = useState(0);
   const [jobRun, setJobRun] = useState<Record<string, unknown> | null>(null);
   const counts = useLoad((signal) => client.get<Record<string, unknown>>("/analytics/dashboard", undefined, signal).catch(() => null), client.base + "dash" + reload);
@@ -287,6 +293,12 @@ export function HiringIntel({ title = "Hiring intelligence" }: { title?: string 
         ))}
       </div>
       {selected && <SignalOutcomes key={selected.id} signal={selected} onClose={() => setSelected(null)} onRecorded={() => setReload((n) => n + 1)} />}
+      {built && <BuildSummary result={built} onClose={() => setBuilt(null)} />}
+      {dialog && dialog.kind !== "link" && (
+        <CreateDialog rows={[dialog.row]} withList={dialog.kind === "list"} onClose={() => setDialog(null)}
+                      onDone={(r) => { setBuilt(r); setDialog(null); setReload((n) => n + 1); }} />
+      )}
+      {dialog?.kind === "link" && <LinkDialog row={dialog.row} onClose={() => setDialog(null)} onDone={() => { setDialog(null); setReload((n) => n + 1); }} />}
       <ResourceList
         reloadKey={String(reload)}
         load={(query, signal) => client.list("/hiring-signals", query, signal)}
@@ -294,9 +306,26 @@ export function HiringIntel({ title = "Hiring intelligence" }: { title?: string 
           { key: "signal_type", label: "Signal", render: (r) => <Pill value={r.signal_type} /> },
           {
             key: "company_id", label: "Company",
-            render: (r) => (r.company_id
-              ? <Link className="link" to={`/companies/${r.company_id}`}>{String(r.company_name ?? "") || "open"}</Link>
-              : r.company_name ? <span title="Not a CRM company yet">{String(r.company_name)}</span> : <span className="muted">—</span>),
+            render: (r) => {
+              const row = signalAsCompany(r);
+              return (
+                <div>
+                  {r.company_id
+                    ? <Link className="link" to={`/companies/${r.company_id}`}>{String(r.company_name ?? "") || "View CRM company"}</Link>
+                    : r.company_name ? <span title="Not a CRM company yet">{String(r.company_name)}</span> : <span className="muted">—</span>}
+                  {row && writable && (
+                    <div className="ab-signal-actions small" onClick={(e) => e.stopPropagation()}>
+                      {r.company_id
+                        ? <Link className="link-button small" to={`/companies/${encodeURIComponent(String(r.company_id))}`}>View company</Link>
+                        : <button type="button" className="link-button small" onClick={() => setDialog({ kind: "create", row })}>Create account</button>}
+                      {!r.company_id && <button type="button" className="link-button small" onClick={() => setDialog({ kind: "link", row })}>Link account</button>}
+                      <button type="button" className="link-button small" onClick={() => setDialog({ kind: "list", row })}>Add to list</button>
+                      {r.company_name ? <Link className="link-button small" to={jobsForCompany(String(r.company_name))}>View jobs</Link> : null}
+                    </div>
+                  )}
+                </div>
+              );
+            },
           },
           { key: "summary", label: "Evidence summary" },
           { key: "technologies", label: "Technologies", render: (r) => <Tags values={r.technologies} /> },

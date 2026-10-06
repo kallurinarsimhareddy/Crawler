@@ -1269,27 +1269,37 @@ class JobMonitorService:
 
     def resolve_review(self, ctx: Ctx, review_id: str, *, action: str, company_id: Optional[str] = None
                        ) -> Dict[str, Any]:
-        """``link`` every job with this company name to ``company_id`` (an existing CRM
-        company chosen by a person), or ``ignore`` the name. Never creates a company."""
+        """``link`` every job (and job-derived signal) with this company name to ``company_id``
+        (an existing CRM company chosen by a person), ``create`` a new account for it even though
+        it resembles an existing one (the explicit duplicate override), ``keep`` it in review, or
+        ``ignore`` the name. A company is only ever created by the explicit ``create``."""
         ctx.require_write()
         review = self.store.get(ctx, "job_company_reviews", review_id)
+        builder = self.platform.service("account_builder")
+        item = {"key": review["normalized_name"], "names": [review["company_name"]],
+                "display_name": review["company_name"], "signal_ids": [], "job_ids": [], "override": False}
         if action == "link":
             company = self.store.get(ctx, "companies", str(company_id or ""))
-            jobs = self._jobs_named(ctx, review)
-            for chunk in _chunks(jobs):
-                self.store.update_many(ctx, "job_postings", [(j["id"], {"company_id": company["id"],
-                                                                        "company_match": "matched"}) for j in chunk])
-            row = self.store.update(ctx, "job_company_reviews", review_id, {"status": "linked",
-                                                                           "company_id": company["id"]})
+            done = builder.link(ctx, item, company["id"], reason="linked from review")
+            row = self.store.get(ctx, "job_company_reviews", review_id)
             audit(self.store, ctx, "job_company.linked", entity_type="job_company_reviews", entity_id=review_id,
-                  summary=f"{review['company_name']} -> {company['name']} ({len(jobs)} jobs)")
-            return {**row, "jobs_linked": len(jobs)}
+                  summary=f"{review['company_name']} -> {company['name']} ({done['jobs_linked']} jobs)")
+            return {**row, "jobs_linked": done["jobs_linked"], "signals_linked": done["signals_linked"],
+                    "jobs_attached": done["jobs_attached"], "signals_attached": done["signals_attached"],
+                    "company": {"id": company["id"], "name": company["name"]}}
+        if action == "create":
+            done = builder.build_one(ctx, {**item, "override": True})
+            audit(self.store, ctx, "job_company.created", entity_type="job_company_reviews", entity_id=review_id,
+                  summary=f"{review['company_name']}: new account despite possible duplicate")
+            return {**self.store.get(ctx, "job_company_reviews", review_id), **done}
+        if action == "keep":
+            return review
         if action == "ignore":
             row = self.store.update(ctx, "job_company_reviews", review_id, {"status": "ignored"})
             audit(self.store, ctx, "job_company.ignored", entity_type="job_company_reviews", entity_id=review_id,
                   summary=review["company_name"])
             return row
-        raise ValidationError("action must be link or ignore")
+        raise ValidationError("action must be link, create, keep or ignore")
 
     # ------------------------------------------------------------------------------------
     # monitor views

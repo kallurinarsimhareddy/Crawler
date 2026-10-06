@@ -1,6 +1,6 @@
 // Dashboard, analytics, the opportunity pipeline and list detail.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { ErrorBanner, Loading } from "../../components/Feedback";
 import type { Row } from "../api";
@@ -8,6 +8,8 @@ import { CreateForm } from "../ResourcePage";
 import { OPPORTUNITY_COLUMNS } from "../resources";
 import { DataTable, Json, KeyValues, PageHeader, Pill, ResourceList, Score, Stat, Tags, fmt, useAction, useLoad } from "../ui";
 import { useWorkspace, useWs } from "../workspace";
+import { canWrite } from "../logic/admin";
+import { memberLink, provenanceText, recordName, taskStopped } from "../logic/accounts";
 
 type Dash = Record<string, unknown>;
 
@@ -176,8 +178,28 @@ export function ListDetail() {
   const client = useWs();
   const list = useLoad((signal) => client.get<Row>(`/lists/${listId}`, undefined, signal), client.base + listId);
   const members = useLoad((signal) => client.list(`/lists/${listId}/members`, { limit: 200 }, signal), client.base + listId + "m");
+  const isCompanies = String(list.data?.entity_type ?? "") === "companies";
+  const summary = useLoad((signal) => (isCompanies ? client.get<Row>(`/account-lists/${listId}/summary`, undefined, signal) : Promise.resolve(null)),
+    `${client.base}${listId}|summary|${isCompanies}`);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [findTask, setFindTask] = useState<string | null>(null);
+  // follow the contact search until it finishes, then show what it found and refresh the counts
+  const finding = useLoad((signal) => (findTask ? client.get<Row>(`/tasks/${encodeURIComponent(findTask)}`, undefined, signal) : Promise.resolve(null)),
+    `${client.base}|find|${findTask ?? ""}`, findTask ? 2000 : undefined);
+  const findStatus = String((finding.data as Row | null)?.status ?? "");
+  useEffect(() => {
+    if (!findTask || !taskStopped(findStatus)) return;
+    const res = ((finding.data as Row).result ?? {}) as Record<string, unknown>;
+    const paid = Array.isArray(res.paid_needed) ? res.paid_needed.length : 0;
+    setNotice(findStatus === "failed" ? `Contact search failed: ${String((finding.data as Row).error ?? "unknown error")}`
+      : `Contact search finished: ${fmt(res.added ?? 0)} new contact${Number(res.added) === 1 ? "" : "s"} for ${fmt(res.companies ?? 0)} companies from free sources.`
+        + (paid ? ` ${fmt(paid)} companies would need a paid provider (not used).` : ""));
+    setFindTask(null);
+    summary.refresh();
+  }, [findTask, findStatus]); // eslint-disable-line react-hooks/exhaustive-deps
   const action = useAction();
   const navigate = useNavigate();
+  const writable = canWrite(useWorkspace().current?.role);
   if (list.error) return <div className="page"><ErrorBanner error={list.error} /></div>;
   if (!list.data) return <div className="page"><Loading /></div>;
   return (
@@ -187,23 +209,49 @@ export function ListDetail() {
         title={String(list.data.name)}
         subtitle={`${fmt(list.data.member_count)} ${String(list.data.entity_type).replace(/_/g, " ")}`}
         actions={<>
+          {isCompanies && writable && (
+            <button className="button button--ghost" disabled={action.busy || Boolean(findTask)} title="Find people at these companies from free sources (internal data and public company websites). Paid providers are not used here." onClick={() => action.run(async () => {
+              const res = await client.post<{ task_id?: string }>("/contacts/find", { list_id: listId, allow_paid: false });
+              setNotice("Finding contacts at these companies (free sources)…");
+              setFindTask(res.task_id ?? null);
+            })}>{findTask ? "Finding contacts…" : "Find contacts"}</button>
+          )}
+          {isCompanies && writable && (
+            <button className="button button--ghost" disabled={action.busy || Number(summary.data?.with_email ?? 0) === 0} title="Validate the email addresses of the contacts at these companies (built-in checks; nothing is sent)" onClick={() => action.run(async () => {
+              const job = await client.post<Row>(`/account-lists/${listId}/validate-emails`, {});
+              navigate(`/email-validation/${job.id}`);
+            })}>Validate contact emails</button>
+          )}
           {String(list.data.entity_type) === "contacts" && (
             <button className="button button--ghost" disabled={action.busy} title="Check every contact's email address (nothing is sent)" onClick={() => action.run(async () => {
               const job = await client.post<Row>("/email/jobs", { source: "list", list_id: listId, name: `List: ${String(list.data!.name)}` });
               navigate(`/email-validation/${job.id}`);
             })}>Validate emails</button>
           )}
-          <button className="button button--ghost" disabled={action.busy} onClick={() => action.run(() => client.post("/exports", { entity_type: "list", filters: { list_id: listId }, format: "xlsx" }))}>Export XLSX</button>
+          <button className="button button--ghost" disabled={action.busy} onClick={() => action.run(async () => {
+            await client.post("/exports", { entity_type: "list", filters: { list_id: listId }, format: "xlsx" });
+            setNotice("Export started — download it from Exports when it is ready.");
+          })}>Export XLSX</button>
         </>}
       />
       {action.error && <ErrorBanner error={action.error} />}
-      <KeyValues items={[["Description", fmt(list.data.description)], ["Source", fmt(list.data.source)]]} />
+      {notice && <p className="alert alert--info small" role="status">{notice}{notice.startsWith("Export") ? <> <Link className="link" to="/exports">Open Exports</Link></> : null}</p>}
+      <KeyValues items={[["Description", fmt(list.data.description)], ["Source", list.data.source === "account_builder" ? "Account Builder (hiring companies)" : fmt(list.data.source)]]} />
+      {isCompanies && summary.data && (
+        <div className="stats stats--wrap">
+          <Stat label="Companies" value={fmt(summary.data.companies)} />
+          <Stat label="With contacts" value={fmt(summary.data.companies_with_contacts)} />
+          <Stat label="Contacts" value={fmt(summary.data.contacts)} />
+          <Stat label="With email" value={fmt(summary.data.with_email)} />
+          {Object.entries((summary.data.email_status ?? {}) as Record<string, number>).map(([k, v]) => <Stat key={k} label={k.replace(/_/g, " ")} value={fmt(v)} />)}
+        </div>
+      )}
       {members.data && (
         <DataTable
           rows={members.data.items}
           columns={[
-            { key: "entity_id", label: "Record", render: (r) => <Link className="link" to={`/${String(list.data!.entity_type) === "contacts" ? "contacts" : "companies"}/${r.entity_id}`}>{String(r.entity_id)}</Link> },
-            { key: "added_reason", label: "Why added" },
+            { key: "entity_id", label: "Record", render: (r) => <Link className="link" to={memberLink(String(list.data!.entity_type), String(r.entity_id))}>{recordName(r.record as Record<string, unknown> | null)}</Link> },
+            { key: "added_reason", label: "Why added", render: (r) => provenanceText(r.added_reason) },
             { key: "created_at", label: "Added", render: (r) => fmt(r.created_at) },
           ]}
           empty="This list is empty."

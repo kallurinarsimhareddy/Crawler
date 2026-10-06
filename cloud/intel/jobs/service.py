@@ -292,7 +292,9 @@ class JobIntelService:
         company = self.store.find(ctx, "companies", company_id)
         if company is None:
             return {}
-        open_jobs = self.store.all(ctx, "job_postings", {"company_id": company_id, "status": "open"}, cap=5000)
+        # open + stale: a STALE posting is still listed by its source (only old)
+        open_jobs = self.store.all(ctx, "job_postings", {"company_id": company_id, "status": ["open", "stale"]},
+                                   cap=5000)
         changes: Dict[str, Any] = {"hiring_count": len(open_jobs), "last_seen_at": utcnow()}
         platforms = [j["ats"] for j in open_jobs if j.get("ats")]
         if platforms:

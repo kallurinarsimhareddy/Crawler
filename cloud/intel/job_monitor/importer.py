@@ -10,6 +10,7 @@ overwrites a job a monitor already observed, it only fills blank fields.
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import hashlib
 import logging
@@ -103,16 +104,28 @@ def _raw(mapping: Mapping[str, Optional[str]], record: Mapping[str, Any]) -> Dic
             if label in LABEL_COLUMNS}
 
 
+@contextlib.contextmanager
+def _field_limit(limit: int = _CSV_FIELD_LIMIT) -> Iterator[None]:
+    """``csv.field_size_limit`` is process-global: raise it only for our own read, then restore
+    it (another parser may rely on the default to detect a damaged file)."""
+    import csv
+
+    previous = csv.field_size_limit(limit)
+    try:
+        yield
+    finally:
+        csv.field_size_limit(previous)
+
+
 def _scan_csv(path: Any, filename: str) -> Tuple[List[str], int]:
     """Headers and data-row count of a CSV on disk, streamed (bounded memory, any size).
     Raises UnicodeDecodeError for a non-UTF-8 file and ValidationError for a broken one."""
     import csv
 
     delimiter = "\t" if str(filename).lower().endswith(".tsv") else ","
-    csv.field_size_limit(_CSV_FIELD_LIMIT)
     header: Optional[List[str]] = None
     rows = 0
-    with open(path, "r", encoding="utf-8-sig", errors="strict", newline="") as handle:
+    with _field_limit(), open(path, "r", encoding="utf-8-sig", errors="strict", newline="") as handle:
         try:
             # strict: an unterminated quoted field is an error, not a silently merged row
             for raw in csv.reader(handle, delimiter=delimiter, strict=True):
@@ -191,8 +204,7 @@ class JobImportService:
         import io
 
         delimiter = "\t" if str(row["filename"]).lower().endswith(".tsv") else ","
-        csv.field_size_limit(10_000_000)
-        with self.platform.storage.open(row["storage_key"]) as handle:
+        with _field_limit(), self.platform.storage.open(row["storage_key"]) as handle:
             text = io.TextIOWrapper(handle, encoding="utf-8-sig", errors="strict", newline="")
             header: Optional[List[str]] = None
             number = 0

@@ -113,7 +113,7 @@ export function Home() {
       <section aria-label="Metrics" className="metrics">
         <Metric label="Companies" value={value(num(d, "companies", "total"))} to="/companies" points={series.companies} hint={d ? `${num(d, "companies", "with_open_jobs").toLocaleString()} hiring now` : undefined} />
         <Metric label="Contacts" value={value(num(d, "contacts", "total"))} to="/contacts" hint={d ? `${num(d, "contacts", "verified_emails").toLocaleString()} verified emails` : undefined} />
-        <Metric label="Open Jobs" value={value(num(d, "jobs", "open"))} to="/hiring?tab=jobs" points={series.job_postings} hint={d ? `${num(d, "jobs", "relevant").toLocaleString()} relevant` : undefined} />
+        <Metric label="Open Jobs" value={value(num(d, "jobs", "open"))} to="/jobs" points={series.job_postings} hint={d ? `${num(d, "jobs", "relevant").toLocaleString()} relevant` : undefined} />
         <Metric label="Hiring Signals" value={value(num(d, "signals", "active"))} to="/signals" points={series.hiring_signals} hint={d ? `${num(d, "signals", "total").toLocaleString()} detected in total` : undefined} />
         <Metric label="Active Campaigns" value={activeCampaigns} to="/campaigns" hint={d ? `${campaigns.length.toLocaleString()} campaigns` : undefined} />
         <Metric label="Tasks Due" value={due.data ? (due.data as PageOf).total : due.loading ? null : 0} to="/tasks" hint="Open, due by today" />

@@ -297,6 +297,14 @@ class MemoryStore(Store):
             return counts
 
 
+def _memory_filtered_rows(self: MemoryStore, ctx: Ctx, spec: EntitySpec, filters, q):
+    with self._lock:
+        return [dict(r) for r in self._filtered(ctx, spec, filters, q)]
+
+
+MemoryStore._filtered_rows = _memory_filtered_rows  # type: ignore[attr-defined]
+
+
 def _memory_count_by_day(self: MemoryStore, ctx: Ctx, spec: EntitySpec, column: str, filters) -> Dict[str, int]:
     from datetime import timezone as _tz
 

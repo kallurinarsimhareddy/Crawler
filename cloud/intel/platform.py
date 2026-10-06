@@ -78,6 +78,8 @@ SERVICES: Dict[str, str] = {
     "signal_outcomes": "cloud.intel.signals.outcomes:SignalOutcomeService",
     # Jobs CSV export (migration 0014)
     "job_exports": "cloud.intel.job_monitor.exports:JobExportService",
+    # Account Builder (no migration: jobs/signals -> CRM companies -> lists)
+    "account_builder": "cloud.intel.job_monitor.accounts:AccountBuilderService",
 }
 
 

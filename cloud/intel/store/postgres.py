@@ -18,10 +18,10 @@ from __future__ import annotations
 import json
 import uuid
 from contextlib import contextmanager
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
 
 from cloud.intel.core.context import ConflictError, Ctx, ForbiddenError, NotFoundError, ValidationError
-from cloud.intel.store.base import Page, Store
+from cloud.intel.store.base import Page, Store, parse_filters
 from cloud.intel.store.spec import COMMON_COLUMNS, EntitySpec
 
 __all__ = ["PostgresStore"]
@@ -237,6 +237,59 @@ class PostgresStore(Store):
                                 break
         return out
 
+    def _group_stats(self, ctx: Ctx, spec: EntitySpec, column: str, filters, q, metrics) -> Dict[Any, Dict[str, int]]:
+        from psycopg import sql
+
+        where, params = self._where(spec, ctx, filters, q)
+        parts, extra = [sql.SQL("{} as value").format(sql.Identifier(column)), sql.SQL("count(*) as count")], []
+        for name, conds in metrics.items():
+            terms = []
+            for col, op, value in conds:
+                if op == "in":
+                    terms.append(sql.SQL("{} = any(%s)").format(sql.Identifier(col)))
+                    extra.append([self._adapt(spec, col, v) for v in value])
+                elif op == "eq":
+                    terms.append(sql.SQL("{} = %s").format(sql.Identifier(col)))
+                    extra.append(self._adapt(spec, col, value))
+                else:
+                    terms.append(sql.SQL("{} is not null").format(sql.Identifier(col)))
+            parts.append(sql.SQL("count(*) filter (where {}) as {}").format(
+                sql.SQL(" and ").join(terms), sql.Identifier(f"m_{name}")))
+        query = sql.SQL("select {} from {} where {} group by 1").format(sql.SQL(", ").join(parts), self._table(spec), where)
+        with self._tx(self._scope(ctx)) as conn:
+            rows = conn.execute(query, extra + list(params)).fetchall()
+        return {(str(r["value"]) if isinstance(r["value"], uuid.UUID) else r["value"]):
+                {"count": r["count"], **{name: r[f"m_{name}"] for name in metrics}} for r in rows}
+
+    def _group_tags(self, ctx: Ctx, spec: EntitySpec, column: str, tags_column: str, filters, q
+                    ) -> Dict[Any, Dict[str, int]]:
+        from psycopg import sql
+
+        where, params = self._where(spec, ctx, filters, q)
+        # filter the rows first (workspace + RLS + filters), then unnest only the survivors
+        query = sql.SQL("select s.value, tag, count(*) as n from (select {} as value, {} as tags from {} where {}) s, "
+                        "unnest(s.tags) as tag group by 1, 2").format(
+            sql.Identifier(column), sql.Identifier(tags_column), self._table(spec), where)
+        out: Dict[Any, Dict[str, int]] = {}
+        with self._tx(self._scope(ctx)) as conn:
+            for r in conn.execute(query, params).fetchall():
+                out.setdefault(r["value"], {})[r["tag"]] = r["n"]
+        return out
+
+    def _update_where(self, ctx: Ctx, spec: EntitySpec, filters: Mapping[str, Any], clean: Dict[str, Any]) -> int:
+        """One ``UPDATE ... WHERE <filters>`` under the caller's RLS scope (workspace filter
+        included by _where), instead of one statement per row."""
+        from psycopg import sql
+
+        where, params = self._where(spec, ctx, parse_filters(spec, filters), None)
+        names = list(clean)
+        query = sql.SQL("update {} set {} where {}").format(
+            self._table(spec), sql.SQL(", ").join(sql.SQL("{} = %s").format(sql.Identifier(n)) for n in names), where)
+        with self._tx(self._scope(ctx)) as conn:
+            if not ctx.system and not self._has_role(conn, ctx, write=True):
+                raise ForbiddenError("this workspace role is read-only")
+            return conn.execute(query, [self._adapt(spec, n, clean[n]) for n in names] + list(params)).rowcount
+
     def _delete_many(self, ctx: Ctx, spec: EntitySpec, row_ids: List[str]) -> int:
         from psycopg import sql
 
@@ -327,6 +380,11 @@ class PostgresStore(Store):
         with self._tx(self._scope(ctx)) as conn:
             rows = conn.execute(query, params).fetchall()
         return {(str(r["value"]) if isinstance(r["value"], uuid.UUID) else r["value"]): r["n"] for r in rows}
+
+    def database_size_bytes(self) -> int:
+        """pg_database_size of the connected database (capacity guards)."""
+        with self._pool.connection() as conn:
+            return int(conn.execute("select pg_database_size(current_database()) as size").fetchone()["size"])
 
     def _count_by_day(self, ctx: Ctx, spec: EntitySpec, column: str, filters) -> Dict[str, int]:
         from psycopg import sql

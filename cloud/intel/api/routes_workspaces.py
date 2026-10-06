@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any, Dict, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
@@ -78,9 +79,17 @@ def add_member(body: Dict[str, Any] = Body(...), ctx: Ctx = Depends(write_ctx),
                platform: Platform = Depends(get_platform)):
     try:
         ctx.require_admin()
-        platform.store.add_member(ctx, str(body.get("user_id")), str(body.get("role") or "member"))
-        audit(platform.store, ctx, "workspace.member_add", changes={"user_id": body.get("user_id"),
-                                                                    "role": body.get("role")})
+        user_id, role = str(body.get("user_id")), str(body.get("role") or "member")
+        if role == "owner":
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "ownership cannot be assigned through this endpoint")
+        admin = platform.service("admin")
+        if admin._role_of(ctx, str(uuid.UUID(user_id))) is not None:
+            # an existing member: the admin service's rules apply (the owner's role can never be
+            # changed here, and the last admin cannot be demoted)
+            admin.change_role(ctx, user_id, role)
+            return {"ok": True}
+        platform.store.add_member(ctx, user_id, role)
+        audit(platform.store, ctx, "workspace.member_add", changes={"user_id": user_id, "role": role})
         return {"ok": True}
     except (PlatformError, ValueError) as error:
         raise HTTPException(getattr(error, "status", 422), str(error)) from error

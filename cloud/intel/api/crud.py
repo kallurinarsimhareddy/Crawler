@@ -17,7 +17,7 @@ silently ignored. Every write is audited. Tracks with richer behaviour
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -52,7 +52,9 @@ Hook = Callable[[Platform, Ctx, Dict[str, Any]], Dict[str, Any]]
 
 def crud_router(entity: str, *, path: Optional[str] = None, tag: Optional[str] = None,
                 create: Optional[Hook] = None, update: Optional[Callable[..., Dict[str, Any]]] = None,
-                allow_create: bool = True, allow_update: bool = True, allow_delete: bool = True) -> APIRouter:
+                allow_create: bool = True, allow_update: bool = True, allow_delete: bool = True,
+                decorate: Optional[Callable[[Platform, Ctx, List[Dict[str, Any]]], None]] = None) -> APIRouter:
+    """``decorate`` fills display-only fields on read rows (in place), e.g. names for ids."""
     spec = get_spec(entity)
     base = path or f"/{entity.replace('_', '-')}"
     router = APIRouter(prefix="/w/{workspace_id}", tags=[tag or entity])
@@ -62,15 +64,20 @@ def crud_router(entity: str, *, path: Optional[str] = None, tag: Optional[str] =
     def list_rows(request: Request, limit: int = 50, offset: int = 0, order: Optional[str] = None,
                   ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
         try:
-            return page_response(platform.store.list(ctx, entity, list_filters(request), order=order,
-                                                     limit=limit, offset=offset))
+            page = platform.store.list(ctx, entity, list_filters(request), order=order, limit=limit, offset=offset)
+            if decorate is not None:
+                decorate(platform, ctx, page.rows)
+            return page_response(page)
         except PlatformError as error:
             raise http_error(error) from error
 
     @router.get(base + "/{row_id}", name=f"get_{entity}")
     def get_row(row_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform = Depends(get_platform)):
         try:
-            return jsonable_encoder(platform.store.get(ctx, entity, row_id))
+            row = platform.store.get(ctx, entity, row_id)
+            if decorate is not None:
+                decorate(platform, ctx, [row])
+            return jsonable_encoder(row)
         except PlatformError as error:
             raise http_error(error) from error
 
