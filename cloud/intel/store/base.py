@@ -578,3 +578,52 @@ def _abstract_list_workspace_ids(self) -> List[str]:  # pragma: no cover - repla
 
 #: System-only: every workspace id, for maintenance loops (reaping, monitors).
 Store.list_workspace_ids = _abstract_list_workspace_ids  # type: ignore[attr-defined]
+
+
+def _task_priority(task: Dict[str, Any], bulk_kinds: Sequence[str]) -> tuple:
+    raw = (task.get("params") or {}).get("priority")
+    try:
+        priority = int(raw)
+    except (TypeError, ValueError):
+        priority = 100
+    due = task.get("run_after") or task.get("created_at")
+    return (1 if task.get("kind") in bulk_kinds else 0, priority, due, task.get("created_at"), task.get("id"))
+
+
+def _generic_due_tasks(self, *, now, limit: int = 1, bulk_kinds: Sequence[str] = (),
+                       ids: Optional[Sequence[str]] = None) -> List[Tuple[str, str]]:
+    """System-only: ``(workspace_id, task_id)`` of runnable tasks across workspaces, in the
+    order a worker should take them (interactive before bulk, priority, then due time)."""
+    from datetime import timedelta
+
+    found = []
+    for workspace_id in self.list_workspace_ids():
+        ctx = Ctx.for_system(workspace_id)
+        filters: Dict[str, Any] = {"status": ["queued", "retrying"], "cancel_requested_at__isnull": True}
+        if ids:
+            filters["id"] = list(ids)
+        for task in self.rows(ctx, "platform_tasks", filters, order="created_at", limit=MAX_PAGE):
+            if task.get("run_after") is None or task["run_after"] <= now + timedelta(seconds=1):
+                found.append((workspace_id, task))
+    found.sort(key=lambda pair: _task_priority(pair[1], bulk_kinds))
+    return [(w, t["id"]) for w, t in found[:max(0, limit)]]
+
+
+def _generic_task_queue_counts(self, *, now) -> Dict[str, int]:
+    counts = {"ready": 0, "delayed": 0, "running": 0}
+    for workspace_id in self.list_workspace_ids():
+        ctx = Ctx.for_system(workspace_id)
+        for task in self.rows(ctx, "platform_tasks", {"status": ["queued", "retrying", "running"]}, limit=MAX_PAGE):
+            if task["status"] == "running":
+                counts["running"] += 1
+            elif task.get("run_after") is not None and task["run_after"] > now:
+                counts["delayed"] += 1
+            else:
+                counts["ready"] += 1
+    return counts
+
+
+#: System-only queue reads used by the PostgreSQL task queue (generic versions; the
+#: PostgreSQL store replaces them with single indexed queries).
+Store.due_tasks = _generic_due_tasks  # type: ignore[attr-defined]
+Store.task_queue_counts = _generic_task_queue_counts  # type: ignore[attr-defined]

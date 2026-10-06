@@ -42,7 +42,7 @@ def deployment_problems(settings: Settings) -> List[str]:
             problems.append(message)
 
     need(settings.storage == "postgres", f"{env} requires CAREERCLOUD_STORAGE=postgres")
-    need(settings.queue == "redis", f"{env} requires CAREERCLOUD_QUEUE=redis")
+    need(settings.queue in ("redis", "postgres"), f"{env} requires CAREERCLOUD_QUEUE=redis or postgres")
     need(settings.auth_mode == "supabase", f"{env} requires CAREERCLOUD_AUTH_MODE=supabase")
     need(settings.dev_jwt_secret is None, f"{env} must not have CAREERCLOUD_DEV_JWT_SECRET")
     need(settings.supabase_service_role_key is None, "the API must never hold the Supabase service-role key")

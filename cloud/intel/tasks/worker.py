@@ -183,6 +183,10 @@ HOUSEKEEPING_SECONDS = 120.0
 ORPHAN_SECONDS = 600.0
 #: Worker presence beat; the queue considers a worker gone after 180 s without one.
 PRESENCE_SECONDS = 60.0
+#: Finished (completed / failed / cancelled) tasks are deleted after this many days
+#: (CAREERCLOUD_TASK_RETENTION_DAYS; 0 keeps them forever). Checked once a day.
+RETENTION_DAYS = float(os.environ.get("CAREERCLOUD_TASK_RETENTION_DAYS", "90") or 0)
+RETENTION_CHECK_SECONDS = 86400.0
 
 
 class PlatformWorker:
@@ -201,6 +205,9 @@ class PlatformWorker:
         self._last_maintenance = 0.0
         self._last_orphans = 0.0
         self._last_reserve = 0.0
+        self._last_retention = 0.0
+        #: how often an idle worker reserves anyway (delayed retries, scheduled runs)
+        self.housekeeping_seconds = float(getattr(self.queue, "housekeeping_seconds", HOUSEKEEPING_SECONDS))
         #: reserve on the next round: a doorbell rang, or the last reserve found work
         self._woken = True
         self._requeue_all = False
@@ -218,6 +225,12 @@ class PlatformWorker:
 
     def stop(self) -> None:
         self._stopping.set()
+        interrupt = getattr(self.queue, "interrupt", None)      # wake a worker blocked on the doorbell
+        if callable(interrupt):
+            try:
+                interrupt()
+            except Exception:  # noqa: BLE001 - stopping must never fail
+                log.debug("could not interrupt the queue wait", exc_info=True)
 
     def process_next(self) -> bool:
         from cloud.shared.queue import queue_unavailable
@@ -324,9 +337,14 @@ class PlatformWorker:
 
     def maintain(self) -> Dict[str, int]:
         report = {"reaped": 0, "requeued": 0, "monitors": 0}
-        orphans = time.monotonic() - self._last_orphans >= ORPHAN_SECONDS
+        # a durable queue (PostgreSQL) has no lost doorbells to re-ring
+        orphans = (not getattr(self.queue, "durable", False)
+                   and time.monotonic() - self._last_orphans >= ORPHAN_SECONDS)
         if orphans:
             self._last_orphans = time.monotonic()
+        retention = RETENTION_DAYS > 0 and time.monotonic() - self._last_retention >= RETENTION_CHECK_SECONDS
+        if retention:
+            self._last_retention = time.monotonic()
         everything, self._requeue_all = self._requeue_all, False
         for workspace_id in self.platform.store.list_workspace_ids():
             ctx = Ctx.for_system(workspace_id)
@@ -338,6 +356,9 @@ class PlatformWorker:
                     report["requeued"] += self.platform.tasks.requeue_orphans(
                         ctx, **({"older_than_seconds": 0} if everything else {}))
                 report["monitors"] += self.platform.service("monitoring").schedule_due(ctx)
+                if retention:
+                    report["purged"] = report.get("purged", 0) + self.platform.tasks.purge_finished(
+                        ctx, older_than_days=RETENTION_DAYS)
                 # Scraper runs whose task died with the worker: mark them so they can be retried.
                 report["scrape_recovered"] = report.get("scrape_recovered", 0) +                     self.platform.service("scraper").recover(ctx)
                 # Sequence steps advance only where sending is actually permitted
@@ -424,7 +445,7 @@ class PlatformWorker:
         """Reserve only when there may be work (a doorbell, work just found, or the
         housekeeping interval is due); otherwise wait on the doorbell."""
         # a worker waiting for the queue probes it with a reserve when its back-off ends
-        if self.degraded is not None or self._woken or time.monotonic() - self._last_reserve >= HOUSEKEEPING_SECONDS:
+        if self.degraded is not None or self._woken or time.monotonic() - self._last_reserve >= self.housekeeping_seconds:
             self._woken = self.process_next()
             if self._woken or self.degraded is not None:
                 return
@@ -434,7 +455,7 @@ class PlatformWorker:
         """Nothing to reserve: wait for the queue's doorbell (one blocking command per wait)
         until the next maintenance pass or housekeeping reserve is due. True when the
         doorbell rang (reserve now)."""
-        until = min(self._last_reserve + HOUSEKEEPING_SECONDS, self._last_maintenance + self.maintenance_seconds)
+        until = min(self._last_reserve + self.housekeeping_seconds, self._last_maintenance + self.maintenance_seconds)
         # at least 1 s (the shortest blocking wait), so the doorbell is always checked
         remaining = max(1.0, until - time.monotonic())
         from cloud.shared.queue import queue_unavailable

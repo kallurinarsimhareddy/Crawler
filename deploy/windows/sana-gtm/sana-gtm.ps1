@@ -159,6 +159,8 @@ function Start-Hidden([string]$FilePath, [string[]]$Arguments, [string]$StdOut =
 
 function Start-Api {
     Rotate (Join-Path $LogDir "api.out.log"); Rotate (Join-Path $LogDir "api.err.log")
+    # /status reads the worker's presence from its state file (PostgreSQL task queue)
+    $env:CAREERCLOUD_WORKER_STATE_FILE = (Join-Path $LogDir "worker-state.json")
     $procId = Start-Hidden $Python @("-m", "uvicorn", "cloud.api.main:app", "--host", "127.0.0.1", "--port", "$ApiPort",
         "--env-file", $ApiEnv, "--proxy-headers") (Join-Path $LogDir "api.out.log") (Join-Path $LogDir "api.err.log")
     Write-Log "API started (pid $procId, no window)"

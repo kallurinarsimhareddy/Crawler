@@ -152,6 +152,12 @@ def create_app(
             dispatcher = QueueDispatcher(queue)
             runnable_types = settings.runnable_types
             queue_name = queue.name
+        elif settings.queue == "postgres":
+            # Platform tasks use the PostgreSQL queue. Legacy CareerCloud crawl jobs need the
+            # separate crawl worker (not part of SANA GTM): they stay queued, as without it.
+            dispatcher = NullDispatcher()
+            runnable_types = settings.runnable_types
+            queue_name = "postgres"
         elif runner is None and settings.runner == "none":
             dispatcher = NullDispatcher()
             queue_name = "none"
@@ -212,8 +218,9 @@ def create_app(
     app.state.token_verifier = verifier
     app.state.runnable_types = runnable_types
     app.state.queue_name = queue_name
-    # `/status` reads queue depth and worker presence straight off the queue.
-    app.state.queue = queue
+    # `/status` reads queue depth and worker presence straight off the queue — with the
+    # PostgreSQL queue, the platform's (its worker is the one that matters).
+    app.state.queue = getattr(platform, "queue", None) if settings.queue == "postgres" else queue
 
     app.state.job_limiter = RateLimiter(
         capacity=settings.job_create_per_hour, refill_per_second=settings.job_create_per_hour / 3600

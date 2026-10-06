@@ -97,6 +97,7 @@ def build_platform(role: str = "api", env: Optional[Mapping[str, str]] = None, *
         storage, database_url = settings.storage, settings.database_url
         pool_max, user_role = settings.db_pool_max, settings.db_user_role
 
+    pg_url = None
     if store is None:
         if storage == "postgres":
             from cloud.db.connection import resolve_database_url
@@ -112,6 +113,7 @@ def build_platform(role: str = "api", env: Optional[Mapping[str, str]] = None, *
                     "CAREERCLOUD_DATABASE_URL=localdev in development (after `python -m cloud.devtools.localpg "
                     "start`), a postgresql:// URL elsewhere, or CAREERCLOUD_STORAGE=memory for a throwaway store")
             store = PostgresStore.from_url(url, max_size=pool_max, user_role=user_role)
+            pg_url = url
             try:
                 report = require_schema(store._pool)  # noqa: SLF001 - the store owns the pool
             except Exception:
@@ -139,6 +141,11 @@ def build_platform(role: str = "api", env: Optional[Mapping[str, str]] = None, *
             prefix = (settings.queue_prefix if settings is not None else None) or env.get(
                 "CAREERCLOUD_QUEUE_PREFIX", f"careercloud:{environment}")
             queue = RedisJobQueue.from_url(url, prefix=f"{prefix}:platform")
+        elif queue_kind == "postgres":
+            # platform_tasks is the queue; LISTEN/NOTIFY is the doorbell. No Redis at all.
+            from cloud.intel.tasks.pgqueue import PostgresTaskQueue
+
+            queue = PostgresTaskQueue(store, url=pg_url, state_file=env.get("CAREERCLOUD_WORKER_STATE_FILE"))
         elif role == "api":
             inline = queue = InlineTaskQueue()
 

@@ -125,6 +125,14 @@ def queue_unavailable(error: BaseException) -> Optional[QueueUnavailable]:
     commands; None for anything else (a real bug must still surface)."""
     if isinstance(error, QueueUnavailable):
         return error
+    try:  # the PostgreSQL task queue: the database itself is unreachable
+        import psycopg
+        import psycopg_pool
+
+        if isinstance(error, (psycopg.OperationalError, psycopg.InterfaceError, psycopg_pool.PoolTimeout)):
+            return QueueUnavailable(f"the task database is unreachable ({type(error).__name__})")
+    except ImportError:  # pragma: no cover
+        pass
     try:
         import redis
     except ImportError:  # pragma: no cover - redis is installed wherever it is used
@@ -227,6 +235,11 @@ class InMemoryJobQueue(JobQueue):
                 self._bell.wait(max(0.0, timeout))
             rang, self._rang = self._rang, False
             return rang
+
+    def interrupt(self) -> None:
+        with self._bell:
+            self._rang = True
+            self._bell.notify_all()
 
     def _promote(self, now: float) -> None:
         for job_id, due in sorted(self._delayed.items(), key=lambda item: item[1]):

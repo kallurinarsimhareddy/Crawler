@@ -152,7 +152,7 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         raise ValueError("CAREERCLOUD_MAX_CONCURRENT_JOBS must be at least 1")
 
     storage = env_choice(env, "CAREERCLOUD_STORAGE", defaults.storage, ("memory", "postgres"))
-    queue = env_choice(env, "CAREERCLOUD_QUEUE", defaults.queue, ("inline", "redis"))
+    queue = env_choice(env, "CAREERCLOUD_QUEUE", defaults.queue, ("inline", "redis", "postgres"))
     auth_mode = env_choice(env, "CAREERCLOUD_AUTH_MODE", defaults.auth_mode, ("supabase", "dev"))
     allow_remote = env_bool(env, "CAREERCLOUD_ALLOW_REMOTE_SERVICES", False)
 

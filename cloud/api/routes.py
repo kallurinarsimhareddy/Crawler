@@ -168,6 +168,9 @@ def _database_status(request: Request) -> ComponentStatus:
 
 def _redis_status(request: Request) -> ComponentStatus:
     queue = get_queue(request)
+    if queue is not None and queue.name == "postgres":
+        return ComponentStatus(status="disabled", backend="postgres",
+                               detail="no Redis: the task queue is PostgreSQL")
     if queue is None or queue.name != "redis":
         return ComponentStatus(
             status="disabled",
@@ -213,7 +216,9 @@ def _worker_status(request: Request, settings: Settings, redis_ok: bool) -> tupl
     """
     queue = get_queue(request)
     stale_after = settings.worker_stale_after_seconds
-    if queue is None or queue.name != "redis":
+    if queue is not None and queue.name == "postgres":
+        redis_ok = True                 # nothing external to reach: presence and depth come from PostgreSQL
+    if queue is None or queue.name not in ("redis", "postgres"):
         return (
             WorkerStatus(
                 online=True,

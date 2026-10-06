@@ -284,6 +284,24 @@ class TaskService:
                 count += 1
         return count
 
+    def purge_finished(self, ctx: Ctx, *, older_than_days: float, limit: int = 200) -> int:
+        """Bounded task history: delete completed / failed / cancelled tasks that finished
+        more than ``older_than_days`` ago. Queued, running, retrying and paused tasks (and
+        their checkpoints) are never touched."""
+        if older_than_days <= 0:
+            return 0
+        cutoff = self._clock() - timedelta(days=older_than_days)
+        old = self.store.list(ctx, "platform_tasks", {"status": sorted(TERMINAL), "finished_at__lt": cutoff},
+                              order="finished_at", limit=limit).rows
+        removed = 0
+        for task in old:
+            try:
+                self.store.delete(ctx, "platform_tasks", task["id"])
+                removed += 1
+            except (ConflictError, NotFoundError):
+                continue
+        return removed
+
     # --- plumbing -------------------------------------------------------------
 
     def _transition(self, ctx: Ctx, task: Mapping[str, Any], status: str, **changes: Any) -> Dict[str, Any]:

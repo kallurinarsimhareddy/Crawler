@@ -54,6 +54,15 @@ def main() -> int:
             out["database"] = conn.execute("select 1").fetchone()[0] == 1
     except Exception as error:  # noqa: BLE001 - reported by class name only
         out["errors"]["database"] = type(error).__name__
+    if env.get("CAREERCLOUD_QUEUE", "redis") != "redis":
+        # PostgreSQL task queue: the queue is the database; the heartbeat is the worker's state file.
+        out["queue"] = bool(out["database"])
+        fresh = _state_age(out["worker_state"], time.time())
+        if fresh is not None and fresh < HEARTBEAT_FRESH_S:
+            out["workers_online"], out["last_heartbeat_age_s"] = 1, round(fresh, 1)
+        out["worker_heartbeat"] = out["workers_online"] > 0
+        print(json.dumps(out))
+        return 0
     try:
         import redis
 

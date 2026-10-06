@@ -16,6 +16,7 @@ Identifiers come only from :mod:`cloud.intel.store.spec` and are quoted with
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
@@ -497,3 +498,44 @@ def _pg_list_workspace_ids(self: PostgresStore) -> List[str]:
 
 
 PostgresStore.list_workspace_ids = _pg_list_workspace_ids  # type: ignore[attr-defined]
+
+
+def _pg_due_tasks(self: PostgresStore, *, now, limit: int = 1, bulk_kinds=(), ids=None) -> List[Tuple[str, str]]:
+    """Runnable tasks across workspaces, in one short query. ``FOR UPDATE SKIP LOCKED``
+    passes over a row another worker is claiming at this instant; the claim itself stays
+    the optimistic ``version`` update in TaskService.claim, so a task can never be taken
+    twice. Uses the caller's clock (the same one the claim checks ``run_after`` with)."""
+    where = ["status in ('queued', 'retrying')", "cancel_requested_at is null",
+             "(run_after is null or run_after <= %(due)s)"]
+    params: Dict[str, Any] = {"due": now + timedelta(seconds=1), "bulk": list(bulk_kinds),
+                              "limit": max(1, int(limit))}
+    if ids:
+        where.append("id = any(%(ids)s)")
+        params["ids"] = list(ids)
+    query = ("select workspace_id, id from careercloud.platform_tasks where " + " and ".join(where) +
+             " order by (case when kind = any(%(bulk)s) then 1 else 0 end),"
+             " (case when params->>'priority' ~ '^-?[0-9]{1,6}$' then (params->>'priority')::int else 100 end),"
+             " coalesce(run_after, created_at), created_at, id"
+             " limit %(limit)s for update skip locked")
+    with self._tx(None) as conn:
+        return [(str(r["workspace_id"]), r["id"]) for r in conn.execute(query, params).fetchall()]
+
+
+def _pg_task_queue_counts(self: PostgresStore, *, now) -> Dict[str, int]:
+    with self._tx(None) as conn:
+        row = conn.execute(
+            "select count(*) filter (where status in ('queued', 'retrying') and (run_after is null or run_after <= %(now)s)) as ready,"
+            " count(*) filter (where status in ('queued', 'retrying') and run_after > %(now)s) as delayed,"
+            " count(*) filter (where status = 'running') as running"
+            " from careercloud.platform_tasks where status in ('queued', 'retrying', 'running')", {"now": now}).fetchone()
+    return {k: int(row[k]) for k in ("ready", "delayed", "running")}
+
+
+def _pg_notify(self: PostgresStore, channel: str, payload: str) -> None:
+    with self._tx(None) as conn:
+        conn.execute("select pg_notify(%s, %s)", [channel, payload])
+
+
+PostgresStore.due_tasks = _pg_due_tasks  # type: ignore[attr-defined]
+PostgresStore.task_queue_counts = _pg_task_queue_counts  # type: ignore[attr-defined]
+PostgresStore.notify = _pg_notify  # type: ignore[attr-defined]
