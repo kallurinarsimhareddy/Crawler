@@ -57,6 +57,7 @@
 | [MIGRATION_PLAN.md](MIGRATION_PLAN.md) | Stages 0–8, verification checks, cutover, rollback |
 | [INSTALLATION_DESIGN.md](INSTALLATION_DESIGN.md) | Guided installer and the `sanagtm` install/start/stop/update/backup/restore/health/logs/capacity/uninstall CLI |
 | [SECURITY_AND_BACKUP.md](SECURITY_AND_BACKUP.md) | Gaps, VM security, backup and restore-test policy, DR scenarios, env var names |
+| [WINDOWS_PACKAGE.md](WINDOWS_PACKAGE.md) | **Windows installer ZIP: architecture, test results, readiness (2026-10-12)** |
 | [SELF_HOSTED_PACKAGE.md](SELF_HOSTED_PACKAGE.md) | **The built package: tests, VM spec, prerequisites, migration + rollback checklists (2026-10-09)** |
 | [PRODUCTION_SAFETY.md](PRODUCTION_SAFETY.md) | Production safety runbook (auto sweep, paused run, backups) |
 | [CLEANUP_CANDIDATES.md](CLEANUP_CANDIDATES.md) | Removal candidates, each with evidence and a precondition |

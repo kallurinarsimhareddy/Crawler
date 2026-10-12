@@ -75,3 +75,6 @@ sana-backups/
 *.p12
 *.pfx
 answers.env
+# Windows self-hosted package build output
+dist-windows/
+cloud/web/dist-selfhost/

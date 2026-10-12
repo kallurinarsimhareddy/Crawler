@@ -17,3 +17,6 @@ deploy/**       text eol=lf
 
 # Batch files must keep CRLF to run reliably under cmd.exe.
 *.bat          text eol=crlf
+
+# Windows command scripts keep CRLF even inside deploy/ (cmd.exe needs it).
+*.cmd          text eol=crlf

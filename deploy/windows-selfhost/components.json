@@ -1,0 +1,31 @@
+{
+  "_comment": "Third-party runtimes the installer downloads (or takes from -ComponentsDir for offline installs). Each file is verified against its SHA-256 before use. Pinned and verified 2026-10-12.",
+  "python": {
+    "version": "3.12.10",
+    "file": "python.3.12.10.nupkg",
+    "url": "https://api.nuget.org/v3-flatcontainer/python/3.12.10/python.3.12.10.nupkg",
+    "sha256": "0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93de3b8",
+    "note": "Official CPython build published on nuget.org by the Python team; python.exe Authenticode-signed by the Python Software Foundation. Portable: no installer, no admin."
+  },
+  "postgresql": {
+    "version": "17.11-1",
+    "file": "postgresql-17.11-1-windows-x64-binaries.zip",
+    "url": "https://get.enterprisedb.com/postgresql/postgresql-17.11-1-windows-x64-binaries.zip",
+    "sha256": "6eabdf00d2893713b75db4336a23c3fdf505f056e217ec6e2e95d901750cfea3",
+    "note": "EDB's official Windows binaries (the files the PostgreSQL installer installs). Only bin, lib and share are extracted."
+  },
+  "winsw": {
+    "version": "2.12.0",
+    "file": "WinSW-x64.exe",
+    "url": "https://github.com/winsw/winsw/releases/download/v2.12.0/WinSW-x64.exe",
+    "sha256": "05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da",
+    "note": "Windows Service Wrapper (MIT), latest stable release; runs the web, worker and tunnel as Windows services."
+  },
+  "cloudflared": {
+    "version": "2026.10.0",
+    "file": "cloudflared-windows-amd64.exe",
+    "url": "https://github.com/cloudflare/cloudflared/releases/download/2026.10.0/cloudflared-windows-amd64.exe",
+    "sha256": "86aee4017b26625cee8484c113558f48effa4cd47f7aa05fcf425604e5d2b23c",
+    "note": "Authenticode-signed by Cloudflare, Inc."
+  }
+}

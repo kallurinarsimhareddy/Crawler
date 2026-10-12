@@ -6,6 +6,7 @@
     python -m cloud.ops.selfhost health api|worker  # container health checks (exit 0 = healthy)
     python -m cloud.ops.selfhost stamp-restored     # after a verified restore: stamp it for this env
     python -m cloud.ops.selfhost info               # one JSON line: schema, stamp, sizes (no secrets)
+    python -m cloud.ops.selfhost verify-secrets     # the secrets key decrypts every stored provider credential
 
 Everything reads the process environment (the compose ``env_file``). Nothing here prints a
 connection string or a secret.
@@ -165,6 +166,35 @@ def health_worker(env: Mapping[str, str], *, now: Optional[float] = None) -> Dic
     return out
 
 
+def verify_secrets(env: Mapping[str, str]) -> Dict[str, object]:
+    """Can CAREERCLOUD_PLATFORM_SECRETS_KEY decrypt every stored provider credential? Counts only;
+    no value or provider secret is ever printed. Read-only."""
+    import psycopg
+    from cryptography.fernet import Fernet, InvalidToken
+
+    key = (env.get("CAREERCLOUD_PLATFORM_SECRETS_KEY") or "").strip()
+    out: Dict[str, object] = {"ok": False, "stored": 0, "readable": 0, "unreadable": []}
+    try:
+        fernet = Fernet(key.encode())
+    except (ValueError, TypeError):
+        out["error"] = "CAREERCLOUD_PLATFORM_SECRETS_KEY is missing or not a valid Fernet key"
+        return out
+    with psycopg.connect(_url(env)) as conn:
+        conn.execute("set transaction read only")
+        rows = conn.execute("select provider, secret_ciphertext from careercloud.provider_connections "
+                            "where secret_ciphertext is not null").fetchall()
+        conn.rollback()
+    for provider, ciphertext in rows:
+        try:
+            fernet.decrypt(ciphertext.encode())
+            out["readable"] = int(out["readable"]) + 1
+        except InvalidToken:
+            out["unreadable"].append(provider)  # type: ignore[union-attr]
+    out["stored"] = len(rows)
+    out["ok"] = not out["unreadable"]
+    return out
+
+
 def info(env: Mapping[str, str]) -> Dict[str, object]:
     import psycopg
 
@@ -192,7 +222,8 @@ def info(env: Mapping[str, str]) -> Dict[str, object]:
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m cloud.ops.selfhost", description=__doc__.split("\n\n")[0])
-    parser.add_argument("command", choices=("prepare", "registry", "health", "stamp-restored", "info"))
+    parser.add_argument("command", choices=("prepare", "registry", "health", "stamp-restored", "info",
+                                            "verify-secrets"))
     parser.add_argument("target", nargs="?", choices=("api", "worker"))
     args = parser.parse_args(argv)
     env = os.environ
@@ -205,6 +236,10 @@ def main(argv: Optional[List[str]] = None) -> int:
             result = {"stamp": stamp_restored(env)}
         elif args.command == "info":
             result = info(env)
+        elif args.command == "verify-secrets":
+            result = verify_secrets(env)
+            print(json.dumps(result, default=str))
+            return 0 if result["ok"] else 1
         else:
             if args.target is None:
                 parser.error("health needs api or worker")

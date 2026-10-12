@@ -331,7 +331,14 @@ class PlatformWorker:
             tmp = path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as handle:
                 json.dump(state, handle)
-            os.replace(tmp, path)
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:  # Windows: a health check is reading the file right now
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.05)
         except OSError:
             log.warning("could not write the worker state file %s", self.state_file, exc_info=True)
 

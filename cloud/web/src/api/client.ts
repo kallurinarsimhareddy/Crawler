@@ -12,8 +12,9 @@ import type {
   Status,
   TargetRecord,
 } from "./types";
+import { runtimeEnv } from "../runtimeConfig";
 
-const BASE_URL = (import.meta.env.VITE_API_URL ?? "").replace(/\/+$/, "");
+const BASE_URL = (runtimeEnv("VITE_API_URL") ?? "").replace(/\/+$/, "");
 
 export class ApiError extends Error {
   constructor(

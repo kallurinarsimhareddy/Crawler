@@ -4,6 +4,7 @@ import { AssistantProvider } from "../shell/Assistant";
 import { CommandPalette } from "../shell/CommandPalette";
 import { Sidebar } from "../shell/Sidebar";
 import { Topbar } from "../shell/Topbar";
+import { runtimeEnv } from "../runtimeConfig";
 
 const RAIL_KEY = "sanagtm.nav.rail";
 
@@ -44,7 +45,7 @@ export function Layout() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  const staging = import.meta.env.VITE_DEPLOY_ENV === "staging";
+  const staging = runtimeEnv("VITE_DEPLOY_ENV") === "staging";
   return (
     <AssistantProvider>
       <div className={`app${staging ? " app--staging" : ""}${rail ? " app--rail" : ""}`}>

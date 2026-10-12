@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Navigate, useLocation, useNavigate } from "react-router-dom";
 import { useAuth } from "../auth/AuthProvider";
 import { ErrorBanner } from "../components/Feedback";
+import { runtimeEnv } from "../runtimeConfig";
 
 export function Login() {
   const { mode, session, signIn, signUp, requestPasswordReset, configured } = useAuth();
@@ -49,7 +50,7 @@ export function Login() {
 
   return (
     <div className="auth-page">
-      {import.meta.env.VITE_DEPLOY_ENV === "staging" && (
+      {runtimeEnv("VITE_DEPLOY_ENV") === "staging" && (
         <div className="env-banner env-banner--fixed" role="note">
           STAGING — test environment
         </div>

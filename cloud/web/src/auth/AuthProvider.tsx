@@ -1,6 +1,7 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import { api, configureAuth } from "../api/client";
+import { runtimeEnv } from "../runtimeConfig";
 
 export type AuthMode = "supabase" | "dev";
 
@@ -25,9 +26,9 @@ interface AuthState {
 
 const AuthContext = createContext<AuthState | null>(null);
 
-const MODE: AuthMode = import.meta.env.VITE_AUTH_MODE === "dev" ? "dev" : "supabase";
-const SUPABASE_URL = import.meta.env.VITE_SUPABASE_URL ?? "";
-const SUPABASE_ANON_KEY = import.meta.env.VITE_SUPABASE_ANON_KEY ?? "";
+const MODE: AuthMode = runtimeEnv("VITE_AUTH_MODE") === "dev" ? "dev" : "supabase";
+const SUPABASE_URL = runtimeEnv("VITE_SUPABASE_URL") ?? "";
+const SUPABASE_ANON_KEY = runtimeEnv("VITE_SUPABASE_ANON_KEY") ?? "";
 
 // Development tokens live in sessionStorage: gone when the tab closes, never
 // shared across tabs, and only ever issued by a development API.
