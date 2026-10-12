@@ -1,0 +1,11 @@
+[Unit]
+Description=SANA GTM nightly backup (database dump + restore test, files, configuration)
+After=docker.service
+Requires=docker.service
+ConditionPathExists=/etc/sanagtm/compose.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sanagtm backup --scheduled
+Nice=10
+IOSchedulingClass=idle

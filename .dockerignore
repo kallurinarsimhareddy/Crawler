@@ -1,0 +1,32 @@
+# Build context for deploy/selfhost (app and web images). Secrets and machine-local state never
+# enter an image: every .env file, credentials, local databases, virtualenvs and build output.
+**/.env
+**/.env.*
+!**/.env.example
+**/secrets/
+**/*.json.key
+**/client_secret*.json
+**/service_account*.json
+**/token.json
+**/.venv/
+**/.venv-*/
+**/venv/
+**/node_modules/
+**/__pycache__/
+**/*.py[cod]
+**/.localdev/
+**/.wrangler/
+cloud/web/dist/
+logs/
+output/
+state/
+input/
+**/*.db
+**/*.db-*
+**/*.dump
+**/*.dump.partial
+deploy/windows/
+docs/
+.git/
+.github/
+*.bat

@@ -1,0 +1,8 @@
+[Unit]
+Description=SANA GTM capacity record (appends /srv/sanagtm/run/capacity.csv)
+After=docker.service
+ConditionPathExists=/etc/sanagtm/compose.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sanagtm capacity-record

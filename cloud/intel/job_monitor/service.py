@@ -332,7 +332,9 @@ class JobMonitorService:
                 nxt += step
             sweep_due = monitor.get("next_full_sweep_at") is not None and monitor["next_full_sweep_at"] <= now
             self.store.update(ctx, "job_source_monitors", monitor["id"], {"next_run_at": nxt})
-            if self.active_run(ctx, monitor["id"]) is not None:
+            active = self.active_run(ctx, monitor["id"])
+            if active is not None:
+                self._report_blocked(ctx, monitor, active)
                 continue
             try:
                 self.start_run(ctx, monitor["id"], mode="full" if sweep_due else "incremental", trigger="schedule")
@@ -343,6 +345,46 @@ class JobMonitorService:
         if queued:
             log.info("queued %d daily job lifecycle evaluation(s)", queued)
         return started
+
+    def _report_blocked(self, ctx: Ctx, monitor: Mapping[str, Any], active: Mapping[str, Any]) -> None:
+        """A due scheduled run was skipped because another run is still active. Silent only while
+        that run is actually working; a paused (or otherwise stalled) run would block the schedule
+        indefinitely, so say so once per scheduled run that it costs."""
+        task = self.store.find(ctx, "platform_tasks", active["task_id"]) if active.get("task_id") else None
+        task_status = (task or {}).get("status")
+        if task_status in ("running", "queued", "retrying"):
+            return
+        log.warning("job monitor %s: scheduled run skipped; run %s is %s with its task %s",
+                    monitor["id"], active["id"], active["status"], task_status or "missing")
+        self.platform.service("notifications").notify(
+            ctx, title=f"{monitor['name']}: scheduled run skipped", kind="job_monitor", severity="warning",
+            body=(f"A {active.get('mode') or ''} run is still open but its task is {task_status or 'missing'}, so "
+                  "no new runs start. Resume or cancel that run."),
+            link=f"/monitors/{monitor['id']}", entity_type="job_monitor_runs", entity_id=active["id"])
+
+    def cancel_run(self, ctx: Ctx, run_id: str) -> Dict[str, Any]:
+        """Cancel a run. A working run is asked to stop (the worker records it as cancelled at its
+        next page); a run whose task is paused, finished or missing has no worker to do that, so it
+        is finished here. Jobs already stored are kept, and a cancelled sweep closes nothing."""
+        ctx.require_write()
+        run = self.store.get(ctx, "job_monitor_runs", run_id)
+        if run["status"] in FINISHED_RUN_STATES:
+            raise ConflictError(f"this run is already {run['status']}")
+        task = self.store.find(ctx, "platform_tasks", run["task_id"]) if run.get("task_id") else None
+        if task is not None and task["status"] not in ("completed", "failed", "cancelled"):
+            task = self.platform.tasks.cancel(ctx, task["id"])
+        if task is not None and task["status"] not in ("completed", "failed", "cancelled"):
+            return run  # still running: the worker sees cancel_requested_at and finishes the run
+        if run["status"] == "queued":
+            return self.store.update(ctx, "job_monitor_runs", run_id,
+                                     {"status": "cancelled", "stop_reason": "cancelled before it started"})
+        from cloud.intel.job_monitor.runner import _finish
+
+        monitor = self.store.get(ctx, "job_source_monitors", run["monitor_id"])
+        _finish(self.platform, ctx.as_system(), monitor, run_id, "cancelled", stop_reason="cancelled by a user")
+        audit(self.store, ctx, "job_monitor.run_cancelled", entity_type="job_monitor_runs", entity_id=run_id,
+              summary=f"{monitor['name']}: {run['mode']} run cancelled at page {run.get('pages') or 0:,}")
+        return self.store.get(ctx, "job_monitor_runs", run_id)
 
     def schedule_lifecycle(self, ctx: Ctx, *, now: Optional[datetime] = None) -> int:
         """Queue the daily lifecycle evaluation (stale roles, closure candidates, signals) of

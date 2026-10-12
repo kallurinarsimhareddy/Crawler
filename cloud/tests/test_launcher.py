@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from cloud.tests._optional import needs_module, needs_repo_files
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 RUN_WORKER = REPO_ROOT / "run-worker.bat"
@@ -37,6 +38,7 @@ def run_launcher(script: Path, *args: str, env_overrides: dict | None = None) ->
     )
 
 
+@needs_repo_files("run-worker.bat", "stop-worker.bat")
 class TestLauncherFilesExist(unittest.TestCase):
     def test_both_scripts_are_at_the_repository_root(self) -> None:
         """Where an operator will look for them, not buried in cloud/."""
@@ -94,6 +96,7 @@ class TestLauncherFilesExist(unittest.TestCase):
 
 
 @windows_only
+@needs_repo_files("run-worker.bat", "stop-worker.bat")
 class TestRunWorkerRefusals(unittest.TestCase):
     """Every guard, exercised by actually running the script."""
 
@@ -167,6 +170,7 @@ class TestRunWorkerRefusals(unittest.TestCase):
 
 
 @windows_only
+@needs_repo_files("run-worker.bat", "stop-worker.bat")
 class TestStopWorker(unittest.TestCase):
     def test_it_writes_the_stop_file_the_worker_watches(self) -> None:
         scratch = tempfile.TemporaryDirectory()

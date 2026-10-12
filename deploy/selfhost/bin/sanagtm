@@ -1,0 +1,481 @@
+#!/usr/bin/env bash
+# sanagtm — install and operate self-hosted SANA GTM (Docker Compose on Ubuntu Server 24.04).
+#
+#   sanagtm install [--answers FILE] [--no-tunnel] [--reuse-data]
+#   sanagtm start | stop | restart [SERVICE] | status
+#   sanagtm health [--quiet]            exit 0 only if everything is healthy
+#   sanagtm logs [SERVICE] [-f] [--since 1h]
+#   sanagtm backup [--label NAME] [--scheduled]
+#   sanagtm backups                     list backups (newest first)
+#   sanagtm restore DUMP [--live]       default: restore-test into a scratch database
+#   sanagtm migrate import DUMP         load a Supabase backup into a NEW install (worker stays off)
+#   sanagtm migrate verify MANIFEST     compare the live database with a backup manifest
+#   sanagtm capacity                    database / disk / backup usage
+#   sanagtm update [--to GIT_REF]       backup, fetch, rebuild, migrate, restart, health
+#   sanagtm selftest                    run the platform test suite inside the image
+#   sanagtm uninstall [--purge-data]    containers and images; data is kept unless --purge-data
+#   sanagtm version
+#
+# Layout: code /opt/sanagtm/app (git checkout), config /etc/sanagtm (0600 secrets),
+# data /srv/sanagtm (pgdata, files, results, run, backups). Override with SANAGTM_APP,
+# SANAGTM_ETC, SANAGTM_DATA. Secrets are never passed on a command line or printed.
+set -euo pipefail
+umask 077
+
+SANAGTM_APP="${SANAGTM_APP:-/opt/sanagtm/app}"
+SANAGTM_ETC="${SANAGTM_ETC:-/etc/sanagtm}"
+SANAGTM_DATA="${SANAGTM_DATA:-/srv/sanagtm}"
+DOCKER="${SANAGTM_DOCKER:-docker}"
+COMPOSE_FILE="$SANAGTM_APP/deploy/selfhost/compose.yaml"
+PG_BIN=/usr/lib/postgresql/17/bin
+APP_UID=10001
+BACKUP_MAX_AGE_H=36
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+need_root() {
+  [[ "${SANAGTM_ALLOW_NONROOT:-0}" == 1 || $EUID -eq 0 ]] || die "run as root (sudo sanagtm $*)"
+}
+
+dc() {
+  "$DOCKER" compose -p sanagtm -f "$COMPOSE_FILE" --env-file "$SANAGTM_ETC/compose.env" "$@"
+}
+
+# Run a one-off command in the app image (no ports, same networks/env as the API).
+app_run() { dc run --rm --no-deps -T "$@"; }
+
+conf() {  # conf KEY FILE -> value (never echoed by callers that handle secrets)
+  local key=$1 file=$2
+  [[ -f "$file" ]] || return 0
+  sed -n "s/^${key}=//p" "$file" | tail -n 1 | sed 's/^"//; s/"$//'
+}
+
+admin_url_export() {
+  # The admin (superuser) URL, for restores and the selftest only. Exported into THIS process so
+  # `docker compose run -e SANAGTM_ADMIN_DATABASE_URL` passes it by name, never by value.
+  local pw
+  pw=$(conf POSTGRES_PASSWORD "$SANAGTM_ETC/postgres.env")
+  [[ -n "$pw" ]] || die "POSTGRES_PASSWORD missing from $SANAGTM_ETC/postgres.env"
+  export SANAGTM_ADMIN_DATABASE_URL="postgresql://postgres:${pw}@postgres:5432/postgres"
+}
+
+installed() { [[ -f "$SANAGTM_ETC/compose.env" && -f "$SANAGTM_ETC/sanagtm.env" ]]; }
+require_installed() { installed || die "SANA GTM is not installed here (run: sudo sanagtm install)"; }
+
+random_hex() { od -An -N"$1" -tx1 /dev/urandom | tr -d ' \n'; }
+fernet_key() { head -c 32 /dev/urandom | base64 | tr '+/' '-_'; }
+
+ask() {  # ask VAR "prompt" [default] [secret] [optional]
+  local var=$1 prompt=$2 default=${3:-} secret=${4:-} optional=${5:-} value
+  if [[ -n "${!var:-}" ]]; then return 0; fi          # from --answers or the environment
+  if [[ ! -t 0 ]]; then
+    [[ -n "$optional" ]] && return 0                   # non-interactive: an optional value may stay empty
+    die "$var is required (non-interactive: pass --answers FILE)"
+  fi
+  if [[ -n "$secret" ]]; then read -r -s -p "$prompt: " value; echo; else
+    read -r -p "$prompt${default:+ [$default]}: " value; fi
+  printf -v "$var" '%s' "${value:-$default}"
+}
+
+write_file() {  # write_file PATH MODE  (content on stdin)
+  local path=$1 mode=$2 tmp
+  tmp=$(mktemp "${path}.XXXX")
+  cat > "$tmp"
+  chmod "$mode" "$tmp"
+  mv -f "$tmp" "$path"
+}
+
+# --------------------------------------------------------------------------------------------
+cmd_install() {
+  need_root install
+  local answers="" tunnel=1 reuse=0
+  while [[ $# -gt 0 ]]; do case $1 in
+    --answers) answers=$2; shift 2 ;;
+    --no-tunnel) tunnel=0; shift ;;
+    --reuse-data) reuse=1; shift ;;
+    *) die "unknown option $1" ;;
+  esac; done
+  if [[ -n "$answers" ]]; then
+    [[ -f "$answers" ]] || die "no such answers file: $answers"
+    # shellcheck disable=SC1090
+    set -a; source "$answers"; set +a
+  fi
+  installed && [[ "${SANAGTM_REINSTALL:-0}" != 1 ]] && die "already installed ($SANAGTM_ETC exists). Use update, or SANAGTM_REINSTALL=1 to rewrite configuration"
+
+  command -v "$DOCKER" >/dev/null || die "docker is not installed (run deploy/selfhost/bin/bootstrap-ubuntu.sh)"
+  "$DOCKER" compose version >/dev/null 2>&1 || die "the docker compose plugin is missing"
+  [[ -f "$COMPOSE_FILE" ]] || die "no compose file at $COMPOSE_FILE (is SANAGTM_APP right?)"
+
+  if [[ -d "$SANAGTM_DATA/pgdata" && -n "$(ls -A "$SANAGTM_DATA/pgdata" 2>/dev/null)" && $reuse -ne 1 ]]; then
+    die "$SANAGTM_DATA/pgdata already holds a database; refusing to install over it (--reuse-data keeps it)"
+  fi
+
+  say "SANA GTM installation — only the required values are asked."
+  ask SANAGTM_HOSTNAME "Public hostname for SANA GTM (e.g. sanagtm.example.com)"
+  [[ "$SANAGTM_HOSTNAME" =~ ^[a-z0-9.-]+\.[a-z]{2,}$ ]] || die "hostname must look like sanagtm.example.com"
+  if [[ "$SANAGTM_HOSTNAME" =~ (^|[^a-z])(dev|test|stag) ]]; then
+    die "the hostname looks like a dev/test/staging name; production refuses those (environment isolation)"
+  fi
+  ask SANAGTM_SUPABASE_URL "Supabase Auth URL (https://<ref>.supabase.co)"
+  [[ "$SANAGTM_SUPABASE_URL" =~ ^https://[a-z0-9.-]+$ ]] || die "the auth URL must be https://<host>"
+  ask SANAGTM_SUPABASE_ANON_KEY "Supabase anon/publishable key (public)"
+  [[ "$SANAGTM_SUPABASE_ANON_KEY" =~ service_role|sb_secret_ ]] && die "that is a SECRET key; use the public anon/publishable key"
+  ask SANAGTM_PLATFORM_SECRETS_KEY "Existing CAREERCLOUD_PLATFORM_SECRETS_KEY (Enter = generate a new one)" "" secret optional
+  if [[ -z "${SANAGTM_PLATFORM_SECRETS_KEY:-}" ]]; then
+    SANAGTM_PLATFORM_SECRETS_KEY=$(fernet_key)
+    warn "generated a NEW platform secrets key. Provider credentials from another install cannot be read with it. Save it in your password manager: sudo grep PLATFORM_SECRETS_KEY $SANAGTM_ETC/sanagtm.env"
+  fi
+  if [[ $tunnel -eq 1 ]]; then ask SANAGTM_TUNNEL_TOKEN "Cloudflare Tunnel token" "" secret; fi
+  : "${SANAGTM_LEGACY_DATABASE_HOSTS:=}"
+
+  mkdir -p "$SANAGTM_ETC" && chmod 700 "$SANAGTM_ETC"
+  local db_pw su_pw
+  db_pw=$(random_hex 24); su_pw=$(random_hex 24)
+  local wss="wss://${SANAGTM_SUPABASE_URL#https://}"
+  write_file "$SANAGTM_ETC/compose.env" 600 <<EOF
+# Non-secret compose settings (sanagtm install, $(date -u +%FT%TZ)).
+SANAGTM_ETC=$SANAGTM_ETC
+SANAGTM_DATA=$SANAGTM_DATA
+SANAGTM_HOSTNAME=$SANAGTM_HOSTNAME
+SANAGTM_SUPABASE_URL=$SANAGTM_SUPABASE_URL
+SANAGTM_SUPABASE_WSS=$wss
+SANAGTM_SUPABASE_ANON_KEY=$SANAGTM_SUPABASE_ANON_KEY
+SANAGTM_VERSION=local
+SANAGTM_INSTALL_BROWSER=${SANAGTM_INSTALL_BROWSER:-0}
+SANAGTM_WORKER_CONCURRENCY=${SANAGTM_WORKER_CONCURRENCY:-2}
+SANAGTM_PG_SHARED_BUFFERS=${SANAGTM_PG_SHARED_BUFFERS:-1GB}
+SANAGTM_PG_CACHE=${SANAGTM_PG_CACHE:-3GB}
+SANAGTM_BACKEND_SUBNET=${SANAGTM_BACKEND_SUBNET:-172.29.40.0/24}
+SANAGTM_WEB_IP=${SANAGTM_WEB_IP:-172.29.40.10}
+SANAGTM_OFFSITE_DIR=${SANAGTM_OFFSITE_DIR:-}
+COMPOSE_PROFILES=$([[ $tunnel -eq 1 ]] && echo tunnel)
+EOF
+  write_file "$SANAGTM_ETC/postgres.env" 600 <<EOF
+POSTGRES_PASSWORD=$su_pw
+SANAGTM_DB_PASSWORD=$db_pw
+EOF
+  write_file "$SANAGTM_ETC/sanagtm.env" 600 <<EOF
+# SANA GTM application settings. SECRETS — root only (0600). Never commit or paste this file.
+CAREERCLOUD_ENV=production
+CAREERCLOUD_SELF_HOSTED=1
+CAREERCLOUD_STORAGE=postgres
+CAREERCLOUD_QUEUE=postgres
+CAREERCLOUD_DATABASE_URL=postgresql://sanagtm:${db_pw}@postgres:5432/sanagtm
+CAREERCLOUD_DB_USER_ROLE=authenticated
+CAREERCLOUD_DB_POOL_MAX=8
+CAREERCLOUD_AUTH_MODE=supabase
+CAREERCLOUD_SUPABASE_URL=$SANAGTM_SUPABASE_URL
+CAREERCLOUD_API_ORIGIN=https://$SANAGTM_HOSTNAME
+CAREERCLOUD_CORS_ORIGINS=https://$SANAGTM_HOSTNAME
+CAREERCLOUD_TRUST_PROXY=cloudflare
+CAREERCLOUD_LOG_FORMAT=json
+CAREERCLOUD_LOG_LEVEL=INFO
+CAREERCLOUD_STORAGE_BACKEND=local
+CAREERCLOUD_PLATFORM_SECRETS_KEY=$SANAGTM_PLATFORM_SECRETS_KEY
+CAREERCLOUD_RUNNER=none
+SANAGTM_LEGACY_DATABASE_HOSTS=$SANAGTM_LEGACY_DATABASE_HOSTS
+# Optional, add as needed (see deploy/selfhost/env/sanagtm.env.example):
+# GEMINI_API_KEY= / ANTHROPIC_API_KEY= / CAREERCLOUD_SMTP_HOST= ...
+EOF
+  if [[ $tunnel -eq 1 ]]; then
+    write_file "$SANAGTM_ETC/tunnel.env" 600 <<<"TUNNEL_TOKEN=$SANAGTM_TUNNEL_TOKEN"
+  else
+    write_file "$SANAGTM_ETC/tunnel.env" 600 <<<"# no tunnel (installed with --no-tunnel)"
+  fi
+  unset SANAGTM_TUNNEL_TOKEN SANAGTM_PLATFORM_SECRETS_KEY
+
+  mkdir -p "$SANAGTM_DATA"/{pgdata,files/tmp,results,run,backups/config}
+  chown -R "$APP_UID:$APP_UID" "$SANAGTM_DATA"/{files,results,run,backups} 2>/dev/null || \
+    [[ "${SANAGTM_ALLOW_NONROOT:-0}" == 1 ]] || die "cannot chown $SANAGTM_DATA (run as root)"
+  chmod 700 "$SANAGTM_DATA/backups/config"
+
+  say "building images (first time: several minutes) …"
+  dc build
+  say "starting …"
+  dc up -d
+  wait_healthy 300 || { dc ps; die "services did not become healthy; see: sanagtm logs"; }
+  cmd_health || true
+  say ""
+  say "SANA GTM is installed."
+  say "  URL:     https://$SANAGTM_HOSTNAME   (sign in with your existing account)"
+  say "  Status:  sudo sanagtm status   |   Logs: sudo sanagtm logs api -f"
+  say "  Backups: nightly by the sanagtm-backup timer; now: sudo sanagtm backup"
+}
+
+wait_healthy() {  # wait_healthy SECONDS
+  local deadline=$((SECONDS + $1)) unhealthy
+  while (( SECONDS < deadline )); do
+    unhealthy=$(dc ps --format '{{.Service}} {{.Health}} {{.State}}' 2>/dev/null \
+      | awk '$1!="migrate" && $1!="" && !($2=="healthy" || ($2=="" && $3=="running")) {print $1}')
+    [[ -z "$unhealthy" ]] && return 0
+    sleep 5
+  done
+  return 1
+}
+
+cmd_start()   { need_root start; require_installed; dc up -d; wait_healthy 300 || warn "not all services are healthy yet (sanagtm health)"; dc ps; }
+cmd_stop()    { need_root stop; require_installed; dc stop; }
+cmd_restart() { need_root restart; require_installed; if [[ $# -gt 0 ]]; then dc restart "$@"; else dc restart; fi; }
+
+cmd_status() {
+  require_installed
+  dc ps
+  say ""
+  app_run migrate python -m cloud.ops.selfhost info 2>/dev/null || warn "database info unavailable"
+}
+
+newest_backup() { ls -1t "$SANAGTM_DATA"/backups/*.dump 2>/dev/null | head -n 1 || true; }
+
+cmd_health() {
+  require_installed
+  local quiet=0 failed=0 report
+  [[ "${1:-}" == --quiet ]] && quiet=1
+  check() {  # check NAME COMMAND...
+    local name=$1; shift
+    if "$@" >/dev/null 2>&1; then report+="  ok    $name"$'\n'; else report+="  FAIL  $name"$'\n'; failed=1; fi
+  }
+  report=""
+  check "containers healthy"   wait_healthy 1
+  check "api /api/v1/health"   dc exec -T api python -m cloud.ops.selfhost health api
+  check "worker heartbeat"     dc exec -T worker python -m cloud.ops.selfhost health worker
+  local newest age_h free_pct
+  newest=$(newest_backup)
+  if [[ -n "$newest" ]]; then
+    age_h=$(( ( $(date +%s) - $(stat -c %Y "$newest") ) / 3600 ))
+    check "backup newer than ${BACKUP_MAX_AGE_H} h (newest: ${age_h} h)" test "$age_h" -lt "$BACKUP_MAX_AGE_H"
+  else
+    report+="  FAIL  no backup yet (sudo sanagtm backup)"$'\n'; failed=1
+  fi
+  free_pct=$(df -P "$SANAGTM_DATA" | awk 'NR==2 {gsub("%","",$5); print 100-$5}')
+  check "data disk ${free_pct}% free (>= 20%)" test "$free_pct" -ge 20
+  if grep -q '^COMPOSE_PROFILES=tunnel' "$SANAGTM_ETC/compose.env" && command -v curl >/dev/null; then
+    check "public https://$(conf SANAGTM_HOSTNAME "$SANAGTM_ETC/compose.env")/api/v1/health" \
+      curl -fsS --max-time 15 "https://$(conf SANAGTM_HOSTNAME "$SANAGTM_ETC/compose.env")/api/v1/health"
+  fi
+  mkdir -p "$SANAGTM_DATA/run"
+  printf '{"checked_at":"%s","ok":%s}\n' "$(date -u +%FT%TZ)" "$([[ $failed -eq 0 ]] && echo true || echo false)" \
+    > "$SANAGTM_DATA/run/health.json" 2>/dev/null || true
+  [[ $quiet -eq 1 && $failed -eq 0 ]] || printf '%s' "$report"
+  return $failed
+}
+
+cmd_logs() { require_installed; local args=(--tail 200); [[ $# -gt 0 ]] && args+=("$@"); dc logs "${args[@]}"; }
+
+cmd_backup() {
+  need_root backup; require_installed
+  local label=manual scheduled=0 offsite
+  while [[ $# -gt 0 ]]; do case $1 in
+    --label) label=$2; shift 2 ;;
+    --scheduled) scheduled=1; label=nightly; shift ;;
+    *) die "unknown option $1" ;;
+  esac; done
+  [[ "$label" =~ ^[a-z0-9-]+$ ]] || die "label: lowercase letters, digits and dashes"
+  offsite=$(conf SANAGTM_OFFSITE_DIR "$SANAGTM_ETC/compose.env")
+  local mounts=(-v "$SANAGTM_DATA/backups:/backups") target=(--local-only)
+  if [[ -n "$offsite" ]]; then
+    [[ -d "$offsite" ]] || die "SANAGTM_OFFSITE_DIR=$offsite is not mounted"
+    mounts+=(-v "$offsite:/offsite"); target=(--offsite /offsite)
+  fi
+  app_run "${mounts[@]}" migrate python deploy/ops/backup/sana_backup.py backup \
+    --pg-bin "$PG_BIN" --out /backups --label "sanagtm-$label" "${target[@]}"
+  # files (uploads, exports) and the configuration. The configuration holds SECRETS: it stays in a
+  # root-only directory, is NOT encrypted, and is not copied off the machine by this command.
+  local ts; ts=$(date -u +%Y%m%dT%H%M%SZ)
+  tar -C "$SANAGTM_DATA" -czf "$SANAGTM_DATA/backups/files_$ts.tar.gz" --exclude=files/tmp files results
+  tar -C "$(dirname "$SANAGTM_ETC")" -czf "$SANAGTM_DATA/backups/config/config_$ts.tar.gz" "$(basename "$SANAGTM_ETC")"
+  chmod 600 "$SANAGTM_DATA"/backups/config/*.tar.gz "$SANAGTM_DATA"/backups/files_*.tar.gz
+  app_run -v "$SANAGTM_DATA/backups:/backups" migrate python deploy/ops/backup/sana_backup.py prune \
+    --dir /backups --daily 14 --weekly 8 --monthly 6
+  keep_newest "$SANAGTM_DATA/backups" 'files_*.tar.gz' 14
+  keep_newest "$SANAGTM_DATA/backups/config" 'config_*.tar.gz' 30
+  if [[ $scheduled -eq 1 ]]; then
+    # the newest dump must restore cleanly into a scratch database before it counts
+    cmd_restore "$(newest_backup)" >/dev/null
+  fi
+}
+
+keep_newest() {  # keep_newest DIR GLOB N — delete all but the N newest matches
+  local dir=$1 glob=$2 n=$3
+  # shellcheck disable=SC2012,SC2086
+  ls -1t "$dir"/$glob 2>/dev/null | tail -n +$((n + 1)) | while read -r old; do rm -f -- "$old"; done
+}
+
+cmd_backups() { ls -1t "$SANAGTM_DATA"/backups/*.dump 2>/dev/null | while read -r f; do printf '%s  %s\n' "$(du -h "$f" | cut -f1)" "$f"; done; }
+
+container_path() {  # host dump path -> path inside the app container (/backups/…)
+  local dump=$1
+  [[ -f "$dump" ]] || die "no such dump: $dump"
+  [[ -f "${dump%.dump}.manifest.json" ]] || die "missing manifest next to the dump: ${dump%.dump}.manifest.json"
+  case "$(readlink -f "$dump")" in
+    "$(readlink -f "$SANAGTM_DATA/backups")"/*) echo "/backups/$(basename "$dump")" ;;
+    *) die "copy the dump and its manifest into $SANAGTM_DATA/backups first" ;;
+  esac
+}
+
+cmd_restore() {
+  need_root restore; require_installed
+  local dump="" live=0
+  while [[ $# -gt 0 ]]; do case $1 in --live) live=1; shift ;; *) dump=$1; shift ;; esac; done
+  [[ -n "$dump" ]] || die "usage: sanagtm restore DUMP [--live]"
+  local inside; inside=$(container_path "$dump")
+  admin_url_export
+  if [[ $live -eq 0 ]]; then
+    app_run -v "$SANAGTM_DATA/backups:/backups:ro" -e SANAGTM_ADMIN_DATABASE_URL migrate \
+      python deploy/ops/backup/sana_backup.py restore-test --dump "$inside" --pg-bin "$PG_BIN" \
+      --server-url-env SANAGTM_ADMIN_DATABASE_URL
+    return
+  fi
+  local host; host=$(conf SANAGTM_HOSTNAME "$SANAGTM_ETC/compose.env")
+  say "This REPLACES the live SANA GTM database with $(basename "$dump")."
+  local typed; read -r -p "Type the hostname ($host) to continue: " typed
+  [[ "$typed" == "$host" ]] || die "not confirmed"
+  say "safety backup of the current data first …"
+  cmd_backup --label pre-restore
+  dc stop api worker web cloudflared 2>/dev/null || true
+  app_run -v "$SANAGTM_DATA/backups:/backups:ro" -e SANAGTM_ADMIN_DATABASE_URL migrate \
+    python deploy/ops/backup/sana_backup.py restore --dump "$inside" --pg-bin "$PG_BIN" \
+    --server-url-env SANAGTM_ADMIN_DATABASE_URL --database sanagtm --owner sanagtm --replace --confirm sanagtm
+  app_run migrate python -m cloud.ops.selfhost stamp-restored   # no-op for this install's own backups
+  dc up -d
+  wait_healthy 300 || warn "not healthy yet (sanagtm health)"
+}
+
+workspace_count() {
+  app_run migrate python - <<'PY' 2>/dev/null || echo error
+import os, psycopg
+with psycopg.connect(os.environ["CAREERCLOUD_DATABASE_URL"]) as c:
+    ok = c.execute("select to_regclass('careercloud.workspaces') is not null").fetchone()[0]
+    print(c.execute("select count(*) from careercloud.workspaces").fetchone()[0] if ok else 0)
+PY
+}
+
+cmd_migrate() {
+  need_root migrate; require_installed
+  local sub=${1:-}; shift || true
+  case $sub in
+    import)
+      local dump=${1:-}; [[ -n "$dump" ]] || die "usage: sanagtm migrate import DUMP"
+      local inside; inside=$(container_path "$dump")
+      local count; count=$(workspace_count | tail -n 1)
+      [[ "$count" == 0 ]] || die "this install already has data (workspaces: $count); migrate import is for a NEW install. Use 'sanagtm restore --live' to replace data deliberately"
+      admin_url_export
+      say "1/4 restore-test into a scratch database …"
+      app_run -v "$SANAGTM_DATA/backups:/backups:ro" -e SANAGTM_ADMIN_DATABASE_URL migrate \
+        python deploy/ops/backup/sana_backup.py restore-test --dump "$inside" --pg-bin "$PG_BIN" \
+        --server-url-env SANAGTM_ADMIN_DATABASE_URL
+      say "2/4 loading into the live database (worker and dashboard stopped) …"
+      dc stop worker api web cloudflared 2>/dev/null || true
+      app_run -v "$SANAGTM_DATA/backups:/backups:ro" -e SANAGTM_ADMIN_DATABASE_URL migrate \
+        python deploy/ops/backup/sana_backup.py restore --dump "$inside" --pg-bin "$PG_BIN" \
+        --server-url-env SANAGTM_ADMIN_DATABASE_URL --database sanagtm --owner sanagtm --replace --confirm sanagtm
+      say "3/4 stamping the restored database for production …"
+      app_run migrate python -m cloud.ops.selfhost stamp-restored
+      say "4/4 starting the API and dashboard (the worker stays OFF until you run: sudo sanagtm start) …"
+      dc up -d api web
+      if grep -q '^COMPOSE_PROFILES=tunnel' "$SANAGTM_ETC/compose.env"; then dc up -d cloudflared; fi
+      say "Imported. Check the data in the browser, then: sudo sanagtm migrate verify ${dump%.dump}.manifest.json"
+      ;;
+    verify)
+      local manifest=${1:-}; [[ -f "$manifest" ]] || die "usage: sanagtm migrate verify MANIFEST"
+      local inside="/backups/$(basename "$manifest")"
+      app_run -v "$SANAGTM_DATA/backups:/backups:ro" migrate \
+        python deploy/ops/backup/sana_backup.py verify --manifest "$inside"
+      ;;
+    *) die "usage: sanagtm migrate import DUMP | verify MANIFEST" ;;
+  esac
+}
+
+cmd_capacity() {
+  require_installed
+  say "== database"; app_run migrate python -m cloud.ops.selfhost info || true
+  say "== disk ($SANAGTM_DATA)"; df -h "$SANAGTM_DATA"
+  say "== data directories"; du -sh "$SANAGTM_DATA"/{pgdata,files,results,backups} 2>/dev/null || true
+  say "== docker"; "$DOCKER" system df 2>/dev/null || true
+  if [[ -f "$SANAGTM_DATA/run/capacity.csv" ]]; then say "== growth (last 8 days)"; tail -n 8 "$SANAGTM_DATA/run/capacity.csv"; fi
+}
+
+cmd_capacity_record() {  # appended daily by the timer: date,db_mb,data_used_kb,data_free_kb
+  require_installed
+  local db_mb; db_mb=$(app_run migrate python -m cloud.ops.selfhost info 2>/dev/null \
+    | python3 -c 'import json,sys; print(json.loads(sys.stdin.read().strip().splitlines()[-1])["database_mb"])' 2>/dev/null || echo "")
+  df -P "$SANAGTM_DATA" | awk -v d="$(date -u +%F)" -v m="$db_mb" 'NR==2 {print d","m","$3","$4}' >> "$SANAGTM_DATA/run/capacity.csv"
+}
+
+cmd_update() {
+  need_root update; require_installed
+  local ref=""
+  [[ "${1:-}" == --to ]] && ref=${2:-}
+  local before; before=$(git -C "$SANAGTM_APP" rev-parse HEAD)
+  say "backup before updating …"; cmd_backup --label pre-update
+  git -C "$SANAGTM_APP" fetch --tags --quiet
+  if [[ -n "$ref" ]]; then git -C "$SANAGTM_APP" checkout --quiet "$ref"; else git -C "$SANAGTM_APP" pull --ff-only --quiet; fi
+  say "updated $before -> $(git -C "$SANAGTM_APP" rev-parse HEAD)"
+  dc build
+  dc up -d     # the migrate service applies pending migrations before the API and worker start
+  if ! wait_healthy 300; then
+    warn "unhealthy after the update. Roll back: git -C $SANAGTM_APP checkout $before && sudo sanagtm start"
+    warn "if a migration ran, also: sudo sanagtm restore \$(ls -1t $SANAGTM_DATA/backups/*pre-update*.dump | head -1) --live"
+    return 1
+  fi
+  cmd_health || true
+}
+
+cmd_selftest() {
+  need_root selftest; require_installed
+  admin_url_export
+  # The test suite creates and drops its own cc_test_* databases on the compose PostgreSQL.
+  export CAREERCLOUD_TEST_DATABASE_URL="$SANAGTM_ADMIN_DATABASE_URL"
+  app_run -e CAREERCLOUD_TEST_DATABASE_URL -e CAREERCLOUD_ENV=test -e CAREERCLOUD_SELF_HOSTED=0 \
+    -e CAREERCLOUD_DATABASE_URL= -e CAREERCLOUD_QUEUE=inline -e CAREERCLOUD_STORAGE=memory migrate \
+    python -m unittest discover -s cloud/tests -t .
+}
+
+cmd_uninstall() {
+  need_root uninstall; require_installed
+  local purge=0; [[ "${1:-}" == --purge-data ]] && purge=1
+  local host; host=$(conf SANAGTM_HOSTNAME "$SANAGTM_ETC/compose.env")
+  if [[ $purge -eq 1 ]]; then
+    local newest age_h typed
+    newest=$(newest_backup)
+    [[ -n "$newest" ]] || die "no backup exists; refusing to delete data"
+    age_h=$(( ( $(date +%s) - $(stat -c %Y "$newest") ) / 3600 ))
+    (( age_h < 24 )) || die "the newest backup is ${age_h} h old; take one (sanagtm backup) and copy it off this machine first"
+    say "PERMANENTLY deletes $SANAGTM_DATA (database, files, backups on this VM) and $SANAGTM_ETC."
+    read -r -p "Type 'DELETE $host' to continue: " typed
+    [[ "$typed" == "DELETE $host" ]] || die "not confirmed"
+  fi
+  dc down --rmi local --remove-orphans
+  if [[ $purge -eq 1 ]]; then rm -rf --one-file-system "$SANAGTM_DATA" "$SANAGTM_ETC"; say "data and configuration deleted";
+  else say "containers and images removed; data kept in $SANAGTM_DATA, configuration in $SANAGTM_ETC"; fi
+}
+
+cmd_version() { git -C "$SANAGTM_APP" describe --tags --always --dirty 2>/dev/null || echo unknown; }
+
+main() {
+  local cmd=${1:-help}; shift || true
+  case $cmd in
+    install) cmd_install "$@" ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart "$@" ;;
+    status) cmd_status ;;
+    health) cmd_health "$@" ;;
+    logs) cmd_logs "$@" ;;
+    backup) cmd_backup "$@" ;;
+    backups) cmd_backups ;;
+    restore) cmd_restore "$@" ;;
+    migrate) cmd_migrate "$@" ;;
+    capacity) cmd_capacity ;;
+    capacity-record) cmd_capacity_record ;;
+    update) cmd_update "$@" ;;
+    selftest) cmd_selftest ;;
+    uninstall) cmd_uninstall "$@" ;;
+    version) cmd_version ;;
+    help|-h|--help) sed -n '2,24p' "$0" | sed 's/^# \{0,1\}//' ;;
+    *) die "unknown command '$cmd' (sanagtm help)" ;;
+  esac
+}
+
+main "$@"

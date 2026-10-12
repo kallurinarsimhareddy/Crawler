@@ -15,6 +15,7 @@ from cloud.intel.platform import Platform
 from cloud.intel.store.memory import MemoryStore
 from cloud.intel.tasks import worker as worker_mod
 from cloud.shared.queue import InMemoryJobQueue, RedisJobQueue
+from cloud.tests._optional import needs_module, needs_repo_files
 
 QUOTA = "max requests limit exceeded. Limit: 500000, Usage: 500003."
 
@@ -112,6 +113,7 @@ class IdleTests(Harness):
 
 
 class OutageRecoveryTests(Harness):
+    @needs_module("redis", "fakeredis")
     def test_tasks_submitted_while_the_queue_is_down_run_once_after_recovery(self) -> None:
         import redis
 

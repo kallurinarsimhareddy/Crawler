@@ -1,0 +1,8 @@
+[Unit]
+Description=SANA GTM health check (writes /srv/sanagtm/run/health.json)
+After=docker.service
+ConditionPathExists=/etc/sanagtm/compose.env
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sanagtm health --quiet

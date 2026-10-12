@@ -106,6 +106,12 @@ class Settings:
     #: A worker whose last heartbeat is older than this counts as offline on
     #: ``/status``. Three missed 30 s beats, so a slow tick is not an outage.
     worker_stale_after_seconds: float = 180.0
+    #: Self-hosted single machine (deploy/selfhost): local file storage on the data disk and a
+    #: database on the private compose network are acceptable for staging/production.
+    self_hosted: bool = False
+    #: With ``trust_proxy=cloudflare``: reverse-proxy peers (besides loopback) whose
+    #: CF-Connecting-IP is believed, as CIDRs — e.g. the compose network's web container.
+    trusted_proxies: Tuple[str, ...] = ()
 
     @property
     def deployed(self) -> bool:
@@ -214,11 +220,22 @@ def load_settings(env: Optional[Mapping[str, str]] = None) -> Settings:
         worker_stale_after_seconds=env_float(
             env, "CAREERCLOUD_WORKER_STALE_AFTER_SECONDS", 180.0, minimum=5.0, maximum=3600.0
         ),
+        self_hosted=env_bool(env, "CAREERCLOUD_SELF_HOSTED", False),
+        trusted_proxies=_networks(env_list(env, "CAREERCLOUD_TRUSTED_PROXIES", ())),
     )
     validate_settings(settings)
     for name in settings.unused_placeholders():
         log.warning("%s is set but has no effect with this configuration", name)
     return settings
+
+
+def _networks(values: Tuple[str, ...]) -> Tuple[str, ...]:
+    import ipaddress
+
+    try:
+        return tuple(str(ipaddress.ip_network(v, strict=False)) for v in values)
+    except ValueError as error:
+        raise ValueError(f"CAREERCLOUD_TRUSTED_PROXIES: {error}") from error
 
 
 def validate_settings(settings: Settings) -> None:
@@ -236,8 +253,9 @@ def validate_settings(settings: Settings) -> None:
             raise ValueError("CAREERCLOUD_SUPABASE_URL must be an https:// URL")
     if deployed and settings.storage != "postgres":
         raise ValueError(f"{settings.environment} requires CAREERCLOUD_STORAGE=postgres")
-    if deployed and settings.queue != "redis":
-        raise ValueError(f"{settings.environment} requires CAREERCLOUD_QUEUE=redis")
+    # Both queues are durable (tasks survive an API restart); "inline" runs tasks in the API process.
+    if deployed and settings.queue not in ("redis", "postgres"):
+        raise ValueError(f"{settings.environment} requires CAREERCLOUD_QUEUE=redis or postgres")
     if settings.storage == "postgres" and not settings.database_url:
         raise ValueError("CAREERCLOUD_STORAGE=postgres needs CAREERCLOUD_DATABASE_URL")
     if settings.queue == "redis" and not settings.redis_url:

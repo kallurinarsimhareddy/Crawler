@@ -1,0 +1,4 @@
+# Only for `sanagtm selftest` (the platform test suite inside the image, against a scratch
+# database on the compose PostgreSQL). Not installed in the default image.
+httpx2==2.13.1
+psutil==7.2.2

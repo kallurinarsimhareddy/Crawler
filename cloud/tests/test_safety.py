@@ -120,6 +120,22 @@ class TestDeploymentSettings(unittest.TestCase):
         )
         self.assertEqual((settings.storage, settings.queue, settings.auth_mode), ("postgres", "redis", "supabase"))
 
+    def test_production_accepts_the_postgres_queue_without_redis(self) -> None:
+        settings = load_settings({
+            "CAREERCLOUD_ENV": "production", "CAREERCLOUD_SUPABASE_URL": "https://abcdefgh.supabase.co",
+            "CAREERCLOUD_STORAGE": "postgres", "CAREERCLOUD_DATABASE_URL": "postgresql://h/db",
+            "CAREERCLOUD_QUEUE": "postgres",
+        })
+        self.assertEqual((settings.environment, settings.queue, settings.redis_url), ("production", "postgres", None))
+
+    def test_production_refuses_the_inline_queue(self) -> None:
+        with self.assertRaisesRegex(ValueError, "redis or postgres"):
+            load_settings({
+                "CAREERCLOUD_ENV": "production", "CAREERCLOUD_SUPABASE_URL": "https://abcdefgh.supabase.co",
+                "CAREERCLOUD_STORAGE": "postgres", "CAREERCLOUD_DATABASE_URL": "postgresql://h/db",
+                "CAREERCLOUD_QUEUE": "inline",
+            })
+
     def test_queue_redis_requires_postgres(self) -> None:
         with self.assertRaises(ValueError):
             load_settings({"CAREERCLOUD_QUEUE": "redis", "CAREERCLOUD_REDIS_URL": "redis://127.0.0.1:6390"})

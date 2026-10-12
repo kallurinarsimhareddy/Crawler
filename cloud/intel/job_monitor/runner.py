@@ -99,6 +99,8 @@ def _finish(platform: Any, ctx: Ctx, monitor: Mapping[str, Any], run_id: str, st
             monitor_changes["last_full_sweep_at"] = now
             if auto:
                 monitor_changes["next_full_sweep_at"] = now + timedelta(days=int(monitor.get("full_sweep_days") or 7))
+        elif auto and status == "cancelled":  # a user stopped it: wait a whole cycle, not until tomorrow
+            monitor_changes["next_full_sweep_at"] = now + timedelta(days=int(monitor.get("full_sweep_days") or 7))
         elif auto:  # try the sweep again with tomorrow's run; nothing was closed
             monitor_changes["next_full_sweep_at"] = now + timedelta(days=1)
     store.update(ctx, "job_source_monitors", monitor["id"], monitor_changes)

@@ -7,13 +7,26 @@ exactly what is wrong when it is not.
 
 from __future__ import annotations
 
-from typing import List
+import ipaddress
+from typing import List, Optional
 from urllib.parse import parse_qs, urlsplit
 
 from cloud.api.settings import Settings
 from cloud.shared.environment import ResourceIdentity
 
-__all__ = ["deployment_problems", "identity_of"]
+__all__ = ["deployment_problems", "identity_of", "is_private_host"]
+
+
+def is_private_host(host: Optional[str]) -> bool:
+    """Loopback, a private/link-local address, or a bare service name (``postgres``) that only
+    resolves inside the compose network. Any dotted public name is not private."""
+    if not host:
+        return False
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return "." not in host
+    return address.is_loopback or address.is_private or address.is_link_local
 
 
 def identity_of(settings: Settings) -> ResourceIdentity:
@@ -50,21 +63,28 @@ def deployment_problems(settings: Settings) -> List[str]:
 
     if settings.database_url:
         query = parse_qs(urlsplit(settings.database_url).query)
+        # Self-hosted: PostgreSQL on the machine's private compose network never leaves the host.
+        private = settings.self_hosted and is_private_host(urlsplit(settings.database_url).hostname)
         need(
-            query.get("sslmode", [""])[0] in ("require", "verify-ca", "verify-full"),
-            "CAREERCLOUD_DATABASE_URL must set sslmode=require (or verify-full)",
+            private or query.get("sslmode", [""])[0] in ("require", "verify-ca", "verify-full"),
+            "CAREERCLOUD_DATABASE_URL must set sslmode=require (or verify-full)"
+            + ("" if not settings.self_hosted else " unless the database is on the private network"),
         )
     if settings.redis_url:
         parts = urlsplit(settings.redis_url)
         need(parts.scheme == "rediss", "CAREERCLOUD_REDIS_URL must use TLS (rediss://)")
         need(bool(parts.password), "CAREERCLOUD_REDIS_URL must authenticate (password in the URL)")
 
-    need(settings.storage_backend == "s3", f"{env} requires CAREERCLOUD_STORAGE_BACKEND=s3 (private bucket)")
+    if settings.self_hosted and settings.storage_backend == "local":
+        # The machine's own data disk; backed up with the database (deploy/selfhost).
+        need(settings.results_dir.is_absolute(), "CAREERCLOUD_RESULTS_DIR must be an absolute path")
+    else:
+        need(settings.storage_backend == "s3", f"{env} requires CAREERCLOUD_STORAGE_BACKEND=s3 (private bucket)")
+        need(bool(settings.results_namespace), "CAREERCLOUD_RESULTS_NAMESPACE is required")
     if settings.storage_backend == "s3":
         need(bool(settings.s3_endpoint and settings.s3_endpoint.startswith("https://")), "CAREERCLOUD_S3_ENDPOINT must be https://")
         for name in ("s3_bucket", "s3_region", "s3_access_key_id", "s3_secret_access_key"):
             need(bool(getattr(settings, name)), f"CAREERCLOUD_{name.upper()} is required")
-    need(bool(settings.results_namespace), "CAREERCLOUD_RESULTS_NAMESPACE is required")
 
     need(bool(settings.api_origin and settings.api_origin.startswith("https://")), "CAREERCLOUD_API_ORIGIN must be an https:// origin")
     need(bool(settings.cors_origins), "CAREERCLOUD_CORS_ORIGINS must name the dashboard origin")

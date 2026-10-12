@@ -106,15 +106,7 @@ def get_run(run_id: str, ctx: Ctx = Depends(workspace_ctx), platform: Platform =
 
 @router.post(W + "/job-monitor-runs/{run_id}/cancel")
 def cancel_run(run_id: str, ctx: Ctx = Depends(write_ctx), platform: Platform = Depends(get_platform)):
-    def go():
-        run = platform.store.get(ctx, "job_monitor_runs", run_id)
-        if run.get("task_id"):
-            platform.tasks.cancel(ctx, run["task_id"])
-        if run["status"] == "queued":
-            run = platform.store.update(ctx, "job_monitor_runs", run_id, {"status": "cancelled",
-                                                                          "stop_reason": "cancelled before it started"})
-        return run
-    return _call(go)
+    return _call(lambda: _svc(platform).cancel_run(ctx, run_id))
 
 
 # --- jobs ------------------------------------------------------------------------------------

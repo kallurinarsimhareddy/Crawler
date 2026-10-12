@@ -13,8 +13,9 @@ are per process and reset on restart.
 
 **Client IP.** Behind Cloudflare Tunnel every connection comes from 127.0.0.1,
 so the real client is taken from ``CF-Connecting-IP``, but only when the peer
-is loopback and ``CAREERCLOUD_TRUST_PROXY=cloudflare``. Otherwise the header is
-ignored, so it cannot be spoofed.
+is loopback (or in ``CAREERCLOUD_TRUSTED_PROXIES``, e.g. the self-hosted web container
+that sits between cloudflared and the API) and ``CAREERCLOUD_TRUST_PROXY=cloudflare``.
+Otherwise the header is ignored, so it cannot be spoofed.
 """
 
 from __future__ import annotations
@@ -23,7 +24,8 @@ import logging
 import threading
 import time
 import uuid
-from typing import Callable, Dict, Tuple
+import ipaddress
+from typing import Callable, Dict, Sequence, Tuple
 
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
@@ -67,9 +69,19 @@ class RateLimiter:
         return allowed, wait
 
 
-def client_ip(request: Request, trust_proxy: str) -> str:
+def _trusted_peer(peer: str, trusted: Sequence[str]) -> bool:
+    if peer in _LOOPBACK:
+        return True
+    try:
+        address = ipaddress.ip_address(peer)
+    except ValueError:
+        return False
+    return any(address in ipaddress.ip_network(net) for net in trusted)
+
+
+def client_ip(request: Request, trust_proxy: str, trusted: Sequence[str] = ()) -> str:
     peer = request.client.host if request.client else "unknown"
-    if trust_proxy == "cloudflare" and peer in _LOOPBACK:
+    if trust_proxy == "cloudflare" and _trusted_peer(peer, trusted):
         forwarded = request.headers.get("cf-connecting-ip", "").strip()
         if forwarded:
             return forwarded
@@ -77,15 +89,16 @@ def client_ip(request: Request, trust_proxy: str) -> str:
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, *, limiter: RateLimiter, trust_proxy: str, exempt_paths=("/api/v1/health",)) -> None:
+    def __init__(self, app, *, limiter: RateLimiter, trust_proxy: str, trusted: Sequence[str] = (),
+                 exempt_paths=("/api/v1/health",)) -> None:
         super().__init__(app)
         self._limiter = limiter
-        self._trust = trust_proxy
+        self._trust, self._trusted = trust_proxy, tuple(trusted)
         self._exempt = frozenset(exempt_paths)
 
     async def dispatch(self, request: Request, call_next):
         if request.method != "OPTIONS" and request.url.path not in self._exempt:
-            allowed, wait = self._limiter.allow(f"ip:{client_ip(request, self._trust)}")
+            allowed, wait = self._limiter.allow(f"ip:{client_ip(request, self._trust, self._trusted)}")
             if not allowed:
                 return JSONResponse(
                     {"detail": "too many requests; slow down"},
@@ -114,9 +127,9 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 class AccessLogMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, *, trust_proxy: str) -> None:
+    def __init__(self, app, *, trust_proxy: str, trusted: Sequence[str] = ()) -> None:
         super().__init__(app)
-        self._trust = trust_proxy
+        self._trust, self._trusted = trust_proxy, tuple(trusted)
 
     async def dispatch(self, request: Request, call_next):
         request_id = uuid.uuid4().hex[:16]
@@ -141,7 +154,7 @@ class AccessLogMiddleware(BaseHTTPMiddleware):
                         "route": getattr(route, "path", None),
                         "status": status,
                         "duration_ms": round((time.perf_counter() - started) * 1000, 1),
-                        "client_ip": client_ip(request, self._trust),
+                        "client_ip": client_ip(request, self._trust, self._trusted),
                         "user_id": getattr(request.state, "user_id", None),
                     }
                 },

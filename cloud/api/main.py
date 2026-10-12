@@ -232,8 +232,9 @@ def create_app(
             capacity=settings.rate_limit_per_minute, refill_per_second=settings.rate_limit_per_minute / 60
         ),
         trust_proxy=settings.trust_proxy,
+        trusted=settings.trusted_proxies,
     )
-    app.add_middleware(AccessLogMiddleware, trust_proxy=settings.trust_proxy)
+    app.add_middleware(AccessLogMiddleware, trust_proxy=settings.trust_proxy, trusted=settings.trusted_proxies)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),

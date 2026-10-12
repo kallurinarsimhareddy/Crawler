@@ -13,6 +13,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
+from cloud.tests._optional import needs_module, needs_repo_files
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -57,6 +58,7 @@ class StatusOnPostgresQueueTests(unittest.TestCase):
         self.assertFalse(client.get("/api/v1/status").json()["worker"]["online"])
 
 
+@needs_repo_files("deploy/windows/sana-gtm/healthcheck.py")
 class HealthcheckWithoutRedisTests(unittest.TestCase):
     def test_postgres_queue_needs_no_redis(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

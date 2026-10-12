@@ -583,6 +583,78 @@ class MonitorTests(_Base):
         self.assertNotIn(page_url(1), self.calls())                 # pages 1-2 were not read again
         self.assertEqual(self.store.count(self.ctx, "job_postings", {}), 12)
 
+    def paused_full_sweep(self, **monitor_kw: Any) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """A full sweep paused after page 2 — the production state of 2026-10-02."""
+        self.pages.update(site([job(n) for n in range(1, 13)]))
+        monitor = self.monitor(**monitor_kw)
+        run = self.svc.start_run(self.ctx, monitor["id"], mode="full")
+        # should_pause is asked twice per page (before and after reading it): pause after page 2
+        with mock.patch("cloud.intel.tasks.service.TaskReporter.should_pause", side_effect=[False] * 4 + [True] * 10):
+            run_task_inline(self.platform, self.ctx.workspace_id, run["task_id"])
+        run = self.store.get(self.ctx, "job_monitor_runs", run["id"])
+        task = self.store.get(self.ctx, "platform_tasks", run["task_id"])
+        self.assertEqual((run["status"], task["status"], run["pages"]), ("running", "paused", 2))
+        return monitor, run
+
+    def test_a_paused_run_blocks_the_schedule_and_says_so(self) -> None:
+        monitor, run = self.paused_full_sweep()
+        now = datetime.now(timezone.utc)
+        self.store.update(self.ctx, "job_source_monitors", monitor["id"], {"next_run_at": now - timedelta(minutes=1)})
+        self.assertEqual(self.svc.tick(self.ctx), 0)
+        notes = [n for n in self.store.all(self.ctx, "notifications", {"kind": "job_monitor"})
+                 if "scheduled run skipped" in n["title"]]
+        self.assertEqual(len(notes), 1)
+        self.assertIn("paused", notes[0]["body"])
+        self.assertEqual(self.store.count(self.ctx, "job_monitor_runs", {"monitor_id": monitor["id"]}), 1)
+
+    def test_a_working_run_blocks_the_schedule_quietly(self) -> None:
+        self.pages.update(site([job(1)]))
+        monitor = self.monitor()
+        self.svc.start_run(self.ctx, monitor["id"])                 # queued, not yet picked up
+        now = datetime.now(timezone.utc)
+        self.store.update(self.ctx, "job_source_monitors", monitor["id"], {"next_run_at": now - timedelta(minutes=1)})
+        self.assertEqual(self.svc.tick(self.ctx), 0)
+        self.assertFalse([n for n in self.store.all(self.ctx, "notifications", {"kind": "job_monitor"})
+                          if "scheduled run skipped" in n["title"]])
+
+    def test_cancelling_a_paused_run_finishes_it_and_unblocks_the_schedule(self) -> None:
+        monitor, run = self.paused_full_sweep(auto_full_sweep=False)
+        stored = self.store.count(self.ctx, "job_postings", {})
+        self.assertEqual(stored, 6)
+        cancelled = self.svc.cancel_run(self.ctx, run["id"])
+        self.assertEqual((cancelled["status"], cancelled["stop_reason"]), ("cancelled", "cancelled by a user"))
+        self.assertEqual(self.store.get(self.ctx, "platform_tasks", run["task_id"])["status"], "cancelled")
+        self.assertEqual(self.store.count(self.ctx, "job_postings", {}), stored)          # nothing deleted
+        self.assertEqual(self.store.count(self.ctx, "job_postings", {"status": ["closed", "expired"]}), 0)
+        self.assertEqual(self.store.count(self.ctx, "job_posting_changes", {"change": ["closed", "expired"]}), 0)
+        after = self.store.get(self.ctx, "job_source_monitors", monitor["id"])
+        self.assertIsNone(after["next_full_sweep_at"])               # auto sweeps stay off
+        self.assertEqual(after["last_run_status"], "cancelled")
+        self.assertIsNone(self.svc.active_run(self.ctx, monitor["id"]))
+        self.store.update(self.ctx, "job_source_monitors", monitor["id"],
+                          {"next_run_at": datetime.now(timezone.utc) - timedelta(minutes=1)})
+        self.assertEqual(self.svc.tick(self.ctx), 1)
+        nxt = self.store.first(self.ctx, "job_monitor_runs", {"monitor_id": monitor["id"], "status": "queued"})
+        self.assertEqual((nxt["mode"], nxt["trigger"]), ("incremental", "schedule"))
+        with self.assertRaises(ConflictError):
+            self.svc.cancel_run(self.ctx, run["id"])                 # already finished
+
+    def test_a_cancelled_sweep_waits_a_whole_cycle_when_auto_sweeps_are_on(self) -> None:
+        monitor, run = self.paused_full_sweep()
+        self.assertIsNotNone(monitor["next_full_sweep_at"])
+        before = datetime.now(timezone.utc)
+        self.svc.cancel_run(self.ctx, run["id"])
+        after = self.store.get(self.ctx, "job_source_monitors", monitor["id"])
+        self.assertGreaterEqual(after["next_full_sweep_at"], before + timedelta(days=monitor["full_sweep_days"] or 7))
+
+    def test_disabling_auto_sweeps_touches_only_the_sweep_date(self) -> None:
+        monitor = self.monitor()
+        self.assertIsNotNone(monitor["next_full_sweep_at"])
+        updated = self.svc.update_monitor(self.ctx, monitor["id"], {"auto_full_sweep": False})
+        self.assertIsNone(updated["next_full_sweep_at"])
+        unchanged = {k: v for k, v in monitor.items() if k not in ("next_full_sweep_at", "updated_at", "version")}
+        self.assertEqual({k: updated[k] for k in unchanged}, unchanged)
+
     def test_cancel_marks_the_run(self) -> None:
         self.pages.update(site([job(n) for n in range(1, 7)]))
         monitor = self.monitor()
@@ -854,6 +926,15 @@ class ApiTests(unittest.TestCase):
         self.assertIn(self.mallory.get(self.base + "/job-feed").status_code, (403, 404))
         self.assertIn(self.mallory.post(self.base + "/job-monitors", json={"source_url": START}).status_code,
                       (403, 404))
+
+    def test_cancel_over_http(self) -> None:
+        monitor = self.client.post(self.base + "/job-monitors", json={"source_url": START}).json()
+        run = self.client.post(self.base + f"/job-monitors/{monitor['id']}/run", json={"mode": "full"}).json()
+        r = self.client.post(self.base + f"/job-monitor-runs/{run['id']}/cancel")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["status"], "cancelled")
+        self.assertEqual(self.client.post(self.base + f"/job-monitor-runs/{run['id']}/cancel").status_code, 409)
+        self.assertIn(self.mallory.post(self.base + f"/job-monitor-runs/{run['id']}/cancel").status_code, (403, 404))
 
 
 if __name__ == "__main__":

@@ -56,3 +56,22 @@ logs/
 # SANA GTM Windows installer build output
 deploy/windows/installer/build/
 deploy/windows/installer/dist/
+
+# --- self-hosted package (deploy/selfhost) ---------------------------------------
+# The "env/" rule above is for virtualenvs; the package ships only an example file here.
+!deploy/selfhost/env/
+deploy/selfhost/env/*
+!deploy/selfhost/env/*.example
+# Database dumps, backups, keys and certificates never belong in the repository.
+*.dump
+*.dump.partial
+*.manifest.json
+*.backup
+*.sql.gz
+backups/
+sana-backups/
+*.pem
+*.key
+*.p12
+*.pfx
+answers.env

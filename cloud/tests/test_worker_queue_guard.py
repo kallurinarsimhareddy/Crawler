@@ -18,6 +18,7 @@ from cloud.intel.platform import Platform
 from cloud.intel.store.memory import MemoryStore
 from cloud.intel.tasks import worker as worker_mod
 from cloud.shared.queue import InMemoryJobQueue, QueueUnavailable, queue_unavailable
+from cloud.tests._optional import needs_module, needs_repo_files
 
 QUOTA = "max requests limit exceeded. Limit: 500000, Usage: 500003. See https://upstash.com/docs/x for details"
 
@@ -49,6 +50,7 @@ class FlakyQueue(InMemoryJobQueue):
 
 
 class ClassificationTests(unittest.TestCase):
+    @needs_module("redis")
     def test_quota_and_connection_errors_are_infrastructure(self) -> None:
         import redis
 
@@ -65,6 +67,7 @@ class ClassificationTests(unittest.TestCase):
         self.assertIsNone(queue_unavailable(ValueError("bad")))
 
 
+@needs_module("redis", "fakeredis")
 class WorkerGuardTests(unittest.TestCase):
     def setUp(self) -> None:
         import redis

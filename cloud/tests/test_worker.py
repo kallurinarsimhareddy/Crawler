@@ -28,6 +28,7 @@ from cloud.worker.fake_runner import FakeRunner
 from cloud.worker.results import ResultWriter
 from cloud.worker.runner import JobRunner, RunResult
 from cloud.worker.worker import Worker, WorkerConfig
+from cloud.tests._optional import needs_module, needs_repo_files
 
 OWNER = str(uuid.uuid4())
 
@@ -497,6 +498,7 @@ class TestWorkerPresence(WorkerHarness):
         self.assertIs(self.job(job_id).status, JobStatus.COMPLETED)
 
 
+@needs_module("redis", "fakeredis")
 class TestWorkerOnPostgresAndRedis(PostgresTestCase):
     """The same guarantees on real PostgreSQL and the Redis queue scripts."""
 

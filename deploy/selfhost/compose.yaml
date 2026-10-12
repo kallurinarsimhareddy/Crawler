@@ -1,0 +1,148 @@
+# SANA GTM, self-hosted: PostgreSQL 17 + API + platform worker + dashboard + Cloudflare Tunnel.
+# Managed by the `sanagtm` CLI (deploy/selfhost/bin/sanagtm); it always runs
+#   docker compose -p sanagtm -f deploy/selfhost/compose.yaml --env-file /etc/sanagtm/compose.env …
+#
+# No port is published on the host: the only way in is the outbound Cloudflare Tunnel to "web".
+# PostgreSQL is reachable only on the private "backend" network. No Redis anywhere: background
+# work uses the PostgreSQL task queue (CAREERCLOUD_QUEUE=postgres).
+
+name: sanagtm
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "5" }
+
+x-app: &app
+  image: sanagtm-app:${SANAGTM_VERSION:-local}
+  build:
+    context: ../..
+    dockerfile: deploy/selfhost/Dockerfile
+    args:
+      INSTALL_BROWSER: ${SANAGTM_INSTALL_BROWSER:-0}
+  env_file: ["${SANAGTM_ETC:-/etc/sanagtm}/sanagtm.env"]
+  environment:
+    CAREERCLOUD_PLATFORM_FILES_DIR: /srv/sanagtm/files
+    CAREERCLOUD_RESULTS_DIR: /srv/sanagtm/results
+    CAREERCLOUD_WORKER_STATE_FILE: /srv/sanagtm/run/worker-state.json
+    CAREERCLOUD_RESOURCE_REGISTRY: /srv/sanagtm/run/resources.json
+    CAREERCLOUD_TRUSTED_PROXIES: ${SANAGTM_WEB_IP:-172.29.40.10}/32
+    TMPDIR: /srv/sanagtm/files/tmp
+  volumes:
+    - ${SANAGTM_DATA:-/srv/sanagtm}/files:/srv/sanagtm/files
+    - ${SANAGTM_DATA:-/srv/sanagtm}/results:/srv/sanagtm/results
+    - ${SANAGTM_DATA:-/srv/sanagtm}/run:/srv/sanagtm/run
+  networks: [backend]
+  security_opt: ["no-new-privileges:true"]
+  cap_drop: [ALL]
+  logging: *logging
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: ${SANAGTM_POSTGRES_IMAGE:-postgres:17-bookworm}
+    env_file: ["${SANAGTM_ETC:-/etc/sanagtm}/postgres.env"]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data/pgdata
+    command: >-
+      postgres
+      -c shared_buffers=${SANAGTM_PG_SHARED_BUFFERS:-1GB}
+      -c effective_cache_size=${SANAGTM_PG_CACHE:-3GB}
+      -c work_mem=16MB -c maintenance_work_mem=256MB
+      -c max_connections=60 -c max_wal_size=2GB -c wal_compression=on -c checkpoint_timeout=15min
+      -c password_encryption=scram-sha-256 -c log_min_duration_statement=2000
+      -c autovacuum_vacuum_scale_factor=0.05 -c autovacuum_analyze_scale_factor=0.05
+    shm_size: 256m
+    volumes:
+      - ${SANAGTM_DATA:-/srv/sanagtm}/pgdata:/var/lib/postgresql/data
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d sanagtm -q"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks: [backend]
+    stop_grace_period: 60s
+    logging: *logging
+    restart: unless-stopped
+
+  # One-shot: wait for PostgreSQL, apply pending migrations, stamp a fresh database, write the
+  # resource registry. The API and worker start only after it succeeds.
+  migrate:
+    <<: *app
+    command: ["python", "-m", "cloud.ops.selfhost", "prepare"]
+    restart: "no"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    <<: *app
+    command: ["uvicorn", "cloud.api.main:app", "--host", "0.0.0.0", "--port", "8100", "--no-server-header"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD", "python", "-m", "cloud.ops.selfhost", "health", "api"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  worker:
+    <<: *app
+    command: ["python", "-m", "cloud.intel.tasks.worker", "--concurrency", "${SANAGTM_WORKER_CONCURRENCY:-2}",
+              "--state-file", "/srv/sanagtm/run/worker-state.json"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    stop_grace_period: 90s      # the worker releases its task (attempt refunded) before exiting
+    healthcheck:
+      test: ["CMD", "python", "-m", "cloud.ops.selfhost", "health", "worker"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 120s
+
+  web:
+    image: sanagtm-web:${SANAGTM_VERSION:-local}
+    build:
+      context: ../..
+      dockerfile: deploy/selfhost/web/Dockerfile
+      args:
+        VITE_SUPABASE_URL: ${SANAGTM_SUPABASE_URL:?set SANAGTM_SUPABASE_URL in /etc/sanagtm/compose.env}
+        VITE_SUPABASE_ANON_KEY: ${SANAGTM_SUPABASE_ANON_KEY:?set SANAGTM_SUPABASE_ANON_KEY in /etc/sanagtm/compose.env}
+    environment:
+      SANAGTM_SUPABASE_URL: ${SANAGTM_SUPABASE_URL}
+      SANAGTM_SUPABASE_WSS: ${SANAGTM_SUPABASE_WSS:-}
+    depends_on:
+      api: { condition: service_healthy }
+    networks:
+      backend: { ipv4_address: "${SANAGTM_WEB_IP:-172.29.40.10}" }
+      edge: {}
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    restart: unless-stopped
+
+  cloudflared:
+    image: ${SANAGTM_CLOUDFLARED_IMAGE:-cloudflare/cloudflared:latest}
+    command: ["tunnel", "--no-autoupdate", "run"]
+    env_file: ["${SANAGTM_ETC:-/etc/sanagtm}/tunnel.env"]      # TUNNEL_TOKEN=…
+    depends_on:
+      web: { condition: service_healthy }
+    networks: [edge]
+    profiles: ["tunnel"]
+    security_opt: ["no-new-privileges:true"]
+    logging: *logging
+    restart: unless-stopped
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: ${SANAGTM_BACKEND_SUBNET:-172.29.40.0/24}
+  edge: {}

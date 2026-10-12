@@ -1,0 +1,25 @@
+# SANA GTM self-hosted runtime (API + platform worker + crawlers), Python 3.12.
+# Pinned to the versions the test suite passes on (cloud/.venv, 2026-10-09). No Redis, no
+# Supabase client, no Google Sheets. Verified by building a clean venv from this file and
+# running the platform suite in it (see deploy/selfhost/README.md, "Verification").
+fastapi==0.141.1
+starlette==1.7.0
+uvicorn[standard]==0.53.0
+pydantic==2.13.5
+PyJWT[crypto]==2.15.0
+cryptography==50.0.1
+psycopg[binary]==3.3.6
+psycopg-binary==3.3.6
+psycopg-pool==3.3.3
+python-multipart==0.0.32
+python-dotenv==1.2.3
+requests==2.34.2
+beautifulsoup4==4.15.0
+lxml==6.1.3
+openpyxl==3.1.5
+pandas==3.0.6
+numpy==2.5.3
+loguru==0.7.3
+dnspython==2.8.0
+# Optional AI provider (Claude). Gemini / OpenAI-compatible use plain HTTPS.
+anthropic==1.8.0

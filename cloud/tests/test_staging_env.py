@@ -16,6 +16,7 @@ from tempfile import TemporaryDirectory
 from cloud.api.settings import load_settings, validate_settings
 from cloud.ops import staging_env
 from cloud.worker.settings import load_worker_settings
+from cloud.tests._optional import needs_module, needs_repo_files
 
 FAKE = {
     "SUPABASE_PROJECT_REF": "abcdefghijklmnopqrst",
@@ -195,6 +196,7 @@ class TestValidation(unittest.TestCase):
             self.assertEqual(staging_env.read_secrets(path), {})
 
 
+@needs_repo_files(".gitignore", ".git")
 class TestSecretsFileIsIgnored(unittest.TestCase):
     def test_the_generated_paths_are_all_git_ignored(self) -> None:
         """A rendered file must never become committable."""

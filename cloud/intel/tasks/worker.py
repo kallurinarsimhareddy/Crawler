@@ -483,7 +483,7 @@ def main(argv=None) -> int:
         from dotenv import load_dotenv
 
         load_dotenv(args.env_file, override=False)
-    logging.basicConfig(level=os.environ.get("CAREERCLOUD_LOG_LEVEL", "INFO"),
+    logging.basicConfig(level=os.environ.get("CAREERCLOUD_LOG_LEVEL", "INFO").strip().upper() or "INFO",
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     from cloud.intel.bootstrap import build_platform
 

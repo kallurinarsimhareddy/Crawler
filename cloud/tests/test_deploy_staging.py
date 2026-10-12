@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 from cloud.shared.environment import ResourceIdentity, ResourceRegistry, check_identity
+from cloud.tests._optional import needs_module, needs_repo_files
 
 STAGING = Path(__file__).resolve().parent.parent / "deploy" / "staging"
 UNITS = sorted((STAGING / "systemd").glob("*.service"))
@@ -135,6 +136,7 @@ class TestTemplates(unittest.TestCase):
         self.assertTrue(text.startswith("#!/usr/bin/env bash"))
         self.assertIn("set -euo pipefail", text)
 
+    @needs_repo_files("cloud/web/.env.staging.example")
     def test_dashboard_staging_template(self) -> None:
         text = (Path(__file__).resolve().parent.parent / "web" / ".env.staging.example").read_text(encoding="utf-8")
         self.assertIn("VITE_DEPLOY_ENV=staging", text)

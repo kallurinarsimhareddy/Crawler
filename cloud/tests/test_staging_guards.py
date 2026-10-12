@@ -35,6 +35,7 @@ from cloud.shared.environment import (
 from cloud.shared.storage import LocalFileStorage
 from cloud.tests._pg import PostgresTestCase, drop_database, fresh_database
 from cloud.worker.settings import WorkerSettings, worker_deployment_problems
+from cloud.tests._optional import needs_module, needs_repo_files
 
 REGISTRY = {
     "_comment": "test registry",
@@ -270,6 +271,7 @@ class TestDeploymentPreflight(unittest.TestCase):
 
 
 class TestRedisAndStorageStamps(unittest.TestCase):
+    @needs_module("fakeredis")
     def test_redis_stamp_is_set_once_and_enforced(self) -> None:
         import fakeredis
 
