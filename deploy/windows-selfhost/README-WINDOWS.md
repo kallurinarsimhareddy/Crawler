@@ -40,7 +40,7 @@ Browser ─https─► Cloudflare ─► Tunnel (outbound only) ─► 127.0.0.1
 | `sanagtm start / stop / restart / update / uninstall` on a service-mode install | **yes** | controls services |
 | Everything else (download, verify, unpack, Python packages, database creation, migrations, configuration, status, health, logs, backup, restore test) | no | done by the installer and the CLI |
 
-**Without an administrator:** use **User mode** (`-Mode User`). It runs the same programs under your account and starts them at **sign-in**, not at boot.
+**Without an administrator:** use **User mode** (`-Mode User`). It runs the same programs under your account and starts them at **sign-in**, not at boot. User mode cannot install the Visual C++ runtime. If PostgreSQL then fails with error `0xC0000135` (a missing DLL), an administrator must install the runtime once. Run `-PreflightOnly` first, because it reports this before anything changes.
 
 ## Install
 
@@ -120,6 +120,14 @@ Copy `<DataDir>\backups` to another physical disk or machine regularly. `-Offsit
 2. Add a public hostname `sanagtm.<your-domain>` → service **HTTP** `127.0.0.1:8100`.
 3. In **Supabase** › Authentication › URL Configuration, add `https://sanagtm.<your-domain>` as the Site URL and as a redirect URL.
 
+Use a **named** tunnel with a stable hostname. A `*.trycloudflare.com` quick tunnel changes its address on every restart, so never configure or build against one.
+
+**Keeping the Cloudflare Pages dashboard.** The install serves its own dashboard at `https://sanagtm.<your-domain>`. To also keep the Pages site (for example `https://sanagtm.pages.dev`) working against this machine, do two things:
+- Add `EXTRA_CORS_ORIGINS=https://sanagtm.pages.dev` to the answers file. Only https origins are accepted; separate several with commas.
+- Rebuild the Pages site with `VITE_API_URL=https://sanagtm.<your-domain>`.
+
+Supabase must list every dashboard origin as a redirect URL.
+
 The tunnel only makes **outbound** connections. No inbound firewall rule or router port is opened. PostgreSQL listens only on 127.0.0.1, and its `pg_hba.conf` accepts only local SCRAM logins. The token is stored in `config\tunnel.token`, which the service reads with `--token-file`, so it never appears on a command line.
 
 ## Moving the existing data (Supabase → this machine)
@@ -136,6 +144,12 @@ The tunnel only makes **outbound** connections. No inbound firewall rule or rout
    ```
    It does a restore test, the verified restore, the production stamp and the **provider-credential check**, then starts the dashboard. **The worker stays off.**
 4. Run `sanagtm migrate verify <manifest>`, then check your data in the browser. Then `sanagtm start`.
+
+**The WAD job monitor after an import.** The imported data includes any job-monitor run that was open in the old installation. A full sweep that was **paused** there stays open here. While it is open, no scheduled run of that monitor starts, and each skipped day raises a "scheduled run skipped" notification. Before `sanagtm start`, decide one of the following:
+- **Resume it:** Control Room › Automation › *Resume task*, or `POST /api/v1/w/<workspace>/tasks/<task id>/resume`. It continues from its checkpoint page.
+- **Cancel it:** open the run and choose *Cancel run*. Stored jobs are kept, and a cancelled sweep closes nothing.
+
+The daily incremental run reads at most 200 pages (about 4,800 jobs). After a long gap, one completed full sweep is what brings the job list back in line with the source.
 
 ## Rollback
 
