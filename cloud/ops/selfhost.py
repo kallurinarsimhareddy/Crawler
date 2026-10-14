@@ -136,16 +136,32 @@ def write_registry(env: Mapping[str, str]) -> str:
     return str(path)
 
 
+def _database_up(env: Mapping[str, str], out: Dict[str, object]) -> bool:
+    import psycopg
+
+    try:
+        with psycopg.connect(_url(env), connect_timeout=5) as conn:
+            out["database"] = conn.execute("select 1").fetchone()[0] == 1
+    except Exception as error:  # noqa: BLE001 - reported by class only, never the URL
+        out["database"] = False
+        out["database_error"] = type(error).__name__
+    return bool(out["database"])
+
+
 def health_api(env: Mapping[str, str], *, port: Optional[int] = None) -> Dict[str, object]:
+    """The web process answers AND its database does: ``/api/v1/health`` alone is static, so an
+    API whose PostgreSQL is down would still look healthy."""
     port = port or int(env.get("SANAGTM_API_PORT", "8100"))
     with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/health", timeout=5) as response:  # noqa: S310
         body = json.loads(response.read().decode("utf-8") or "{}")
-        return {"ok": response.status == 200, "status": response.status, "body": body}
+        out: Dict[str, object] = {"status": response.status, "body": body}
+    out["ok"] = out["status"] == 200 and _database_up(env, out)
+    return out
 
 
 def health_worker(env: Mapping[str, str], *, now: Optional[float] = None) -> Dict[str, object]:
-    import psycopg
-
+    """Healthy only with a fresh heartbeat, a reachable database AND the worker saying ``ok``
+    (``queue_unavailable`` is a live but degraded worker: it runs nothing)."""
     out: Dict[str, object] = {"ok": False, "database": False, "state_age_s": None, "state": None}
     path = env.get("CAREERCLOUD_WORKER_STATE_FILE")
     if path:
@@ -156,13 +172,10 @@ def health_worker(env: Mapping[str, str], *, now: Optional[float] = None) -> Dic
             out["state_age_s"] = round((now or time.time()) - updated, 1)
         except (OSError, ValueError, KeyError, TypeError):
             pass
-    try:
-        with psycopg.connect(_url(env), connect_timeout=5) as conn:
-            out["database"] = conn.execute("select 1").fetchone()[0] == 1
-    except Exception as error:  # noqa: BLE001 - reported by class only
-        out["database_error"] = type(error).__name__
+    _database_up(env, out)
     age = out["state_age_s"]
-    out["ok"] = bool(out["database"]) and age is not None and float(age) < WORKER_STALE_S
+    out["ok"] = bool(out["database"]) and age is not None and float(age) < WORKER_STALE_S and \
+        out["state"] in (None, "ok")
     return out
 
 

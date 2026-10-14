@@ -486,38 +486,117 @@ class PlatformWorker:
 
 
 def egress_allow_hosts(env: Mapping[str, str]) -> list:
-    """Hosts the worker itself must reach over urllib3 that may be non-public: the S3
-    endpoint, a localhost OpenAI-compatible model, and ``CAREERCLOUD_EGRESS_ALLOW_HOSTS``
-    (comma separated, for an operator's own infrastructure). Nothing else is exempt."""
-    from urllib.parse import urlsplit
+    """Hosts the worker itself may reach although non-public (see
+    :func:`cloud.shared.netguard.allow_hosts_from_env`)."""
+    from cloud.shared import netguard
 
-    hosts = []
-    for name in ("CAREERCLOUD_S3_ENDPOINT", "OPENAI_COMPATIBLE_BASE_URL"):
-        host = urlsplit(env.get(name) or "").hostname
-        if host and (name != "OPENAI_COMPATIBLE_BASE_URL" or host in ("localhost", "127.0.0.1", "::1")):
-            hosts.append(host)
-    hosts += [h.strip() for h in (env.get("CAREERCLOUD_EGRESS_ALLOW_HOSTS") or "").split(",") if h.strip()]
-    return sorted({h.lower().rstrip(".") for h in hosts})
+    return netguard.allow_hosts_from_env(env)
 
 
-def install_platform_egress_guard(env: Mapping[str, str]) -> bool:
+def install_platform_egress_guard(env: Mapping[str, str], *, resolver: Optional[Callable] = None) -> bool:
     """Every task here may fetch URLs it was given (crawls follow redirects through the
     CareerCrawler adapters' own sessions). The guard refuses any urllib3 connection, first
     hop or redirect, to loopback, private, link-local, CGNAT, multicast, reserved or
-    unspecified addresses (see ``cloud/worker/egress.py``). On by default; a deployed
+    unspecified addresses (see ``cloud/shared/netguard.py``). On by default; a deployed
     (staging/production) worker refuses to start with it off."""
-    from cloud.shared.config import env_bool
+    from cloud.shared import netguard
 
-    if not env_bool(env, "CAREERCLOUD_EGRESS_GUARD", True):
-        environment = (env.get("CAREERCLOUD_ENV") or "development").strip().lower()
-        if environment in ("staging", "production"):
-            raise SystemExit(f"{environment} must not disable CAREERCLOUD_EGRESS_GUARD")
-        log.warning("egress guard OFF (CAREERCLOUD_EGRESS_GUARD=false): tasks can reach private addresses")
+    return netguard.install_from_env(env, role="worker", default_on=True, resolver=resolver)
+
+
+#: Session advisory lock held by the one active platform worker of a database.
+WORKER_LOCK_KEY = 0x5A4E_A671
+STANDBY_LOG_SECONDS = 300.0
+
+
+def acquire_worker_lock(database_url: str, *, stop: threading.Event, poll_seconds: float = 15.0,
+                        connect: Optional[Callable[[str], Any]] = None, once: bool = False) -> Optional[Any]:
+    """One platform worker per database. Two workers would both run the schedulers (a due job
+    monitor could start twice) — a PID file cannot prevent that after a crash or a manual start.
+    Returns the connection that holds a session advisory lock (keep it open; closing it, or the
+    process dying, releases the lock). A second worker waits here on standby and takes over when
+    the lock frees; ``stop`` ends the wait (returns None)."""
+    if connect is None:
+        import psycopg
+
+        def connect(url: str) -> Any:
+            return psycopg.connect(url, autocommit=True, connect_timeout=10)
+
+    waited_since = time.monotonic()
+    last_log = -STANDBY_LOG_SECONDS
+    while True:
+        conn = None
+        try:
+            conn = connect(database_url)
+            if conn.execute("select pg_try_advisory_lock(%s)", [WORKER_LOCK_KEY]).fetchone()[0]:
+                if time.monotonic() - waited_since > poll_seconds:
+                    log.info("worker lock acquired after %.0f s on standby", time.monotonic() - waited_since)
+                return conn
+            conn.close()
+            if time.monotonic() - last_log >= STANDBY_LOG_SECONDS:
+                last_log = time.monotonic()
+                log.warning("another platform worker is active on this database: waiting on standby "
+                            "(set CAREERCLOUD_WORKER_SINGLETON=false only for a deliberate multi-worker setup)")
+        except Exception as error:  # noqa: BLE001 - database not up yet: keep trying, never crash-loop
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if time.monotonic() - last_log >= STANDBY_LOG_SECONDS:
+                last_log = time.monotonic()
+                log.warning("worker lock: database unavailable (%s); retrying", type(error).__name__)
+        if once or stop.wait(poll_seconds):
+            return None
+
+
+class WorkerLockWatch:
+    """Keeps the singleton lock honest: a database restart drops the lock's connection silently,
+    and a standby worker could then take over while this one still runs. Every ``interval`` the
+    connection is probed; if it is gone the lock is re-taken, and if another worker already has
+    it this worker stops (its supervisor restarts it, onto standby)."""
+
+    def __init__(self, conn: Any, database_url: str, on_lost: Callable[[], None], *, interval: float = 60.0,
+                 connect: Optional[Callable[[str], Any]] = None) -> None:
+        self.conn, self.database_url, self.on_lost, self.interval = conn, database_url, on_lost, interval
+        self._connect = connect
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="worker-lock-watch", daemon=True)
+
+    def start(self) -> "WorkerLockWatch":
+        self._thread.start()
+        return self
+
+    def check(self) -> bool:
+        """True while this process holds the lock (re-taking it if the connection was lost)."""
+        try:
+            self.conn.execute("select 1").fetchone()
+            return True
+        except Exception:  # noqa: BLE001 - the connection (and so the lock) is gone
+            try:
+                self.conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        again = acquire_worker_lock(self.database_url, stop=threading.Event(), connect=self._connect, once=True)
+        if again is not None:
+            self.conn = again
+            log.warning("worker lock connection was lost and has been re-taken")
+            return True
         return False
-    from cloud.worker.egress import install_egress_guard
 
-    install_egress_guard(allow_hosts=egress_allow_hosts(env))
-    return True
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            if not self.check():
+                log.error("worker lock lost to another worker: stopping this one")
+                self.on_lost()
+                return
+
+    def close(self) -> None:
+        self._stop.set()
+        try:
+            self.conn.close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def main(argv=None) -> int:
@@ -538,8 +617,22 @@ def main(argv=None) -> int:
     from cloud.intel.bootstrap import build_platform
 
     install_platform_egress_guard(os.environ)
+    from cloud.shared.config import env_bool
+
+    lock = None
+    database_url = os.environ.get("CAREERCLOUD_DATABASE_URL")
+    if (os.environ.get("CAREERCLOUD_STORAGE") or "postgres").strip().lower() == "postgres" and database_url \
+            and env_bool(os.environ, "CAREERCLOUD_WORKER_SINGLETON", True):
+        standby = threading.Event()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            signal.signal(sig, lambda *_: standby.set())
+        lock = acquire_worker_lock(database_url, stop=standby)
+        if lock is None:
+            return 0                                  # stopped while on standby
     platform = build_platform(role="worker")
     worker = PlatformWorker(platform, state_file=args.state_file)
+    if lock is not None:
+        lock = WorkerLockWatch(lock, database_url, worker.stop).start()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: worker.stop())
     try:
@@ -550,6 +643,8 @@ def main(argv=None) -> int:
             worker.run(concurrency=max(1, min(args.concurrency, 16)))
     finally:
         platform.close()
+        if lock is not None:
+            lock.close()                              # releases the advisory lock
     return 0
 
 

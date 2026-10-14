@@ -14,9 +14,9 @@ public-web contact source and ATS job-board APIs. It enforces:
   ``robots.txt`` respected by default. No CAPTCHA solving, no stealth, no
   proxy rotation, no login: a page that blocks us is reported as ``blocked``.
 
-The DNS check and the connection are not atomic here (requests resolves again);
-the worker process additionally runs CareerCloud's egress guard
-(:mod:`cloud.worker.egress`), which pins the checked address at connect time.
+Every request runs inside :func:`cloud.shared.netguard.guarded`, so the connection
+is made to the address that was just checked, never to a second DNS answer
+(rebinding), in any process — not only where the worker's process-wide guard is on.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional
 from urllib.parse import urljoin, urlsplit
 
+from cloud.shared import netguard
 from cloud.shared.urls import UnsafeTargetError, check_public_host, resolve_public_addresses
 
 __all__ = ["FetchResult", "SafeFetcher", "UnsafeTargetError", "USER_AGENT", "check_url"]
@@ -149,9 +150,11 @@ class SafeFetcher:
                 if check_robots and not self.allowed_by_robots(current):
                     return FetchResult(url, current, 0, error="robots.txt disallows this URL", redirects=redirects)
                 self._pace(urlsplit(current).hostname or "")
-                response = self._session.request(
-                    method, current, json=json_body, timeout=self.timeout, allow_redirects=False, stream=True,
-                    headers={"Accept": accept, **(headers or {})})
+                # Pinned: the connection goes to the address just checked (no rebinding).
+                with netguard.guarded(resolver=self._resolver):
+                    response = self._session.request(
+                        method, current, json=json_body, timeout=self.timeout, allow_redirects=False, stream=True,
+                        headers={"Accept": accept, **(headers or {})})
                 if response.is_redirect or response.status_code in (301, 302, 303, 307, 308):
                     location = response.headers.get("Location")
                     response.close()

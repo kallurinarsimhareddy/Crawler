@@ -29,7 +29,8 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Optional, Tuple, Union
+from urllib.parse import urlsplit
 
 from cloud.intel.scraper.limits import DomainLimiter, RunBudget, backoff_delay, is_transient, retry_after_seconds
 from cloud.intel.scraper.models import CrawlOptions, FetchedPage, Outcome
@@ -134,16 +135,46 @@ _LOAD_MORE_TEXT = ("load more", "show more", "view more", "see more", "more jobs
                    "more positions", "load more jobs", "show more jobs")
 
 
+#: Chromium is pointed at a proxy that does not exist and loses its implicit loopback bypass:
+#: every request is answered by :meth:`PlaywrightRenderer._fulfill` from Python, so anything
+#: that escaped interception cannot reach any network. WebRTC may not send unproxied UDP,
+#: and there is no DNS prefetching.
+_BROWSER_ARGS = ("--proxy-server=http://127.0.0.1:9", "--proxy-bypass-list=<-loopback>",
+                 "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                 "--webrtc-ip-handling-policy=disable_non_proxied_udp", "--dns-prefetch-disable")
+#: Response headers not passed back to the page (requests already decoded the body).
+_DROP_RESPONSE_HEADERS = {"connection", "keep-alive", "transfer-encoding", "content-encoding", "content-length",
+                          "proxy-authenticate", "trailer", "upgrade", "set-cookie"}
+_DROP_REQUEST_HEADERS = {"host", "connection", "content-length", "keep-alive", "proxy-authorization",
+                         "transfer-encoding", "upgrade", "te"}
+
+
 class PlaywrightRenderer(BrowserRenderer):  # pragma: no cover - needs a browser; exercised by the live test
     """Headless Chromium through Playwright (same approach as the crawler's ``utils/browser.py``,
-    minus waiting out challenges, which the platform never does)."""
+    minus waiting out challenges, which the platform never does).
 
-    def __init__(self, timeout_ms: int = 30000, resolver: Optional[Callable] = None) -> None:
+    Network containment: Chromium never connects anywhere itself. Every request — navigation,
+    frame, popup, subresource, fetch/XHR, redirect hop — is intercepted, refused unless its URL
+    passes :func:`check_url` (http(s), allowed port, public host after resolution, alternate IP
+    spellings normalised), and then fetched **by Python through** :func:`cloud.shared.netguard.guarded`,
+    which resolves again and connects only to an address it checked (DNS rebinding cannot
+    redirect the fetch). Redirects are returned to the page unfollowed, so each hop is checked
+    again. Service workers are blocked and downloads off. WebSockets are not intercepted (a
+    synchronous WebSocket route deadlocks Playwright): they go to the dead proxy and fail, as does
+    anything else not intercepted."""
+
+    def __init__(self, timeout_ms: int = 30000, resolver: Optional[Callable] = None, *,
+                 allow_hosts: Tuple[str, ...] = (), max_bytes: int = 15_000_000) -> None:
         from playwright.sync_api import sync_playwright  # noqa: F401 - availability check
 
         self.timeout_ms = timeout_ms
         self.resolver = resolver
-        self.blocked: list = []   # requests refused by the public-address check
+        #: Hosts exempt from the public-address rule (tests serve a local site; empty in production).
+        self.allow_hosts = tuple(h.lower() for h in allow_hosts)
+        self.max_bytes = max_bytes
+        self.blocked: list = []   # requests refused by the public-address check or at connect time
+        self._http: Any = None
+        self.redirected: dict = {}  # request URL -> final URL of a redirect followed in _fulfill
 
     def _route(self, route: Any) -> None:
         from cloud.intel.core.http import UnsafeTargetError, check_url
@@ -156,33 +187,100 @@ class PlaywrightRenderer(BrowserRenderer):  # pragma: no cover - needs a browser
             if request.url.startswith(("data:", "blob:")):
                 route.continue_()
                 return
-            check_url(request.url, resolver=self.resolver) if self.resolver else check_url(request.url)
+            self._check(request.url)
         except UnsafeTargetError:
             self.blocked.append(request.url)
-            route.abort()
+            route.abort("blockedbyclient")
             return
         except Exception:  # noqa: BLE001 - anything unparseable is refused
             self.blocked.append(request.url)
-            route.abort()
+            route.abort("blockedbyclient")
             return
         self._fulfill(route)
 
+    def _check(self, url: str) -> None:
+        from cloud.intel.core.http import check_url
+
+        if (urlsplit(url).hostname or "").lower() not in self.allow_hosts:
+            check_url(url, resolver=self.resolver) if self.resolver else check_url(url)
+
     def _fulfill(self, route: Any) -> None:
-        """Serve a request that passed the safety check (tests serve pages offline here)."""
-        route.continue_()
+        """Fetch a request that passed the URL check from Python, pinned to a checked address, and
+        hand the response to the page (tests override this to serve pages offline).
+
+        Redirects are followed here, each hop URL-checked and pinned (Playwright does not route
+        the request that follows a fulfilled redirect, so the browser must never follow one
+        itself); the page gets the final response, and an HTML document gets a ``<base href>``
+        so its relative links resolve against the final URL."""
+        from urllib.parse import urljoin
+
+        from cloud.intel.core.http import UnsafeTargetError
+        from cloud.shared import netguard
+
+        request = route.request
+        headers = {k: v for k, v in request.all_headers().items()
+                   if not k.startswith(":") and k.lower() not in _DROP_REQUEST_HEADERS}
+        url, method, data = request.url, request.method, request.post_data_buffer
+        try:
+            for _hop in range(6):
+                with netguard.guarded(resolver=self.resolver, allow_hosts=self.allow_hosts):
+                    response = self._http.request(method, url, headers=headers, data=data,
+                                                  timeout=self.timeout_ms / 1000, allow_redirects=False, stream=True)
+                location = response.headers.get("Location")
+                if response.status_code not in (301, 302, 303, 307, 308) or not location:
+                    break
+                response.close()
+                url = urljoin(url, location)
+                self._check(url)
+                if response.status_code == 303 or (response.status_code in (301, 302) and method == "POST"):
+                    method, data = "GET", None
+            else:
+                route.abort("failed")         # too many redirects
+                return
+            chunks, size = [], 0
+            for chunk in response.iter_content(65536):
+                size += len(chunk)
+                if size > self.max_bytes:
+                    response.close()
+                    route.abort("failed")
+                    return
+                chunks.append(chunk)
+            response.close()
+        except (netguard.EgressBlockedError, UnsafeTargetError):
+            self.blocked.append(url)
+            route.abort("blockedbyclient")
+            return
+        except Exception:  # noqa: BLE001 - a network failure is the page's failed request
+            route.abort("failed")
+            return
+        body = b"".join(chunks)
+        out = {k: v for k, v in response.headers.items() if k.lower() not in _DROP_RESPONSE_HEADERS}
+        cookies = response.raw.headers.getlist("Set-Cookie") if hasattr(response.raw, "headers") else []
+        if cookies:
+            out["set-cookie"] = chr(10).join(cookies)
+        if url != request.url:
+            self.redirected[request.url] = url
+            if "html" in (response.headers.get("Content-Type") or "").lower() and b"<base" not in body[:4096].lower():
+                body = re.sub(rb"(<head[^>]*>)", lambda m: m.group(1) + b'<base href="' + url.encode() + b'">',
+                              body, count=1, flags=re.I)
+        route.fulfill(status=response.status_code, headers=out, body=body)
 
     def render(self, url: str, *, interact: bool = False, max_clicks: int = 10) -> RenderResult:
         from playwright.sync_api import sync_playwright
 
         from cloud.intel.core.http import USER_AGENT, check_url
 
+        import requests
+
         started = time.monotonic()
-        check_url(url, resolver=self.resolver) if self.resolver else check_url(url)
+        self._check(url)
         result = RenderResult(final_url=url)
+        self._http = requests.Session()
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
+            browser = p.chromium.launch(headless=True, args=list(_BROWSER_ARGS))
             try:
-                context = browser.new_context(user_agent=USER_AGENT, java_script_enabled=True)
+                context = browser.new_context(user_agent=USER_AGENT, java_script_enabled=True,
+                                              service_workers="block", accept_downloads=False)
                 context.route("**/*", self._route)
                 page = context.new_page()
                 response = page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")
@@ -220,11 +318,12 @@ class PlaywrightRenderer(BrowserRenderer):  # pragma: no cover - needs a browser
                         page.wait_for_timeout(800)
                         result.scrolls += 1
                     html = page.content()
-                result.html, result.final_url = html, page.url
+                result.html, result.final_url = html, self.redirected.get(page.url, page.url)
             except Exception as error:  # noqa: BLE001 - a failed render is an outcome, not a crash
                 result.error = f"{type(error).__name__}: {str(error)[:200]}"
             finally:
                 browser.close()
+                self._http.close()
         result.duration_ms = (time.monotonic() - started) * 1000
         return result
 

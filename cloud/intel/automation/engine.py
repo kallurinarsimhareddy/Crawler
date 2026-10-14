@@ -847,7 +847,10 @@ class AutomationEngine:
             import requests
 
             post = requests.post
-        response = post(url, data=body, headers=headers, timeout=10, allow_redirects=False)
+        from cloud.shared import netguard
+
+        with netguard.guarded(resolver=self._resolver):  # connect to the address check_url accepted
+            response = post(url, data=body, headers=headers, timeout=10, allow_redirects=False)
         status = getattr(response, "status_code", 0)
         if status >= 400 or status == 0:
             raise RuntimeError(f"webhook returned HTTP {status}")

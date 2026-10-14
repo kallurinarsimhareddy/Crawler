@@ -47,6 +47,16 @@ def _targets(platform: Any, ctx: Ctx, params: Mapping[str, Any]) -> List[Dict[st
     raise PermanentTaskError("a crawl needs company_ids, list_id or filters")
 
 
+def browser_fallback_permitted() -> bool:
+    """Same rule as the legacy crawl worker (``cloud/worker/settings.py``): a browser crawl only
+    where an outbound firewall that blocks private ranges is confirmed."""
+    import os
+
+    from cloud.shared.config import env_bool
+
+    return env_bool(os.environ, "CAREERCLOUD_EGRESS_FIREWALL_CONFIRMED", False)
+
+
 def run_crawl(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: Any) -> Dict[str, Any]:
     from cloud.intel.jobs.careercrawler_bridge import crawl_companies
 
@@ -58,11 +68,18 @@ def run_crawl(platform: Any, ctx: Ctx, task: Mapping[str, Any], reporter: Any) -
     totals: Dict[str, Any] = {"companies": len(companies), "crawled": 0, "failed": 0, "postings": 0, "new": 0,
                               "closed": 0, "signals": 0, "failures": []}
     remaining = companies[start:]
+    browser_fallback = bool(params.get("browser_fallback", False))
+    if browser_fallback and not browser_fallback_permitted():
+        # The CareerCrawler's own Chromium (utils/browser.py) opens connections the urllib3
+        # egress guard cannot see; without a confirmed host firewall it stays off.
+        browser_fallback = False
+        totals["browser_fallback"] = "refused: set CAREERCLOUD_EGRESS_FIREWALL_CONFIRMED=true on a host whose " \
+                                     "outbound firewall blocks private addresses"
     crawls = crawl_companies(
         [{"id": c["id"], "name": c["name"], "website": c.get("website") or (f"https://{c['domain']}"
                                                                            if c.get("domain") else None),
           "careers_url": c.get("careers_url")} for c in remaining],
-        browser_fallback=bool(params.get("browser_fallback", False)), engine_factory=CRAWL_ENGINE_FACTORY,
+        browser_fallback=browser_fallback, engine_factory=CRAWL_ENGINE_FACTORY,
         resolver=CRAWL_RESOLVER, is_cancelled=(reporter.is_cancelled if reporter is not None else lambda: False))
     for offset, result in enumerate(crawls):
         index = start + offset

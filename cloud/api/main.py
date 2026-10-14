@@ -14,6 +14,7 @@ only in ``python -m cloud.worker``.
 from __future__ import annotations
 
 import logging
+import os
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, FrozenSet, Optional
 
@@ -253,6 +254,11 @@ def create_app(
 def _asgi_app() -> FastAPI:
     """The app uvicorn serves: configure process logging first, then build."""
     settings = load_settings()
+    from cloud.shared import netguard
+
+    # The API fetches too (scraper plans, provider checks, webhook tests): deployed, every
+    # urllib3 connection is pinned to a checked public address, like the worker's.
+    netguard.install_from_env(os.environ, role="API", default_on=netguard.api_guard_default(os.environ))
     if settings.log_format == "json":
         from cloud.shared.logs import configure_logging
 

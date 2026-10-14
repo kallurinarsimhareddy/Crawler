@@ -71,6 +71,28 @@ class CrawlTaskTests(unittest.TestCase):
         task = self.platform.tasks.submit(self.ctx, "crawl", {"company_ids": company_ids})
         return run_task_inline(self.platform, self.ctx.workspace_id, task["id"])
 
+    def test_browser_fallback_needs_a_confirmed_firewall(self) -> None:
+        """The CareerCrawler's own Chromium bypasses the urllib3 egress guard (phase 2 security)."""
+        from cloud.intel.jobs import careercrawler_bridge
+
+        seen = []
+        real = careercrawler_bridge.crawl_companies
+
+        def spy(companies, **kw):
+            seen.append(kw["browser_fallback"])
+            return real(companies, **kw)
+
+        with mock.patch.object(careercrawler_bridge, "crawl_companies", spy):
+            for confirmed, expected in (("", False), ("true", True)):
+                with self.subTest(confirmed=confirmed), \
+                        mock.patch.dict("os.environ", {"CAREERCLOUD_EGRESS_FIREWALL_CONFIRMED": confirmed}):
+                    task = self.platform.tasks.submit(self.ctx, "crawl", {"company_ids": [self.acme["id"]],
+                                                                          "browser_fallback": True})
+                    done = run_task_inline(self.platform, self.ctx.workspace_id, task["id"])
+                    self.assertEqual(done["status"], "completed", done.get("error"))
+                    self.assertEqual(seen[-1], expected)
+                    self.assertEqual("browser_fallback" in done["result"], not expected)
+
     def test_crawl_ingests_records_ats_and_detects_signals(self) -> None:
         done = self.run_crawl([self.acme["id"], self.broken["id"]])
         self.assertEqual(done["status"], "completed", done.get("error"))

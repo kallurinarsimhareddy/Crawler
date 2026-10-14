@@ -148,7 +148,10 @@ class IntegrationService:
             return self.http("POST", url, headers=dict(headers), data=body, timeout=10)
         import requests
 
-        return requests.post(url, headers=dict(headers), data=body.encode(), timeout=10, allow_redirects=False)
+        from cloud.shared import netguard
+
+        with netguard.guarded(resolver=self.resolver):  # connect to the address check_url accepted
+            return requests.post(url, headers=dict(headers), data=body.encode(), timeout=10, allow_redirects=False)
 
     # --- status -------------------------------------------------------------------
 
