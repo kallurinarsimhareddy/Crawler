@@ -137,6 +137,21 @@ class TestResourceRegistry(unittest.TestCase):
         problems = check_identity(identity, registry())
         self.assertTrue(any("staging" in p for p in problems))
 
+    def test_the_hosting_platforms_own_dev_domain_is_not_an_environment_name(self) -> None:
+        """Production's Pages dashboard is https://sanagtm.pages.dev: the "dev" there is
+        Cloudflare's domain. A project name that says dev is still refused."""
+        def origin_problems(origin: str) -> list:
+            identity = ResourceIdentity.from_urls("production", queue_prefix="careercloud:production",
+                                                  results_namespace="production", dashboard_origins=[origin])
+            return [p for p in check_identity(identity, registry()) if "looks like another environment" in p]
+
+        self.assertEqual(origin_problems("https://sanagtm.pages.dev"), [])
+        self.assertEqual(origin_problems("https://sanagtm.workers.dev"), [])
+        for bad in ("https://sanagtm-dev.pages.dev", "https://dev.sanagtm.pages.dev",
+                    "https://sanagtm-staging.pages.dev", "https://dev.example.com"):
+            with self.subTest(origin=bad):
+                self.assertTrue(origin_problems(bad))
+
     def test_a_deployed_environment_without_a_registry_is_refused(self) -> None:
         with self.assertRaises(EnvironmentIsolationError):
             enforce_isolation(ResourceIdentity.from_urls("staging", **STAGING_URLS), env={})

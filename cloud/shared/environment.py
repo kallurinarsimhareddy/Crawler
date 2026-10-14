@@ -67,6 +67,13 @@ _FOREIGN_TOKENS = {
     "staging": ("prod",),
     "production": ("staging", "stage", "dev", "test"),
 }
+#: Hosting platforms' own domains, which are not part of a project's name: the "dev" in
+#: ``sanagtm.pages.dev`` is Cloudflare's, while ``sanagtm-dev.pages.dev`` is still refused.
+_PLATFORM_SUFFIXES = re.compile(r"\.(pages|workers)\.dev(:\d+)?/?$")
+
+
+def _own_part(value: str) -> str:
+    return _PLATFORM_SUFFIXES.sub("", value)
 
 #: Environment variables that would connect a process to Google Sheets.
 _SHEETS_VARIABLES = re.compile(
@@ -250,11 +257,11 @@ def check_identity(identity: ResourceIdentity, registry: Optional[ResourceRegist
     for attribute in ("database_host", "redis_host", "queue_prefix", "storage_bucket", "results_namespace", "api_origin"):
         value = (getattr(identity, attribute) or "").lower()
         for token in _FOREIGN_TOKENS[env]:
-            if token and re.search(rf"(^|[^a-z]){token}", value):
+            if token and re.search(rf"(^|[^a-z]){token}", _own_part(value)):
                 problems.append(f"{attribute.replace('_', ' ')} {value!r} looks like another environment ({token!r})")
     for origin in identity.dashboard_origins:
         for token in _FOREIGN_TOKENS[env]:
-            if re.search(rf"(^|[^a-z]){token}", origin.lower()):
+            if re.search(rf"(^|[^a-z]){token}", _own_part(origin.lower())):
                 problems.append(f"dashboard origin {origin!r} looks like another environment ({token!r})")
     return problems
 

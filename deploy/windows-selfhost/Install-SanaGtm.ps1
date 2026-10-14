@@ -289,6 +289,13 @@ if ($Mode -eq 'Service') {
 Write-Step 'Starting'
 & (Join-Path $L.Bin 'sanagtm.ps1') start
 & (Join-Path $L.Bin 'sanagtm.ps1') health
+# 'health' also fails on "no recent backup", always true right after installing, so its exit
+# code cannot decide; the dashboard/API answering can. A web server that refused to start
+# (configuration refused, port taken) must not end in "installed".
+$api = Invoke-SanaPython $L @('-m', 'cloud.ops.selfhost', 'health', 'api')
+if ($api.ExitCode -ne 0) {
+    Stop-WithError "the dashboard/API did not start; see $(Join-Path $L.Logs 'web.err.log') (fix it, then: sanagtm start)"
+}
 Write-Host ''
 Write-Host 'SANA GTM is installed.' -ForegroundColor Green
 Write-Host "  URL:       https://$hostname   (locally: http://127.0.0.1:$WebPort)"
