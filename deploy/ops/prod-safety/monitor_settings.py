@@ -116,6 +116,9 @@ def restore(platform: Any, ctx: Any, monitor_id: str, *, snapshot_file: Path, ap
 
 
 def main(argv: Optional[list] = None) -> int:
+    for stream in (sys.stdout, sys.stderr):        # a cp1252 console must not abort a run
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("command", choices=("snapshot", "auto-sweep", "restore"))
     parser.add_argument("value", nargs="?", choices=("on", "off"))

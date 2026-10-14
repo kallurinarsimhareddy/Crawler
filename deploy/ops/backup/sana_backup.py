@@ -616,7 +616,16 @@ def _env_url(name: str) -> str:
     return value
 
 
+def safe_console() -> None:
+    """A Windows console (cp1252) cannot encode the arrows and ellipses this tool prints; a
+    UnicodeEncodeError half way through a backup must never abort it."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="backslashreplace")
+
+
 def main(argv: Optional[List[str]] = None) -> int:
+    safe_console()
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     b = sub.add_parser("backup")

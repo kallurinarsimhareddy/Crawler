@@ -65,6 +65,7 @@ class Env:
             "SUPABASE_ANON_KEY=public-anon-key-0123456789abcdef\n"
             f"PLATFORM_SECRETS_KEY_FILE={work / 'key.txt'}\n"
             "LEGACY_DATABASE_HOSTS=aws-0-ap-south-1.pooler.supabase.com\n"
+            "EXTRA_CORS_ORIGINS=https://sanagtm.pages.dev\n"
             # test hook: lets this harness mint Supabase-format tokens (the VM uses Supabase's JWKS)
             f"ENV_CAREERCLOUD_SUPABASE_JWT_SECRET={JWT_SECRET}\n", encoding="utf-8")
         (work / "key.txt").write_text(key, encoding="utf-8")
@@ -118,6 +119,15 @@ def use_the_app(e: Env, alice: str) -> dict:
           and JWT_SECRET not in cfg and e.key not in cfg)
     check("api health on the same origin", requests.get(e.base + "/api/v1/health", timeout=30).json().get("status") == "ok")
     check("auth enforced", requests.get(e.base + "/api/v1/me", timeout=30).status_code == 401)
+
+    def preflight(origin):
+        return requests.options(e.base + "/api/v1/me", timeout=30, headers={
+            "Origin": origin, "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "authorization"}).headers.get("access-control-allow-origin")
+    check("CORS allows the hostname and EXTRA_CORS_ORIGINS (Pages dashboard) only",
+          preflight("https://sanagtm.example.com") == "https://sanagtm.example.com"
+          and preflight("https://sanagtm.pages.dev") == "https://sanagtm.pages.dev"
+          and preflight("https://evil.example.net") is None)
     ws = requests.post(e.base + "/api/v1/workspaces", json={"name": "Windows E2E", "seed": False}, headers=ah, timeout=60)
     check("workspace created by a Supabase-format identity", ws.status_code in (200, 201), ws.text[:200])
     w = f"{e.base}/api/v1/w/{ws.json()['id']}"

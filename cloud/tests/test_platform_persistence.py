@@ -179,6 +179,35 @@ class SchemaChecks(unittest.TestCase):
         finally:
             drop_database(url)
 
+    def test_a_migration_under_a_live_pool_heals_after_one_failed_call(self) -> None:
+        """Production 2026-10-02: migration 0014 ran while the worker was up; its pooled
+        connections had prepared ``select *`` plans and one call failed with "cached plan must
+        not change result type". psycopg drops the failed statement, so the task's retry works
+        on the same connection. Guards that behaviour (and why one failed attempt is harmless)."""
+        import psycopg
+
+        url = fresh_database()
+        store = PostgresStore.from_url(url, max_size=1)  # one connection: a kept stale one would fail again
+        try:
+            with psycopg.connect(url, autocommit=True) as admin:
+                admin.execute("create table careercloud.plan_probe (id int primary key, a text)")
+                admin.execute("insert into careercloud.plan_probe values (1, 'x')")
+
+            def read() -> dict:
+                with store._tx(None) as conn:  # noqa: SLF001
+                    return conn.execute("select * from careercloud.plan_probe where id = %s", [1]).fetchone()
+
+            for _ in range(8):  # past psycopg's prepare threshold
+                read()
+            with psycopg.connect(url, autocommit=True) as admin:
+                admin.execute("alter table careercloud.plan_probe add column b text")
+            with self.assertRaises(psycopg.errors.FeatureNotSupported):
+                read()
+            self.assertEqual(read(), {"id": 1, "a": "x", "b": None})
+        finally:
+            store.close()
+            drop_database(url)
+
 
 class Defaults(unittest.TestCase):
     def test_postgres_is_the_default_and_memory_is_explicit(self) -> None:

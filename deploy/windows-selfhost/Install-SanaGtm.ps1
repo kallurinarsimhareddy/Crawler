@@ -152,6 +152,17 @@ if (-not $NoTunnel) {
 }
 $legacy = ''
 if ($answers.Contains('LEGACY_DATABASE_HOSTS')) { $legacy = $answers['LEGACY_DATABASE_HOSTS'] }
+# Other browser origins that call this API, e.g. the Cloudflare Pages dashboard
+# (https://sanagtm.pages.dev). The install's own hostname is always allowed.
+$corsOrigins = @("https://$hostname")
+if ($answers.Contains('EXTRA_CORS_ORIGINS') -and $answers['EXTRA_CORS_ORIGINS']) {
+    foreach ($origin in ($answers['EXTRA_CORS_ORIGINS'] -split ',')) {
+        $origin = $origin.Trim().TrimEnd('/')
+        if (-not $origin) { continue }
+        if ($origin -notmatch '^https://[a-z0-9.-]+\.[a-z]{2,}$') { Stop-WithError "EXTRA_CORS_ORIGINS: '$origin' must be an https origin like https://sanagtm.pages.dev" }
+        if ($corsOrigins -notcontains $origin) { $corsOrigins += $origin }
+    }
+}
 Write-Ok "hostname https://$hostname, auth $supabaseUrl, tunnel $(if ($NoTunnel) { 'off' } else { 'on' })"
 
 # ---------------------------------------------------------------------------------------------
@@ -219,7 +230,7 @@ $lines = @(
     'CAREERCLOUD_ENV=production', 'CAREERCLOUD_SELF_HOSTED=1', 'CAREERCLOUD_STORAGE=postgres', 'CAREERCLOUD_QUEUE=postgres',
     "CAREERCLOUD_DATABASE_URL=postgresql://sanagtm:$app@127.0.0.1:$PgPort/sanagtm",
     'CAREERCLOUD_DB_USER_ROLE=authenticated', 'CAREERCLOUD_DB_POOL_MAX=8', 'CAREERCLOUD_AUTH_MODE=supabase',
-    "CAREERCLOUD_SUPABASE_URL=$supabaseUrl", "CAREERCLOUD_API_ORIGIN=https://$hostname", "CAREERCLOUD_CORS_ORIGINS=https://$hostname",
+    "CAREERCLOUD_SUPABASE_URL=$supabaseUrl", "CAREERCLOUD_API_ORIGIN=https://$hostname", "CAREERCLOUD_CORS_ORIGINS=$($corsOrigins -join ',')",
     'CAREERCLOUD_TRUST_PROXY=cloudflare', 'CAREERCLOUD_LOG_FORMAT=json', 'CAREERCLOUD_LOG_LEVEL=INFO',
     'CAREERCLOUD_STORAGE_BACKEND=local', 'CAREERCLOUD_RUNNER=none', "CAREERCLOUD_PLATFORM_SECRETS_KEY=$secretsKey",
     "CAREERCLOUD_PLATFORM_FILES_DIR=$($L.Files)", "CAREERCLOUD_RESULTS_DIR=$($L.Results)",
