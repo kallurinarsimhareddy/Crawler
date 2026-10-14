@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Mapping, Optional, Union
+from typing import Any, Dict, List, Mapping, Optional, Tuple, Union
 
 from cloud.intel.core.audit import audit
 from cloud.intel.core.context import Ctx, ValidationError
@@ -104,8 +104,15 @@ class SourceService:
                                                            query.board_url}] if (query.domain or query.board_url) else [])
             if not companies:
                 raise ValidationError("the CareerCrawler source needs companies (name + website)")
-            task = self.platform.tasks.submit(ctx, "crawl", {"companies": companies, "source": "careercrawler"})
-            return {"source": source, "task_id": task["id"], "status": task["status"], "count": 0}
+            company_ids, needs_review = self._crawl_targets(ctx, companies)
+            if not company_ids:
+                raise ValidationError("none of these companies could be matched to one CRM company"
+                                      + (f" (needs review: {', '.join(needs_review[:5])})" if needs_review else ""))
+            # The ``crawl`` task crawls CRM companies (it records ATS/careers-URL changes and
+            # links postings to them), so ad-hoc records are resolved to company ids first.
+            task = self.platform.tasks.submit(ctx, "crawl", {"company_ids": company_ids, "source": "careercrawler"})
+            return {"source": source, "task_id": task["id"], "status": task["status"], "count": 0,
+                    "companies": len(company_ids), "needs_review": needs_review}
 
         started = time.monotonic()
         ledger = self.platform.service("credits")
@@ -127,6 +134,32 @@ class SourceService:
         audit(self.store, ctx, "source.search", summary=f"{source}: {len(rows)} posting(s)",
               changes={"query": query.as_dict(), "count": len(rows)})
         return {"source": source, "count": len(rows), "rows": rows[:200], "ingest": stats}
+
+    def _crawl_targets(self, ctx: Ctx, companies: Any) -> Tuple[List[str], List[str]]:
+        """Company ids for ``{"company_id"}`` or ``{"name", "website"}`` records: an existing
+        company is matched by the CRM's dedupe rules (domain first), a new one is created; an
+        ambiguous match is left for review rather than guessed."""
+        crm = self.platform.service("crm")
+        ids: List[str] = []
+        needs_review: List[str] = []
+        for record in companies:
+            record = dict(record or {})
+            company_id = record.get("company_id")
+            if company_id:
+                if self.store.find(ctx, "companies", company_id) is not None and company_id not in ids:
+                    ids.append(company_id)
+                continue
+            name = str(record.get("name") or "").strip()
+            website = str(record.get("website") or record.get("domain") or "").strip()
+            if not name or not website:
+                continue
+            outcome = crm.upsert_company(ctx, {"name": name, "website": website}, source_kind="external_source",
+                                         source_name="careercrawler")
+            if outcome.get("needs_review") or not outcome.get("company"):
+                needs_review.append(name)
+            elif outcome["company"]["id"] not in ids:
+                ids.append(outcome["company"]["id"])
+        return ids, needs_review
 
 
 def run_source_search_task(platform: Any, ctx: Ctx, task: Dict[str, Any], reporter: Any) -> Dict[str, Any]:

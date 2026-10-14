@@ -78,6 +78,8 @@ class TestStaticImports(unittest.TestCase):
             ADAPTER_TESTS: ALLOWED_CRAWLER_MODULES | {"crawler.platform_detector"},
             # Proves the crawler's own HTTP sessions go through the egress guard.
             CLOUD / "tests" / "test_egress.py": frozenset({"utils.http"}),
+            # ... and that the platform worker installs that guard for them too.
+            CLOUD / "tests" / "test_platform_egress.py": frozenset({"utils.http"}),
         }
         offenders = []
         for path in _python_files():

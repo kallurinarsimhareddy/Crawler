@@ -17,8 +17,6 @@ requests==2.34.2
 beautifulsoup4==4.15.0
 lxml==6.1.3
 openpyxl==3.1.5
-pandas==3.0.6
-numpy==2.5.3
 loguru==0.7.3
 dnspython==2.8.0
 # Optional AI provider (Claude). Gemini / OpenAI-compatible use plain HTTPS.

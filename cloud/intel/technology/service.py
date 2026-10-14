@@ -2,23 +2,22 @@
 company with evidence (source, date, confidence, evidence URL).
 
 Sources feed :meth:`TechnologyService.record`: job descriptions (the job
-intelligence track), scraped pages, imports, and :class:`TechnologyProvider`
-implementations such as the ZoomInfo connector (Track E/H). Every record keeps
-its evidence; ``companies.technologies`` is only a denormalised summary of the
-active ``company_technologies`` rows.
+intelligence track), scraped pages, imports, and technology providers such as
+the ZoomInfo connector (``cloud.intel.providers.base.TechnologyProvider``). Every
+record keeps its evidence; ``companies.technologies`` is only a denormalised
+summary of the active ``company_technologies`` rows.
 """
 
 from __future__ import annotations
 
 import logging
-from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Mapping, Optional
 
 from cloud.intel.core.audit import audit, provenance
 from cloud.intel.core.context import ConflictError, Ctx, utcnow
 from cloud.intel.technology.taxonomy import CATEGORIES, detect, taxonomy_as_dict
 
-__all__ = ["TechnologyProvider", "TechnologyService", "emit_best_effort"]
+__all__ = ["TechnologyService", "emit_best_effort"]
 
 log = logging.getLogger(__name__)
 
@@ -35,20 +34,6 @@ def emit_best_effort(platform: Any, ctx: Ctx, trigger: str, event_key: str, payl
         platform.service("automation").emit(ctx, trigger, event_key, dict(payload))
     except Exception:  # noqa: BLE001 - automation is optional and best-effort
         log.debug("automation emit %s skipped", trigger, exc_info=True)
-
-
-class TechnologyProvider(ABC):
-    """Anything that can say which technologies a company uses (e.g. ZoomInfo).
-
-    ``lookup`` returns ``[{"technology", "category", "vendor", "evidence_url",
-    "evidence_text", "confidence"}]``. Implementations that spend credits must
-    go through the credit ledger and refuse without an explicit action.
-    """
-
-    name: str = "provider"
-
-    @abstractmethod
-    def lookup(self, ctx: Ctx, company: Mapping[str, Any]) -> List[Dict[str, Any]]: ...
 
 
 class TechnologyService:
@@ -113,39 +98,6 @@ class TechnologyService:
             audit(self.store, ctx, "technology.detect", entity_type="companies", entity_id=company_id,
                   summary=f"{technology} via {source}")
         return row
-
-    def record_from_text(self, ctx: Ctx, company_id: str, text: str, *, source: str,
-                         evidence_url: Optional[str] = None, confidence: Optional[float] = None) -> List[Dict[str, Any]]:
-        rows = []
-        for m in self.detect_in_text(text):
-            rows.append(self.record(ctx, company_id, m["technology"], source=source, category=m["category"],
-                                    families=m["families"], vendor=m["vendor"], evidence_url=evidence_url,
-                                    evidence_text=m["evidence_text"], confidence=confidence))
-        return rows
-
-    def remove(self, ctx: Ctx, company_id: str, technology: str, *, source: str) -> None:
-        for row in self.store.all(ctx, "company_technologies", {"company_id": company_id, "technology": technology,
-                                                                 "source": source, "status": "active"}):
-            self.store.update(ctx, "company_technologies", row["id"], {"status": "removed"})
-        if not self.store.first(ctx, "company_technologies",
-                                {"company_id": company_id, "technology": technology, "status": "active"}):
-            company = self.store.get(ctx, "companies", company_id)
-            self.store.update(ctx, "companies", company_id,
-                              {"technologies": [t for t in company["technologies"] if t != technology]})
-            try:
-                self.platform.service("monitoring").record_change(
-                    ctx, company_id, "technology_removed", before={"technology": technology},
-                    summary=f"{technology} no longer observed ({source})", source=source)
-            except Exception:  # noqa: BLE001
-                log.debug("change event skipped", exc_info=True)
-
-    def run_provider(self, ctx: Ctx, provider: TechnologyProvider, company_id: str) -> List[Dict[str, Any]]:
-        company = self.store.get(ctx, "companies", company_id)
-        return [self.record(ctx, company_id, item["technology"], source=provider.name,
-                            category=item.get("category"), vendor=item.get("vendor"),
-                            evidence_url=item.get("evidence_url"), evidence_text=item.get("evidence_text"),
-                            confidence=item.get("confidence"))
-                for item in provider.lookup(ctx, company)]
 
     def for_company(self, ctx: Ctx, company_id: str) -> List[Dict[str, Any]]:
         return self.store.all(ctx, "company_technologies", {"company_id": company_id, "status": "active"},

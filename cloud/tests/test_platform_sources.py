@@ -127,12 +127,6 @@ class SourceServiceTests(unittest.TestCase):
             self.service.search(self.ctx, "indeed", {"keywords": "sap"})
         self.assertEqual(self.jobs.batches, [])
 
-    def test_careercrawler_becomes_a_crawl_task(self) -> None:
-        result = self.service.search(self.ctx, "careercrawler",
-                                     {"companies": [{"name": "Acme", "website": "https://acme.com"}]})
-        task = self.platform.tasks.get(self.ctx, result["task_id"])
-        self.assertEqual(task["kind"], "crawl")
-
     def test_source_search_task(self) -> None:
         from cloud.intel.tasks.worker import run_task_inline
 
@@ -150,6 +144,62 @@ class SourceServiceTests(unittest.TestCase):
         done = run_task_inline(self.platform, self.ctx.workspace_id, task["id"])
         self.assertEqual(done["status"], "failed")
         self.assertIn("LinkedIn", done["error"])
+
+
+class CareerCrawlerSourceTests(unittest.TestCase):
+    """The careercrawler source against the real CRM (the stubbed CRM above has no upsert_company)."""
+
+    def setUp(self) -> None:
+        import uuid
+
+        from cloud.intel.core.context import Ctx
+        from cloud.intel.platform import Platform, PlatformConfig
+        from cloud.intel.store.memory import MemoryStore
+
+        store = MemoryStore()
+        self.platform = Platform(store, config=PlatformConfig(environment="test"))
+        owner = str(uuid.uuid4())
+        ws = store.create_workspace(owner, "Acme", f"acme-{uuid.uuid4().hex[:8]}")
+        self.ctx = Ctx(ws["id"], owner, "owner")
+        self.service = self.platform.service("sources")
+
+    def test_careercrawler_becomes_a_crawl_task(self) -> None:
+        result = self.service.search(self.ctx, "careercrawler",
+                                     {"companies": [{"name": "Acme", "website": "https://acme.com"}]})
+        task = self.platform.tasks.get(self.ctx, result["task_id"])
+        self.assertEqual(task["kind"], "crawl")
+
+    def test_careercrawler_task_params_are_accepted_by_the_crawl_task(self) -> None:
+        """Audit 2026-10-14 D1: the source submitted ``{"companies": [...]}``, which the crawl
+        task refuses (PermanentTaskError), so every careercrawler search failed."""
+        from cloud.intel.jobs.crawl_task import _targets
+
+        crm = self.platform.service("crm")
+        existing = crm.upsert_company(self.ctx, {"name": "Globex", "website": "https://globex.com"},
+                                      source_kind="manual", source_name="test")["company"]
+        records = [{"name": "Acme", "website": "https://acme.com"},
+                   {"name": "Globex Corporation", "website": "https://www.globex.com/"},  # same domain
+                   {"name": "Acme Inc", "website": "acme.com"},                           # repeat
+                   {"company_id": existing["id"]},
+                   {"name": "No website"}]
+        result = self.service.search(self.ctx, "careercrawler", {"companies": records})
+        task = self.platform.tasks.get(self.ctx, result["task_id"])
+        ids = task["params"]["company_ids"]
+        self.assertNotIn("companies", task["params"])
+        self.assertEqual(len(ids), 2)
+        self.assertIn(existing["id"], ids)
+        self.assertEqual(result["companies"], 2)
+        targets = _targets(self.platform, self.ctx, task["params"])
+        self.assertEqual(sorted(t["id"] for t in targets), sorted(ids))
+        # repeating the request creates no twin companies
+        self.service.search(self.ctx, "careercrawler", {"companies": records})
+        self.assertEqual(len(self.platform.store.all(self.ctx, "companies", {})), 2)
+
+    def test_careercrawler_without_usable_companies_is_refused(self) -> None:
+        from cloud.intel.core.context import ValidationError
+
+        with self.assertRaises(ValidationError):
+            self.service.search(self.ctx, "careercrawler", {"companies": [{"name": "No website"}]})
 
 
 if __name__ == "__main__":

@@ -187,6 +187,9 @@ PRESENCE_SECONDS = 60.0
 #: (CAREERCLOUD_TASK_RETENTION_DAYS; 0 keeps them forever). Checked once a day.
 RETENTION_DAYS = float(os.environ.get("CAREERCLOUD_TASK_RETENTION_DAYS", "90") or 0)
 RETENTION_CHECK_SECONDS = 86400.0
+#: ``new`` / ``stale`` job-history rows older than this many days are pruned in the same daily
+#: pass (JobMonitorService.prune_history). 0 (the default) keeps them: retention is opt-in.
+JOB_HISTORY_RETENTION_DAYS = int(float(os.environ.get("CAREERCLOUD_JOB_HISTORY_RETENTION_DAYS", "0") or 0))
 
 
 class PlatformWorker:
@@ -349,7 +352,8 @@ class PlatformWorker:
                    and time.monotonic() - self._last_orphans >= ORPHAN_SECONDS)
         if orphans:
             self._last_orphans = time.monotonic()
-        retention = RETENTION_DAYS > 0 and time.monotonic() - self._last_retention >= RETENTION_CHECK_SECONDS
+        retention = (RETENTION_DAYS > 0 or JOB_HISTORY_RETENTION_DAYS > 0) and \
+            time.monotonic() - self._last_retention >= RETENTION_CHECK_SECONDS
         if retention:
             self._last_retention = time.monotonic()
         everything, self._requeue_all = self._requeue_all, False
@@ -363,9 +367,13 @@ class PlatformWorker:
                     report["requeued"] += self.platform.tasks.requeue_orphans(
                         ctx, **({"older_than_seconds": 0} if everything else {}))
                 report["monitors"] += self.platform.service("monitoring").schedule_due(ctx)
-                if retention:
+                if retention and RETENTION_DAYS > 0:
                     report["purged"] = report.get("purged", 0) + self.platform.tasks.purge_finished(
                         ctx, older_than_days=RETENTION_DAYS)
+                if retention and JOB_HISTORY_RETENTION_DAYS > 0:
+                    pruned = self.platform.service("job_monitors").prune_history(
+                        ctx, older_than_days=JOB_HISTORY_RETENTION_DAYS, dry_run=False)
+                    report["history_pruned"] = report.get("history_pruned", 0) + pruned["deleted"]
                 # Scraper runs whose task died with the worker: mark them so they can be retried.
                 report["scrape_recovered"] = report.get("scrape_recovered", 0) +                     self.platform.service("scraper").recover(ctx)
                 # Sequence steps advance only where sending is actually permitted
@@ -477,6 +485,41 @@ class PlatformWorker:
             return False
 
 
+def egress_allow_hosts(env: Mapping[str, str]) -> list:
+    """Hosts the worker itself must reach over urllib3 that may be non-public: the S3
+    endpoint, a localhost OpenAI-compatible model, and ``CAREERCLOUD_EGRESS_ALLOW_HOSTS``
+    (comma separated, for an operator's own infrastructure). Nothing else is exempt."""
+    from urllib.parse import urlsplit
+
+    hosts = []
+    for name in ("CAREERCLOUD_S3_ENDPOINT", "OPENAI_COMPATIBLE_BASE_URL"):
+        host = urlsplit(env.get(name) or "").hostname
+        if host and (name != "OPENAI_COMPATIBLE_BASE_URL" or host in ("localhost", "127.0.0.1", "::1")):
+            hosts.append(host)
+    hosts += [h.strip() for h in (env.get("CAREERCLOUD_EGRESS_ALLOW_HOSTS") or "").split(",") if h.strip()]
+    return sorted({h.lower().rstrip(".") for h in hosts})
+
+
+def install_platform_egress_guard(env: Mapping[str, str]) -> bool:
+    """Every task here may fetch URLs it was given (crawls follow redirects through the
+    CareerCrawler adapters' own sessions). The guard refuses any urllib3 connection, first
+    hop or redirect, to loopback, private, link-local, CGNAT, multicast, reserved or
+    unspecified addresses (see ``cloud/worker/egress.py``). On by default; a deployed
+    (staging/production) worker refuses to start with it off."""
+    from cloud.shared.config import env_bool
+
+    if not env_bool(env, "CAREERCLOUD_EGRESS_GUARD", True):
+        environment = (env.get("CAREERCLOUD_ENV") or "development").strip().lower()
+        if environment in ("staging", "production"):
+            raise SystemExit(f"{environment} must not disable CAREERCLOUD_EGRESS_GUARD")
+        log.warning("egress guard OFF (CAREERCLOUD_EGRESS_GUARD=false): tasks can reach private addresses")
+        return False
+    from cloud.worker.egress import install_egress_guard
+
+    install_egress_guard(allow_hosts=egress_allow_hosts(env))
+    return True
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description="CareerCrawler platform worker")
     parser.add_argument("--env-file")
@@ -494,6 +537,7 @@ def main(argv=None) -> int:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     from cloud.intel.bootstrap import build_platform
 
+    install_platform_egress_guard(os.environ)
     platform = build_platform(role="worker")
     worker = PlatformWorker(platform, state_file=args.state_file)
     for sig in (signal.SIGINT, signal.SIGTERM):

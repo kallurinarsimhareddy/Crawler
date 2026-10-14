@@ -57,9 +57,9 @@ it, unchanged, on its own queue prefix.
 | CareerCloud | Auth, RLS pattern, Redis queue, leases/heartbeats/fencing, egress guard, storage, settings, stamps | Imported directly |
 | Seamless worktree `discovery/identity.py` | Company identity matching (EXACT/STRONG/PROBABLE/AMBIGUOUS) | Vendored `vendor/identity.py`; wrapped by `imports/dedupe.py` |
 | Seamless worktree `seamless/` | REST client logic, credit cost model, HR/IT/VP targeting | Client ported into `providers/seamless.py`; `vendor/seamless_credits.py`, `vendor/seamless_targeting.py` |
-| Seamless worktree `zerocredit/` | Leadership-page extraction, email rules, confidence tiers | Vendored `vendor/zc_extract.py`, `zc_clean.py`, `email_rule.py`, `confidence.py`; the process-wide requests monkeypatch was **not** reused |
+| Seamless worktree `zerocredit/` | Leadership-page extraction, email rules, confidence tiers | Vendored `vendor/zc_extract.py`, `email_rule.py`, `confidence.py` (`zc_clean.py` removed 2026-10-14: unused); the process-wide requests monkeypatch was **not** reused |
 | ZoomInfo automation | Official API OAuth client, rate limiting, ERP catalogue | Ported into `providers/zoominfo.py`; ERP catalogue vendored as `technology/data/erp_catalog.json`. The browser-login automation stays operator-attended and is not run unattended |
-| CareerAutomation `ats.py`, `classify.py` | ATS detection and official public job-board APIs; IT/US classification | Vendored `vendor/ats_detect.py`, `vendor/it_classify.py` |
+| CareerAutomation `ats.py`, `classify.py` | ATS detection and official public job-board APIs; IT/US classification | Vendored `vendor/ats_detect.py` (`vendor/it_classify.py` removed 2026-10-14: unused; relevance is `job_monitor/relevance.py`) |
 | Job-board crawler (`linkedin_jobs_mvp`) | Salary/skills/experience extractors, skills catalogue | Vendored `vendor/salary_extract.py`, `skills_extract.py`, `job_classify.py` |
 | Job-board crawler LinkedIn/Indeed/Monster adapters, proxy/stealth code | — | **Not reused**: proxy rotation, stealth scripts and CAPTCHA/Cloudflare bypass violate the platform's rules. Those sources are connectors that require official or partner access |
 | Email verification | No standalone project existed | New `email/` module: local syntax/MX/disposable/role/free checks + EmailListVerify provider |

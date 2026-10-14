@@ -51,6 +51,8 @@ STATUS_VALUES = {v: k for k, v in STATUS_LABELS.items()}
 ACTIVE_STATES = ("open", "stale")
 #: Jobs a completed full sweep is responsible for: absent from it, they miss a sweep or expire.
 SWEEP_STATES = ("open", "stale", "unknown")
+#: History kinds that only restate a job column (first_seen_at, stale_at): see prune_history.
+PRUNABLE_CHANGES = ("new", "stale")
 #: Not shown by the source any more; seeing one again REOPENS it.
 ENDED_STATES = ("closed", "expired")
 LIFECYCLE_STEP = timedelta(days=1)
@@ -557,14 +559,19 @@ class JobMonitorService:
 
     def upsert_batch(self, ctx: Ctx, records: Sequence[Mapping[str, Any]], *, observed_at: datetime,
                      source_kind: str, source_name: str, monitor: Optional[Mapping[str, Any]] = None,
-                     run: Optional[Mapping[str, Any]] = None, import_id: Optional[str] = None) -> Dict[str, Any]:
+                     run: Optional[Mapping[str, Any]] = None, import_id: Optional[str] = None,
+                     observed: bool = False) -> Dict[str, Any]:
         """Store normalised records (from :func:`normalize_job`). ``monitor``/``run`` mean a live
         observation (jobs become ACTIVE); ``import_id`` means historical rows (new jobs are
         UNKNOWN, and an existing job only gains values it is missing — older data never
-        overwrites what a monitor observed)."""
+        overwrites what a monitor observed). ``observed=True`` is a live observation without a
+        monitor run (CareerCrawler crawls, external sources, the scraper): same rules.
+
+        This is the one write path of ``job_postings`` (``JobIntelService.ingest_postings``
+        delegates here). A record may carry ``company_id`` to link a known company."""
         stats = {"found": len(records), "new": 0, "changed": 0, "unchanged": 0, "reopened": 0, "duplicates": 0,
                  "filled": 0, "updated": 0, "linked": 0, "review": 0}
-        observing = run is not None
+        observing = run is not None or observed
         unique: Dict[str, Mapping[str, Any]] = {}
         for values in records:
             if values["url_key"] in unique:
@@ -584,6 +591,8 @@ class JobMonitorService:
         reviews: Dict[str, Tuple[str, List[str], int]] = {}
 
         def link(values: Mapping[str, Any]) -> Dict[str, Any]:
+            if values.get("company_id"):  # the caller already knows the company
+                return {"company_id": values["company_id"], "company_match": "matched"}
             key = normalize_name(values.get("company_name")) if values.get("company_name") else None
             if not key:
                 return {"company_id": None, "company_match": "unmatched"}
@@ -956,6 +965,40 @@ class JobMonitorService:
                 entity_type="job_source_monitors", entity_id=monitor["id"])
         return result
 
+    def prune_history(self, ctx: Ctx, *, older_than_days: int, dry_run: bool = True,
+                      now: Optional[datetime] = None) -> Dict[str, Any]:
+        """Retention for ``job_posting_changes`` (audit 2026-10-14: 115,680 ``new`` + 115,680
+        ``stale`` rows were 36% of the production database).
+
+        Only :data:`PRUNABLE_CHANGES` older than ``older_than_days`` go: a ``new`` row restates
+        ``job_postings.first_seen_at`` and a ``stale`` row restates ``stale_at``, so nothing is
+        lost — :meth:`job_detail` rebuilds both timeline entries from the job. ``changed``,
+        ``reopened``, ``closed``, ``expired`` and gone evidence are never pruned (they are the
+        only record of what changed). The feed's date filters read job columns and run
+        summaries count rows younger than a day, so neither is affected. ``dry_run`` (the
+        default) counts without deleting."""
+        if older_than_days < 1:
+            raise ValidationError("older_than_days must be at least 1")
+        cutoff = (now or utcnow()) - timedelta(days=int(older_than_days))
+        system = ctx.as_system()
+        filters: Dict[str, Any] = {"change": list(PRUNABLE_CHANGES), "detected_at__lt": cutoff}
+        counts = {c: self.store.count(system, "job_posting_changes", {**filters, "change": c})
+                  for c in PRUNABLE_CHANGES}
+        result: Dict[str, Any] = {"cutoff": cutoff.isoformat(), "dry_run": dry_run, "matched": counts,
+                                  "deleted": 0}
+        if dry_run:
+            return result
+        while True:
+            rows = self.store.rows(system, "job_posting_changes", filters, order="id", limit=BATCH, columns=["id"])
+            if not rows:
+                break
+            result["deleted"] += self.store.delete_many(system, "job_posting_changes", [r["id"] for r in rows])
+        if result["deleted"]:
+            audit(self.store, system, "job_history.pruned", entity_type="job_posting_changes",
+                  summary=f"{result['deleted']:,} new/stale history row(s) older than {older_than_days} days",
+                  changes={"matched": counts, "cutoff": result["cutoff"]})
+        return result
+
     # ------------------------------------------------------------------------------------
     # results, notifications, SANA chat
     # ------------------------------------------------------------------------------------
@@ -1266,6 +1309,7 @@ class JobMonitorService:
     def job_detail(self, ctx: Ctx, job_id: str) -> Dict[str, Any]:
         row = self.store.get(ctx, "job_postings", job_id)
         history = self.store.all(ctx, "job_posting_changes", {"job_posting_id": job_id}, order="-detected_at", cap=200)
+        history = _with_restated_history(row, history)
         monitor = self.store.find(ctx, "job_source_monitors", row["source_monitor_id"]) if row.get(
             "source_monitor_id") else None
         company = self.store.find(ctx, "companies", row["company_id"]) if row.get("company_id") else None
@@ -1365,3 +1409,24 @@ class JobMonitorService:
 
 def _jsonable(values: Mapping[str, Any]) -> Dict[str, Any]:
     return {k: (v.isoformat() if isinstance(v, (date, datetime)) else v) for k, v in values.items()}
+
+
+def _with_restated_history(row: Mapping[str, Any], history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """A job's timeline, with the ``new`` / ``stale`` entries that :meth:`prune_history` may
+    have removed restated from the job's own columns (marked ``synthesized``)."""
+    kinds = {h.get("change") for h in history}
+    extra = []
+    base = {"id": None, "job_posting_id": row["id"], "monitor_id": row.get("source_monitor_id"),
+            "import_id": None, "synthesized": True}
+    if "new" not in kinds and row.get("first_seen_at") and row.get("observation_count"):
+        extra.append({**base, "run_id": row.get("first_seen_run_id"), "change": "new", "changed_fields": [],
+                      "before": {}, "after": {"title": row.get("title"), "company_name": row.get("company_name")},
+                      "detected_at": row["first_seen_at"]})
+    if row.get("status") == "stale" and row.get("stale_at") and not any(
+            h.get("change") == "stale" and h.get("detected_at") and h["detected_at"] >= row["stale_at"]
+            for h in history):
+        extra.append({**base, "run_id": None, "change": "stale", "changed_fields": ["status"],
+                      "before": {"status": "ACTIVE"}, "after": {"status": "STALE"}, "detected_at": row["stale_at"]})
+    if not extra:
+        return history
+    return sorted(history + extra, key=lambda h: h["detected_at"], reverse=True)

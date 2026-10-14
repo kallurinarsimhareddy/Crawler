@@ -60,6 +60,11 @@ def canonical_job_url(url: str) -> Optional[str]:
     return urlunsplit(("https", netloc, path, urlencode(query), ""))[:2048]
 
 
+_REMOTE_LABELS = {"remote": "Remote", "hybrid": "Hybrid", "onsite": "On-site"}
+_STATUS_LABELS = {"open": "ACTIVE", "stale": "STALE"}
+_CAMPAIGN_FIELDS = ("is_relevant", "relevance_reasons", "campaign_keys")
+
+
 def _text(value: Any, limit: int) -> Optional[str]:
     if blank(value):
         return None
@@ -138,6 +143,17 @@ class JobIntelService:
     def ingest_postings(self, ctx: Ctx, postings: List[Dict[str, Any]], *, source_kind: str, source_name: str,
                         company_id: Optional[str] = None, crawled_company_ids: Optional[Set[str]] = None
                         ) -> Dict[str, Any]:
+        """Store postings from a crawl, an external source, the scraper or the API.
+
+        Persistence is :meth:`JobMonitorService.upsert_batch` — the one write path of
+        ``job_postings`` — as a live observation: the same URL identity (``job_url_key``,
+        site-profile aware), NEW / CHANGED / REOPENED rules, ``job_posting_changes`` history,
+        keyword-set relevance and the first source's attribution. This method adds what only
+        these sources have: company linking by explicit id or domain, campaign relevance,
+        classifier extras, technology evidence, company change events, automation events and
+        closing a successfully crawled company's missing postings."""
+        from cloud.intel.job_monitor.schema import normalize_job, parse_date
+
         ctx.require_write()
         now = utcnow()
         stats = {"received": len(postings), "inserted": 0, "updated": 0, "reopened": 0, "closed": 0,
@@ -147,125 +163,142 @@ class JobIntelService:
         seen_by_company: Dict[str, Set[str]] = {}
         touched_companies: Set[str] = set()
         technology = self.platform.service("technology")
+        monitors = self.platform.service("job_monitors")
+        source_name = source_name[:200]
 
+        records: List[Dict[str, Any]] = []
+        extras: Dict[str, Dict[str, Any]] = {}
+        texts: Dict[str, str] = {}
         for index, raw in enumerate(postings):
             title = _text(raw.get("title") or raw.get("job_title"), 500)
-            url_key = canonical_job_url(raw.get("job_url") or raw.get("url") or "")
-            if not title or not url_key:
+            url = raw.get("job_url") or raw.get("url")
+            posted = raw.get("posted_at") or raw.get("posted_date")
+            values, problems = normalize_job({
+                "job_url": url, "title": title,
+                "company_name": raw.get("company_name") or raw.get("company"),
+                "location": raw.get("location"), "description": raw.get("description"),
+                "experience_level": raw.get("experience_level"),
+                "salary_budget": raw.get("salary_budget") or raw.get("salary"),
+                "keywords": raw.get("keywords"),
+                "remote": _REMOTE_LABELS.get(str(raw.get("workplace_type") or "").lower()),
+                "date_posted": posted, "listing_date": raw.get("listing_date"),
+                "search_term": raw.get("search_term"), "source_board": raw.get("source_board"),
+            }, source=source_name, scraped_date=now.date())
+            if values is None or not canonical_job_url(url or ""):
                 stats["rejected"] += 1
                 stats["problems"].append({"index": index, "problem": "missing title or a valid http(s) job URL"})
                 continue
+            if posted and parse_date(posted) is None:
+                stats["problems"].append({"index": index, "problem": f"unreadable posted date {posted!r}"})
             cid = raw.get("company_id") or company_id or self._resolve_company(ctx, raw, cache)
-            description = _text(raw.get("description"), 50000) or ""
-            location = _text(raw.get("location"), 500) or ""
-            c = _classify(title, description, location)
+            if cid:
+                values["company_id"] = cid
+                if not values.get("company_name"):
+                    from cloud.intel.job_monitor.schema import content_hash
+
+                    values["company_name"] = self.store.get(ctx, "companies", cid)["name"][:300]
+                    values["content_hash"] = content_hash(values)
+            if not values.get("company_name"):
+                values["company_name"] = "(unknown company)"
+            description = values.get("description") or ""
+            c = _classify(title, description, values.get("location") or "")
             rel = self.relevance(rules, title, description, c)
-            company_name = _text(raw.get("company_name") or raw.get("company"), 300)
-            if cid and not company_name:
-                company_name = self.store.get(ctx, "companies", cid)["name"]
-            values: Dict[str, Any] = {
-                "company_id": cid,
-                "company_name": company_name or "(unknown company)",
+            extra = {
                 "domain": domain_of(raw.get("domain") or raw.get("website")),
-                "title": title,
-                "normalized_title": re.sub(r"\s+", " ", title.lower()),
-                "job_url": str(raw.get("job_url") or raw.get("url")).strip()[:2048],
                 "external_id": _text(raw.get("external_id") or raw.get("job_id"), 200),
-                "description": description or None,
-                "location": location or None,
-                "country": _text(raw.get("country"), 100) or c["country"],
-                "workplace_type": raw.get("workplace_type") if raw.get("workplace_type") in (
-                    "remote", "hybrid", "onsite") else c["workplace_type"],
+                "country": _text(raw.get("country"), 100),
                 "employment_type": _text(raw.get("employment_type"), 60) or c["employment_type"],
-                "department": _text(raw.get("department"), 100) or c["department"],
-                "seniority": c["seniority"],
-                "technologies": c["technologies"],
-                "skills": c["skills"][:50],
+                "department": _text(raw.get("department"), 100),
                 "years_experience_min": c["years_experience_min"],
-                "certifications": c["certifications"],
+                "certifications": c["certifications"] or None,
                 "industry": _text(raw.get("industry"), 200),
                 "ats": _text(raw.get("ats") or raw.get("platform"), 100),
-                "source_kind": source_kind,
-                "source_name": source_name[:200],
                 "is_relevant": bool(rel["campaign_keys"]),
                 "relevance_reasons": rel["reasons"],
                 "campaign_keys": rel["campaign_keys"],
-                "last_seen_at": now,
-                "status": "open",
             }
-            posted = raw.get("posted_at") or raw.get("posted_date")
-            if posted:
-                try:
-                    from cloud.intel.store.base import _coerce
-                    from cloud.intel.store.spec import get_spec
+            if c["skills"]:
+                extra["skills"] = c["skills"][:50]
+            records.append(values)
+            extras[values["url_key"]] = {k: v for k, v in extra.items() if v is not None}
+            texts[values["url_key"]] = f"{title}\n{description}"
 
-                    values["posted_at"] = _coerce(get_spec("job_postings"), "posted_at", posted)
-                except ValidationError:
-                    stats["problems"].append({"index": index, "problem": f"unreadable posted date {posted!r}"})
+        keys = list(extras)
+        before = {row["url_key"]: row for row in self._rows_by_key(ctx, keys)}
+        result = monitors.upsert_batch(ctx, records, observed_at=now, source_kind=source_kind,
+                                       source_name=source_name, observed=True) if records else {"new_ids": []}
+        new_ids = set(result.get("new_ids") or [])
+        rows = {row["url_key"]: row for row in self._rows_by_key(ctx, keys)}
+        patches = []
+        for key, row in rows.items():
+            # A job another source found first keeps its attribution and values: this source
+            # only fills its blanks (campaign relevance is the workspace's and always updates).
+            owner = row.get("source_name") == source_name
+            patch = {k: v for k, v in extras[key].items() if row.get(k) != v and
+                     (owner or k in _CAMPAIGN_FIELDS or row.get(k) in (None, "", []))}
+            if patch:
+                patches.append((row["id"], patch))
+                row.update(patch)
+        if patches:
+            self.store.update_many(ctx, "job_postings", patches)
+        stats["inserted"] = len(new_ids)
+        stats["updated"] = sum(1 for key in rows if key in before)
+        stats["reopened"] = int(result.get("reopened") or 0)
 
-            existing = self.store.first(ctx, "job_postings", {"url_key": url_key})
-            if existing:
-                changes = {k: v for k, v in values.items() if v is not None or k in ("closed_at",)}
-                if existing["status"] == "closed":
-                    changes["closed_at"] = None
-                    stats["reopened"] += 1
-                    if existing.get("company_id"):
-                        self._change(ctx, existing["company_id"], "new_job",
-                                     {"job_posting_id": existing["id"], "title": title, "reopened": True},
-                                     f"Reopened: {title}", source_name)
-                if existing.get("company_id") and not cid:
-                    changes["company_id"] = existing["company_id"]
-                row = self.store.update(ctx, "job_postings", existing["id"], changes)
-                stats["updated"] += 1
-                new = False
-            else:
-                try:
-                    row = self.store.insert(ctx, "job_postings", {**values, "url_key": url_key, "first_seen_at": now})
-                except ConflictError:  # a concurrent twin inserted the same URL
-                    row = self.store.first(ctx, "job_postings", {"url_key": url_key})
-                    row = self.store.update(ctx, "job_postings", row["id"], values)
-                    new = False
-                    stats["updated"] += 1
-                else:
-                    stats["inserted"] += 1
-                    new = True
-            if row["is_relevant"]:
+        for key, row in rows.items():
+            title = row["title"]
+            if row.get("is_relevant"):
                 stats["relevant"] += 1
-            if row.get("company_id"):
-                stats["linked"] += 1
-                cid = row["company_id"]
-                seen_by_company.setdefault(cid, set()).add(row["id"])
-                touched_companies.add(cid)
-                if new:
-                    self._change(ctx, cid, "new_job", {"job_posting_id": row["id"], "title": title,
-                                                       "url": row["job_url"]}, f"New job: {title}", source_name)
-                    emit_best_effort(self.platform, ctx, "job_posted", row["id"],
-                                     {"company_id": cid, "job_posting_id": row["id"], "title": title,
-                                      "is_relevant": row["is_relevant"], "campaign_keys": row["campaign_keys"]})
-                    for tech in self._detected(title, description):
-                        try:
-                            technology.record(ctx, cid, tech["technology"], source="job_posting",
-                                              category=tech["category"], families=tech["families"],
-                                              vendor=tech["vendor"], evidence_url=row["job_url"],
-                                              evidence_text=tech["evidence_text"])
-                        except Exception:  # noqa: BLE001 - evidence is best-effort, the posting is stored
-                            log.exception("technology evidence failed for %s", row["id"])
-                opened = row["first_seen_at"]
-                if opened and now - opened >= timedelta(days=LONG_OPEN_DAYS) and row["is_relevant"]:
-                    emit_best_effort(self.platform, ctx, "long_open_job", f"{row['id']}:{LONG_OPEN_DAYS}d",
-                                     {"company_id": cid, "job_posting_id": row["id"], "title": title,
-                                      "days_open": (now - opened).days})
-            else:
+            if not row.get("company_id"):
                 stats["unlinked"] += 1
+                continue
+            stats["linked"] += 1
+            cid = row["company_id"]
+            seen_by_company.setdefault(cid, set()).add(row["id"])
+            touched_companies.add(cid)
+            previous = before.get(key)
+            if previous is not None and previous.get("status") in ("closed", "expired") and row["status"] == "open":
+                self._change(ctx, cid, "new_job", {"job_posting_id": row["id"], "title": title, "reopened": True},
+                             f"Reopened: {title}", source_name)
+            if row["id"] in new_ids:
+                self._change(ctx, cid, "new_job", {"job_posting_id": row["id"], "title": title,
+                                                   "url": row["job_url"]}, f"New job: {title}", source_name)
+                emit_best_effort(self.platform, ctx, "job_posted", row["id"],
+                                 {"company_id": cid, "job_posting_id": row["id"], "title": title,
+                                  "is_relevant": row["is_relevant"], "campaign_keys": row["campaign_keys"]})
+                title_text, _, desc_text = texts[key].partition("\n")
+                for tech in self._detected(title_text, desc_text):
+                    try:
+                        technology.record(ctx, cid, tech["technology"], source="job_posting",
+                                          category=tech["category"], families=tech["families"],
+                                          vendor=tech["vendor"], evidence_url=row["job_url"],
+                                          evidence_text=tech["evidence_text"])
+                    except Exception:  # noqa: BLE001 - evidence is best-effort, the posting is stored
+                        log.exception("technology evidence failed for %s", row["id"])
+            opened = row["first_seen_at"]
+            if opened and now - opened >= timedelta(days=LONG_OPEN_DAYS) and row["is_relevant"]:
+                emit_best_effort(self.platform, ctx, "long_open_job", f"{row['id']}:{LONG_OPEN_DAYS}d",
+                                 {"company_id": cid, "job_posting_id": row["id"], "title": title,
+                                  "days_open": (now - opened).days})
 
-        # Close what a successful crawl no longer shows (never for failed crawls).
+        # Close what a successful crawl no longer shows (never for failed crawls). Only this
+        # source's own jobs: another source's job is that source's to close.
         for cid in crawled_company_ids or set():
             seen = seen_by_company.get(cid, set())
-            for job in self.store.all(ctx, "job_postings", {"company_id": cid, "status": "open",
-                                                             "source_name": source_name[:200]}):
-                if job["id"] in seen:
-                    continue
-                self.store.update(ctx, "job_postings", job["id"], {"status": "closed", "closed_at": now})
+            closing = [job for job in self.store.all(ctx, "job_postings", {"company_id": cid,
+                                                                           "status": ["open", "stale"],
+                                                                           "source_name": source_name})
+                       if job["id"] not in seen]
+            if closing:
+                self.store.update_many(ctx, "job_postings", [
+                    (job["id"], {"status": "closed", "closed_at": now})
+                    for job in closing])
+                self.store.insert_many(ctx, "job_posting_changes", [
+                    {"job_posting_id": job["id"], "monitor_id": None, "run_id": None, "change": "closed",
+                     "changed_fields": ["status"], "before": {"status": _STATUS_LABELS.get(job["status"])},
+                     "after": {"status": "CLOSED", "reason": "missing_from_board", "source": source_name},
+                     "detected_at": now} for job in closing])
+            for job in closing:
                 stats["closed"] += 1
                 self._change(ctx, cid, "job_closed", {"job_posting_id": job["id"], "title": job["title"]},
                              f"Closed: {job['title']}", source_name)
@@ -279,6 +312,13 @@ class JobIntelService:
                           f"{stats['closed']} closed")
         stats["problems"] = stats["problems"][:100]
         return stats
+
+    def _rows_by_key(self, ctx: Ctx, keys: List[str]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for start in range(0, len(keys), 500):
+            chunk = keys[start:start + 500]
+            rows.extend(self.store.all(ctx, "job_postings", {"url_key": chunk}, cap=len(chunk) + 5))
+        return rows
 
     @staticmethod
     def _detected(title: str, description: str) -> List[Dict[str, Any]]:
